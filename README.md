@@ -8,7 +8,7 @@ Parallel agents collide where worktree tools stop, on ports, databases, and env 
 
 ## Status
 
-The remote seed was verified on 2026-11-02 against the staged seed and its commit is e7e7d53dcd4d41fe5b46d0c51f1808872ff133fb. All work arrives through pull requests and nothing lands on main directly. The contract lives in CONTRACT.md and carries the setup obligations S1 to S5 and the Round 1 feature obligations SY-1 to SY-10. Round 1 builds the first working slice, one claim command that furnishes a full stack environment per agent, with the live view as a printed table and a release that returns everything. Closed perfection rounds are 0 of 100, because a round closes only when its full cycle of work and audit and review and red team and approval has run. The local gate is python -m pytest -q plus python scripts/codepoint_scan.py.
+The remote seed was verified on 2026-11-02 against the staged seed and its commit is e7e7d53dcd4d41fe5b46d0c51f1808872ff133fb. All work arrives through pull requests and nothing lands on main directly. The contract lives in CONTRACT.md and carries the setup obligations S1 to S5 and the Round 1 feature obligations SY-1 to SY-10. Round 1 builds the first working slice, one claim command that furnishes a full stack environment per agent, with the live view as a printed table and a release that returns everything. Closed perfection rounds are 1 of 100, because a round closes only when its full cycle of work and audit and review and red team and approval has run. The local gate is python -m pytest -q plus python scripts/codepoint_scan.py.
 
 ## Use
 
