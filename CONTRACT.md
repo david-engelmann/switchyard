@@ -20,7 +20,7 @@ Obligation S4 covers synthetic fixtures only. Every fixture and example in this 
 
 ## Obligation S5
 
-Obligation S5 covers canonical AGENTS identity. The part of AGENTS.md above the marked line is identical to the canonical template for the program and only the annex below that line differs per repo. This is covered by the AGENTS tests in the tests folder and by comparison against the canonical template when this setup is accepted.
+Obligation S5 covers canonical AGENTS identity. The part of AGENTS.md above the marked line is identical to the canonical template for the program and only the annex below that line differs per repo. This is covered by tests in the tests folder that pin the SHA-256 digest of the part above the marked line, and by comparison against the canonical template when this setup is accepted.
 
 ## What this stub is not
 

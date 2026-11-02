@@ -3,45 +3,47 @@
 The scan reads each matching file as text and counts the U+2014 and
 U+2013 codepoints directly in Python. It exits with status 1 when
 either count is nonzero and with status 0 when both counts are zero.
+Directories are excluded by name during the walk below the scan
+root, so the name of an ancestor of the root can never exclude the
+root itself, and the excluded names match the generated and
+dependency directories in the repo gitignore plus the tool caches.
 """
-
+import os
 import sys
 from pathlib import Path
 
-EXTENSIONS = {".md", ".txt", ".py", ".yml", ".toml"}
-EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv"}
-
 EM_DASH = "\u2014"
 EN_DASH = "\u2013"
+SUFFIXES = {".md", ".txt", ".py", ".yml", ".toml"}
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules", "build", "dist"}
 
 
 def iter_files(root):
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        if any(part in EXCLUDED_DIRS for part in path.parts):
-            continue
-        if path.suffix in EXTENSIONS:
-            yield path
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            if path.suffix in SUFFIXES:
+                yield path
 
 
-def main():
-    if len(sys.argv) > 1:
-        root = Path(sys.argv[1]).resolve()
-    else:
-        root = Path(__file__).resolve().parent.parent
+def scan(root):
     em_count = 0
     en_count = 0
     for path in iter_files(root):
         text = path.read_text(encoding="utf-8", errors="ignore")
         em_count += text.count(EM_DASH)
         en_count += text.count(EN_DASH)
+    return em_count, en_count
+
+
+def main():
+    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent
+    em_count, en_count = scan(root)
     print(f"U+2014 em dash count {em_count}")
     print(f"U+2013 en dash count {en_count}")
-    if em_count or en_count:
-        return 1
-    return 0
+    return 1 if em_count or en_count else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
