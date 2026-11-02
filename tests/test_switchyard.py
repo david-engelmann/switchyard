@@ -378,6 +378,43 @@ def _forged_bodies():
 CORRUPT_BODIES += _forged_bodies()
 
 
+def _grid_and_stamp_bodies():
+    off_grid = valid_record("alpha", port_start=20005)
+    wrong_size = valid_record("alpha")
+    wrong_size["port_end"] = 20004
+    bad_stamp = valid_record("alpha")
+    bad_stamp["claimed_at"] = "not a timestamp"
+    return [
+        registry_body(
+            {}, port_pool={"start": 65000, "range_size": 100, "range_count": 16}
+        ),
+        registry_body({"alpha": off_grid}),
+        registry_body({"alpha": wrong_size}),
+        registry_body({"alpha": bad_stamp}),
+    ]
+
+
+CORRUPT_BODIES += _grid_and_stamp_bodies()
+
+DUPLICATE_KEY_BODIES = [
+    (
+        '{"version": 1, "version": 1, "port_pool": {"start": 20000, '
+        '"range_size": 10, "range_count": 16}, "claims": {}}'
+    ),
+    (
+        '{"version": 1, "port_pool": {"start": 20000, "range_size": 10, '
+        '"range_count": 16}, "claims": {"alpha": {"agent": "alpha", '
+        '"branch": "switchyard/alpha", "branch": "switchyard/alpha", '
+        '"worktree": "worktrees/alpha", "port_start": 20000, '
+        '"port_end": 20009, "database": "switchyard_alpha", '
+        '"env_file": "worktrees/alpha/.env.switchyard", '
+        '"claimed_at": "2026-11-02T00:00:00+00:00"}}}'
+    ),
+]
+
+CORRUPT_BODIES += DUPLICATE_KEY_BODIES
+
+
 @pytest.mark.parametrize("body", CORRUPT_BODIES)
 def test_a_corrupt_registry_fails_every_command_and_changes_nothing(stack, body):
     (stack / core.REGISTRY_NAME).write_text(body, encoding="utf-8")
@@ -712,6 +749,103 @@ def test_a_git_call_that_times_out_is_a_clean_error(monkeypatch):
     monkeypatch.setattr(core.subprocess, "run", slow_run)
     with pytest.raises(core.SwitchyardError):
         core._git_result(Path("repo"), "status")
+
+
+# The third repair, rollback ownership, the linked worktree perimeter,
+# decode depth, and the wider git environment scrub
+
+
+def _handmade_branch(stack, tmp_path):
+    repo = stack / "repo"
+    git(repo, "branch", "switchyard/alpha")
+    scratch = tmp_path / "handmade"
+    git(repo, "worktree", "add", str(scratch), "switchyard/alpha")
+    (scratch / "hand.txt").write_text("hand made work", encoding="utf-8")
+    git(scratch, "add", "hand.txt")
+    git(scratch, "commit", "-q", "-m", "Hand made commit")
+    sha = git(repo, "rev-parse", "switchyard/alpha").strip()
+    git(repo, "worktree", "remove", "--force", str(scratch))
+    return sha
+
+
+def test_a_preexisting_branch_survives_a_plain_failed_claim(stack, tmp_path):
+    sha = _handmade_branch(stack, tmp_path)
+    code, _, err = run_cli(["claim", "alpha", "--stack", str(stack)])
+    assert code != 0
+    assert git(stack / "repo", "rev-parse", "switchyard/alpha").strip() == sha
+    assert read_registry(stack)["claims"] == {}
+
+
+def test_a_preexisting_branch_survives_an_obstructed_failed_claim(stack, tmp_path):
+    sha = _handmade_branch(stack, tmp_path)
+    blocker = stack / "worktrees" / "alpha"
+    blocker.mkdir()
+    (blocker / "junk.txt").write_text("in the way", encoding="utf-8")
+    code, _, err = run_cli(["claim", "alpha", "--stack", str(stack)])
+    assert code != 0
+    assert git(stack / "repo", "rev-parse", "switchyard/alpha").strip() == sha
+    assert (blocker / "junk.txt").read_text(encoding="utf-8") == "in the way"
+    assert read_registry(stack)["claims"] == {}
+
+
+def test_claim_and_release_refuse_a_linked_worktree_of_a_foreign_repo(tmp_path):
+    git(tmp_path, "init", "-q", "-b", "main", "foreign")
+    foreign = tmp_path / "foreign"
+    git(foreign, "config", "user.email", "foreign@example.invalid")
+    git(foreign, "config", "user.name", "foreign")
+    (foreign / "seed.txt").write_text("seed", encoding="utf-8")
+    git(foreign, "add", "seed.txt")
+    git(foreign, "commit", "-q", "-m", "Seed the foreign repository")
+    stack = init_stack_dir(tmp_path)
+    shutil.rmtree(stack / "repo")
+    git(foreign, "worktree", "add", str(stack / "repo"))
+    branches_before = git(foreign, "branch", "--list")
+    worktrees_before = git(foreign, "worktree", "list")
+    registry_before = (stack / core.REGISTRY_NAME).read_bytes()
+    for argv in (
+        ["claim", "alpha", "--stack", str(stack)],
+        ["release", "alpha", "--stack", str(stack)],
+    ):
+        code, _, err = run_cli(argv)
+        assert code != 0, argv
+        assert "will not run git" in err, argv
+    assert git(foreign, "branch", "--list") == branches_before
+    assert git(foreign, "worktree", "list") == worktrees_before
+    assert (stack / core.REGISTRY_NAME).read_bytes() == registry_before
+
+
+def test_an_extremely_nested_registry_is_corrupt_not_a_traceback(stack):
+    body = "[" * 20000 + "]" * 20000
+    (stack / core.REGISTRY_NAME).write_text(body, encoding="utf-8")
+    before = snapshot(stack)
+    for argv in (
+        ["claim", "alpha", "--stack", str(stack)],
+        ["list", "--stack", str(stack)],
+        ["release", "alpha", "--stack", str(stack)],
+    ):
+        code, _, err = run_cli(argv)
+        assert code == 2, argv
+        assert "corrupt" in err, argv
+        assert "Traceback" not in err, argv
+    assert snapshot(stack) == before
+
+
+def test_the_git_helper_scrubs_config_variables_and_numbered_pairs(monkeypatch):
+    for name in core.GIT_CONFIG_VARIABLES:
+        monkeypatch.setenv(name, "/elsewhere")
+    numbered = (
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_KEY_12",
+        "GIT_CONFIG_VALUE_12",
+    )
+    for name in numbered:
+        monkeypatch.setenv(name, "steered")
+    monkeypatch.setenv("SWITCHYARD_UNRELATED_MARKER", "kept")
+    env = core._git_env()
+    for name in core.GIT_CONFIG_VARIABLES + numbered:
+        assert name not in env
+    assert env["SWITCHYARD_UNRELATED_MARKER"] == "kept"
 
 
 # The module entry point

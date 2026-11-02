@@ -91,6 +91,19 @@ def _corrupt(path, why):
     return CorruptRegistryError(f"registry at {path} is corrupt, {why}")
 
 
+class _DuplicateKeyError(ValueError):
+    """A JSON object in the registry repeated a key."""
+
+
+def _object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateKeyError(key)
+        result[key] = value
+    return result
+
+
 REGISTRY_KEYS = {"version", "port_pool", "claims"}
 POOL_KEYS = {"start", "range_size", "range_count"}
 RECORD_KEYS = {
@@ -137,6 +150,8 @@ def _validate_registry(data, path):
         if not _is_int(pool[key]) or pool[key] <= 0:
             raise _corrupt(path, f"the port pool field {key} is not a positive integer")
     pool_end = pool["start"] + pool["range_size"] * pool["range_count"] - 1
+    if pool_end > 65535:
+        raise _corrupt(path, "the port pool reaches past port 65535")
     claims = data["claims"]
     if not isinstance(claims, dict):
         raise _corrupt(path, "the claims are missing or not an object")
@@ -166,6 +181,14 @@ def _validate_registry(data, path):
                     f"the claim for {agent} records {key} as {record[key]} "
                     f"where the agent name derives {expected}",
                 )
+        try:
+            datetime.fromisoformat(record["claimed_at"])
+        except ValueError:
+            raise _corrupt(
+                path,
+                f"the claim for {agent} has a claimed_at that does not "
+                "parse as a timestamp",
+            ) from None
         for key in ("port_start", "port_end"):
             if not _is_int(record[key]):
                 raise _corrupt(path, f"the claim for {agent} has no sound {key}")
@@ -173,6 +196,14 @@ def _validate_registry(data, path):
             raise _corrupt(path, f"the claim for {agent} has an inverted port range")
         if record["port_start"] < pool["start"] or record["port_end"] > pool_end:
             raise _corrupt(path, f"the claim for {agent} reaches outside the port pool")
+        if (record["port_start"] - pool["start"]) % pool["range_size"] != 0 or (
+            record["port_end"] != record["port_start"] + pool["range_size"] - 1
+        ):
+            raise _corrupt(
+                path,
+                f"the claim for {agent} does not hold exactly one slot "
+                "of the port pool grid",
+            )
         ranges.append((record["port_start"], record["port_end"], agent))
     ranges.sort()
     for (prev_start, prev_end, prev_agent), (start, end, agent) in zip(
@@ -202,9 +233,13 @@ def load_registry(stack):
     except OSError as exc:
         raise _corrupt(path, f"it cannot be read, {exc}") from exc
     try:
-        data = json.loads(raw)
+        data = json.loads(raw, object_pairs_hook=_object_without_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise _corrupt(path, f"it is not valid JSON, {exc}") from exc
+    except _DuplicateKeyError as exc:
+        raise _corrupt(path, f"it repeats the key {exc}") from exc
+    except RecursionError:
+        raise _corrupt(path, "it nests too deeply to be read") from None
     return _validate_registry(data, path)
 
 
@@ -274,20 +309,34 @@ GIT_LOCATION_VARIABLES = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
 )
+GIT_CONFIG_VARIABLES = (
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+)
+GIT_CONFIG_PAIR_PATTERN = re.compile(r"^GIT_CONFIG_(KEY|VALUE)_[0-9]+$")
 GIT_TIMEOUT_SECONDS = 120
 
 
 def _git_env():
-    """The environment handed to git, with caller locations removed.
+    """The environment handed to git, with caller steering removed.
 
     A location variable inherited from the caller, GIT_DIR above all,
     would retarget every git call at a foreign repository even though
     this helper names its repository with -C, so the location variables
-    never pass through.
+    never pass through. The config variables and the numbered config
+    key and value pairs would let the caller steer what git reads as
+    its configuration, so they never pass through either.
     """
     env = dict(os.environ)
-    for name in GIT_LOCATION_VARIABLES:
+    for name in GIT_LOCATION_VARIABLES + GIT_CONFIG_VARIABLES:
         env.pop(name, None)
+    for name in list(env):
+        if GIT_CONFIG_PAIR_PATTERN.match(name):
+            env.pop(name, None)
     return env
 
 
@@ -322,8 +371,13 @@ def _verify_own_repo(stack):
 
     Git finds a repository by walking upward, so a stack repo that lost
     its .git entry while sitting inside a larger repository would make
-    every git operation land silently in the ancestor. Claim and
-    release call this before they run any git command.
+    every git operation land silently in the ancestor. A stack repo
+    that is a linked worktree of a foreign repository passes that test,
+    because its top level is itself, while every git operation still
+    lands in the foreign repository that owns the common git
+    directory. Claim and release call this before they run any git
+    command, and the common git directory must resolve to exactly the
+    stack repo's own .git directory.
     """
     repo = stack / REPO_NAME
     if not (repo / ".git").exists():
@@ -342,6 +396,21 @@ def _verify_own_repo(stack):
         raise SwitchyardError(
             f"the stack repository at {repo} resolves to the repository at "
             f"{top}, which is not the stack repository, "
+            "so switchyard will not run git against it"
+        )
+    common = _git_result(repo, "rev-parse", "--git-common-dir")
+    if common.returncode != 0:
+        detail = common.stderr.strip() or common.stdout.strip()
+        raise SwitchyardError(
+            f"the stack repository at {repo} cannot be read by git, {detail}"
+        )
+    common_dir = Path(common.stdout.strip())
+    if not common_dir.is_absolute():
+        common_dir = repo / common_dir
+    if common_dir.resolve() != (repo / ".git").resolve():
+        raise SwitchyardError(
+            f"the stack repository at {repo} shares the git directory at "
+            f"{common_dir.resolve()}, which is not its own .git directory, "
             "so switchyard will not run git against it"
         )
 
@@ -473,16 +542,19 @@ def _require_committed_head(repo):
         )
 
 
-def _rollback_claim(repo, worktree, branch):
+def _rollback_claim(repo, worktree, branch, branch_preexisted):
     """Best effort removal of whatever a failed claim created.
 
     The branch is deleted whether or not the worktree add reported
     success, because git creates the branch inside the add command
     itself, so a failed add can still leave a branch behind that would
-    block every later claim for the agent. The worktree is removed
-    only when it carries the .git file of a real worktree, so a
-    directory that was already in the way is left untouched. Returns a
-    list of problem descriptions, empty when everything was removed
+    block every later claim for the agent. It is deleted only when
+    this claim attempt created it. A branch that already stood in the
+    repository before the attempt is not the claim's to remove, and it
+    is left standing with whatever commits it carries. The worktree is
+    removed only when it carries the .git file of a real worktree, so
+    a directory that was already in the way is left untouched. Returns
+    a list of problem descriptions, empty when everything was removed
     or never existed.
     """
     problems = []
@@ -493,12 +565,15 @@ def _rollback_claim(repo, worktree, branch):
             problems.append(
                 f"the worktree at {worktree} could not be removed, {detail}"
             )
-    listed = _git_result(repo, "branch", "--list", branch)
-    if listed.returncode == 0 and listed.stdout.strip():
-        result = _git_result(repo, "branch", "-D", branch)
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            problems.append(f"the branch {branch} could not be deleted, {detail}")
+    if not branch_preexisted:
+        listed = _git_result(repo, "branch", "--list", branch)
+        if listed.returncode == 0 and listed.stdout.strip():
+            result = _git_result(repo, "branch", "-D", branch)
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip()
+                problems.append(
+                    f"the branch {branch} could not be deleted, {detail}"
+                )
     return problems
 
 
@@ -539,6 +614,8 @@ def claim(stack, agent):
             "env_file": env_rel,
             "claimed_at": datetime.now(timezone.utc).isoformat(),
         }
+        listed = _git_result(repo, "branch", "--list", branch)
+        branch_preexisted = listed.returncode == 0 and bool(listed.stdout.strip())
         try:
             _require_committed_head(repo)
             _git(repo, "worktree", "add", "-b", branch, str(worktree))
@@ -547,7 +624,7 @@ def claim(stack, agent):
             data["claims"][agent] = record
             _save_registry(stack, data)
         except BaseException as exc:
-            problems = _rollback_claim(repo, worktree, branch)
+            problems = _rollback_claim(repo, worktree, branch, branch_preexisted)
             if problems:
                 raise SwitchyardError(
                     f"the claim for {agent} failed, {exc}, and rolling it "
