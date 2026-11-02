@@ -848,6 +848,29 @@ def test_the_git_helper_scrubs_config_variables_and_numbered_pairs(monkeypatch):
     assert env["SWITCHYARD_UNRELATED_MARKER"] == "kept"
 
 
+# The fourth repair, a failed env file write is a clean error
+
+
+def test_a_failed_env_file_write_is_a_clean_error_and_rolls_back(stack):
+    repo = stack / "repo"
+    planted = repo / core.ENV_NAME
+    planted.mkdir()
+    (planted / "keep.txt").write_text("tracked placeholder", encoding="utf-8")
+    git(repo, "add", core.ENV_NAME)
+    git(repo, "commit", "-q", "-m", "Plant a directory at the env file path")
+    registry_before = (stack / core.REGISTRY_NAME).read_bytes()
+    code, _, err = run_cli(["claim", "alpha", "--stack", str(stack)])
+    assert code == 1
+    assert "error:" in err
+    assert "env file" in err
+    assert "cannot be written" in err
+    assert "Traceback" not in err
+    assert (stack / core.REGISTRY_NAME).read_bytes() == registry_before
+    assert git(repo, "branch", "--list", "switchyard/alpha").strip() == ""
+    assert "worktrees/alpha" not in git(repo, "worktree", "list")
+    assert not (stack / "worktrees" / "alpha").exists()
+
+
 # The module entry point
 
 

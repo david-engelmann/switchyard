@@ -533,6 +533,16 @@ def _env_text(record):
     return "\n".join(lines) + "\n"
 
 
+def _write_env_file(stack, env_rel, record):
+    path = stack / env_rel
+    try:
+        path.write_text(_env_text(record), encoding="utf-8")
+    except OSError as exc:
+        raise SwitchyardError(
+            f"the env file at {path} cannot be written, {exc}"
+        ) from exc
+
+
 def _require_committed_head(repo):
     result = _git_result(repo, "rev-parse", "--verify", "--quiet", "HEAD")
     if result.returncode != 0:
@@ -620,7 +630,7 @@ def claim(stack, agent):
             _require_committed_head(repo)
             _git(repo, "worktree", "add", "-b", branch, str(worktree))
             _git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
-            (stack / env_rel).write_text(_env_text(record), encoding="utf-8")
+            _write_env_file(stack, env_rel, record)
             data["claims"][agent] = record
             _save_registry(stack, data)
         except BaseException as exc:
