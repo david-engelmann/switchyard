@@ -46,10 +46,10 @@ def test_contract_names_setup_obligations():
         assert f"Obligation {code}" in text
 
 
-def test_readme_status_states_zero_of_one_hundred():
+def test_readme_status_states_one_of_one_hundred():
     text = read("README.md")
     assert "## Status" in text
-    assert "0 of 100" in text
+    assert "1 of 100" in text
     assert "e7e7d53dcd4d41fe5b46d0c51f1808872ff133fb" in text
 
 

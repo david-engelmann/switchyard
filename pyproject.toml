@@ -1,5 +1,24 @@
-# Packaging metadata arrives with the first package in this repo.
-# Until then this file carries the pytest configuration only.
+# Packaging metadata for the switchyard package, which lands with
+# Round 1. The pytest configuration sits below the project tables.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "switchyard"
+version = "0.1.0"
+description = "A worktree and port orchestrator that gives every parallel agent its own branch, port range, database, and env file with one command."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.scripts]
+switchyard = "switchyard.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
