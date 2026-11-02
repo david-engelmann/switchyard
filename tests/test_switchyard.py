@@ -642,6 +642,78 @@ def test_the_agent_name_cap_is_forty_characters(stack):
     assert code == 0, err
 
 
+# SY-10, names carrying newlines, and the inherited git environment
+
+
+@pytest.mark.parametrize("name", ["alpha\n", "al\npha"])
+def test_agent_names_with_newlines_are_rejected_and_change_nothing(stack, name):
+    before = snapshot(stack)
+    code, _, err = run_cli(["claim", name, "--stack", str(stack)])
+    assert code != 0
+    assert "invalid agent name" in err
+    assert snapshot(stack) == before
+
+
+def test_a_claim_ignores_git_location_variables_from_the_caller(
+    tmp_path, monkeypatch
+):
+    stack = init_stack_dir(tmp_path)
+    foreign = tmp_path / "foreign"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(foreign)],
+        capture_output=True,
+        check=True,
+    )
+    git(foreign, "config", "user.email", "foreign@example.invalid")
+    git(foreign, "config", "user.name", "foreign")
+    (foreign / "seed.txt").write_text("seed", encoding="utf-8")
+    git(foreign, "add", "seed.txt")
+    git(foreign, "commit", "-q", "-m", "Seed the foreign repository")
+    branches_before = git(foreign, "branch", "--list")
+    monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
+    code, _, err = run_cli(["claim", "alpha", "--stack", str(stack)])
+    assert code == 0, err
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_WORK_TREE")
+    assert git(stack / "repo", "branch", "--list", "switchyard/alpha").strip()
+    assert read_registry(stack)["claims"]["alpha"]["branch"] == "switchyard/alpha"
+    assert git(foreign, "branch", "--list") == branches_before
+    assert not (foreign / "worktrees").exists()
+
+
+def test_the_git_helper_scrubs_location_variables_and_sets_a_timeout(monkeypatch):
+    for name in core.GIT_LOCATION_VARIABLES:
+        monkeypatch.setenv(name, "/elsewhere")
+    monkeypatch.setenv("SWITCHYARD_UNRELATED_MARKER", "kept")
+    env = core._git_env()
+    for name in core.GIT_LOCATION_VARIABLES:
+        assert name not in env
+    assert env["SWITCHYARD_UNRELATED_MARKER"] == "kept"
+
+    calls = {}
+
+    def fake_run(command, **kwargs):
+        calls["command"] = command
+        calls["kwargs"] = kwargs
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    core._git_result(Path("repo"), "status")
+    assert calls["kwargs"]["timeout"] == core.GIT_TIMEOUT_SECONDS
+    for name in core.GIT_LOCATION_VARIABLES:
+        assert name not in calls["kwargs"]["env"]
+
+
+def test_a_git_call_that_times_out_is_a_clean_error(monkeypatch):
+    def slow_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+    monkeypatch.setattr(core.subprocess, "run", slow_run)
+    with pytest.raises(core.SwitchyardError):
+        core._git_result(Path("repo"), "status")
+
+
 # The module entry point
 
 

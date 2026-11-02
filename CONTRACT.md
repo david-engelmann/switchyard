@@ -69,3 +69,7 @@ Obligation SY-10 covers agent name safety. A claim rejects an agent name that is
 ## How the stub grew
 
 The setup obligations above were the whole contract when this repo was seeded, and they said the full contract would be the first build act. Round 1 is that act. The setup obligations stand unchanged, the feature obligations SY-1 to SY-10 extend them, and from here the contract grows by amendment with the earlier text left standing.
+
+## Amendment note, the Round 1 framing edits
+
+The Round 1 amendment changed two pieces of framing text from the setup stub, and the record names both here because the earlier wording did not survive in place. The stub intro opened by calling this file a stub contract that states the setup obligations for switchyard, and it now says the contract states the setup obligations first and the feature obligations of each build slice after them. The stub closed with a section headed What this stub is not, which said the stub is not the full contract and that build work would extend it with the obligations of the first slice before any feature code lands, and that section was retired and replaced by the section above headed How the stub grew. No obligation text changed in either edit.

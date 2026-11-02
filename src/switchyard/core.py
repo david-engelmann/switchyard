@@ -62,7 +62,7 @@ def validate_agent_name(agent):
     if (
         not isinstance(agent, str)
         or len(agent) > AGENT_NAME_MAX
-        or not AGENT_NAME_PATTERN.match(agent)
+        or not AGENT_NAME_PATTERN.fullmatch(agent)
     ):
         raise InvalidAgentNameError(
             f"invalid agent name {agent!r}, use one path safe component of "
@@ -266,12 +266,45 @@ def _recreate_lock(stack, lock_path):
         ) from exc
 
 
+GIT_LOCATION_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
+GIT_TIMEOUT_SECONDS = 120
+
+
+def _git_env():
+    """The environment handed to git, with caller locations removed.
+
+    A location variable inherited from the caller, GIT_DIR above all,
+    would retarget every git call at a foreign repository even though
+    this helper names its repository with -C, so the location variables
+    never pass through.
+    """
+    env = dict(os.environ)
+    for name in GIT_LOCATION_VARIABLES:
+        env.pop(name, None)
+    return env
+
+
 def _git_result(repo, *args):
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            env=_git_env(),
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SwitchyardError(
+            f"git {' '.join(args)} did not finish within "
+            f"{GIT_TIMEOUT_SECONDS} seconds and was stopped"
+        ) from exc
 
 
 def _git(repo, *args):
