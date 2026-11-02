@@ -10,6 +10,7 @@ import io
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,7 +19,6 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 from switchyard import cli, core  # noqa: E402
 
@@ -310,6 +310,7 @@ CORRUPT_BODIES = [
                     "port_end": 20009,
                     "database": "switchyard_alpha",
                     "env_file": "worktrees/alpha/.env.switchyard",
+                    "claimed_at": "2026-11-02T00:00:00+00:00",
                 },
                 "beta": {
                     "agent": "beta",
@@ -319,11 +320,62 @@ CORRUPT_BODIES = [
                     "port_end": 20014,
                     "database": "switchyard_beta",
                     "env_file": "worktrees/beta/.env.switchyard",
+                    "claimed_at": "2026-11-02T00:00:00+00:00",
                 },
             },
         }
     ),
 ]
+
+
+def valid_record(agent, port_start=20000):
+    return {
+        "agent": agent,
+        "branch": core.branch_name(agent),
+        "worktree": f"{core.WORKTREES_NAME}/{agent}",
+        "port_start": port_start,
+        "port_end": port_start + 9,
+        "database": core.database_name(agent),
+        "env_file": f"{core.WORKTREES_NAME}/{agent}/{core.ENV_NAME}",
+        "claimed_at": "2026-11-02T00:00:00+00:00",
+    }
+
+
+def registry_body(claims, **overrides):
+    body = {
+        "version": 1,
+        "port_pool": {"start": 20000, "range_size": 10, "range_count": 16},
+        "claims": claims,
+    }
+    body.update(overrides)
+    return json.dumps(body)
+
+
+def _forged_bodies():
+    extra_record_field = valid_record("alpha")
+    extra_record_field["note"] = "not a recorded field"
+    missing_claimed_at = valid_record("alpha")
+    del missing_claimed_at["claimed_at"]
+    forged_branch = valid_record("alpha")
+    forged_branch["branch"] = "main"
+    forged_worktree = valid_record("alpha")
+    forged_worktree["worktree"] = "worktrees/beta"
+    forged_worktree["env_file"] = "worktrees/beta/" + core.ENV_NAME
+    wide_pool = {"start": 20000, "range_size": 10, "range_count": 16, "extra": 1}
+    return [
+        registry_body({}, version=1.0),
+        registry_body({}, version=True),
+        registry_body({}, surprise="an unrecorded field"),
+        registry_body({}, port_pool=wide_pool),
+        registry_body({"alpha": extra_record_field}),
+        registry_body({"alpha": missing_claimed_at}),
+        registry_body({"alpha": forged_branch}),
+        registry_body({"alpha": forged_worktree}),
+        registry_body({"../escape": valid_record("../escape")}),
+    ]
+
+
+CORRUPT_BODIES += _forged_bodies()
 
 
 @pytest.mark.parametrize("body", CORRUPT_BODIES)
@@ -374,6 +426,220 @@ def test_unsafe_agent_names_are_rejected_and_change_nothing(stack, name):
     assert err.strip()
     assert snapshot(stack) == before
     assert not (stack.parent / "escape").exists()
+
+
+# SY-8, forged records, decode damage, and the repository perimeter
+
+
+def test_a_record_pointing_at_another_agents_worktree_is_corrupt(stack):
+    assert run_cli(["claim", "alpha", "--stack", str(stack)])[0] == 0
+    assert run_cli(["claim", "beta", "--stack", str(stack)])[0] == 0
+    data = read_registry(stack)
+    data["claims"]["alpha"]["worktree"] = "worktrees/beta"
+    data["claims"]["alpha"]["env_file"] = "worktrees/beta/" + core.ENV_NAME
+    (stack / core.REGISTRY_NAME).write_text(json.dumps(data), encoding="utf-8")
+    before = snapshot(stack)
+    code, _, err = run_cli(["release", "alpha", "--stack", str(stack)])
+    assert code != 0
+    assert "corrupt" in err
+    assert snapshot(stack) == before
+    assert (stack / "worktrees" / "beta").is_dir()
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        b"\xff\xfe\x00 not a registry in any encoding",
+        json.dumps({"version": 1, "port_pool": {}, "claims": {}}).encode("utf-16"),
+    ],
+)
+def test_a_registry_that_is_not_utf8_text_is_corrupt_and_changes_nothing(stack, blob):
+    (stack / core.REGISTRY_NAME).write_bytes(blob)
+    before = snapshot(stack)
+    for argv in (
+        ["claim", "alpha", "--stack", str(stack)],
+        ["list", "--stack", str(stack)],
+        ["release", "alpha", "--stack", str(stack)],
+    ):
+        code, _, err = run_cli(argv)
+        assert code != 0, argv
+        assert "corrupt" in err, argv
+    assert snapshot(stack) == before
+
+
+def test_a_registry_path_that_is_a_directory_is_corrupt_not_missing(stack):
+    registry = stack / core.REGISTRY_NAME
+    registry.unlink()
+    registry.mkdir()
+    for argv in (
+        ["claim", "alpha", "--stack", str(stack)],
+        ["list", "--stack", str(stack)],
+    ):
+        code, _, err = run_cli(argv)
+        assert code != 0, argv
+        assert "corrupt" in err, argv
+        assert "not a file" in err, argv
+
+
+def test_a_lock_path_that_is_a_directory_is_a_clean_error(stack):
+    lock = stack / core.LOCK_NAME
+    lock.unlink()
+    lock.mkdir()
+    for argv in (
+        ["claim", "alpha", "--stack", str(stack)],
+        ["release", "alpha", "--stack", str(stack)],
+    ):
+        code, _, err = run_cli(argv)
+        assert code != 0, argv
+        assert "lock" in err, argv
+
+
+def test_a_missing_lock_file_is_recreated_when_the_registry_survives(stack):
+    assert run_cli(["claim", "alpha", "--stack", str(stack)])[0] == 0
+    (stack / core.LOCK_NAME).unlink()
+    code, _, err = run_cli(["claim", "beta", "--stack", str(stack)])
+    assert code == 0, err
+    assert (stack / core.LOCK_NAME).is_file()
+    code, _, err = run_cli(["release", "alpha", "--stack", str(stack)])
+    assert code == 0, err
+    assert set(read_registry(stack)["claims"]) == {"beta"}
+
+
+def test_claim_refuses_a_stack_repo_that_lost_its_git_inside_an_outer_repo(tmp_path):
+    git(tmp_path, "init", "-q", "-b", "main", "outer")
+    outer = tmp_path / "outer"
+    stack = init_stack_dir(outer)
+    assert run_cli(["claim", "alpha", "--stack", str(stack)])[0] == 0
+    registry_before = (stack / core.REGISTRY_NAME).read_bytes()
+    shutil.rmtree(stack / "repo" / ".git")
+    for argv in (
+        ["claim", "beta", "--stack", str(stack)],
+        ["release", "alpha", "--stack", str(stack)],
+    ):
+        code, _, err = run_cli(argv)
+        assert code != 0, argv
+        assert ".git" in err, argv
+    assert (stack / core.REGISTRY_NAME).read_bytes() == registry_before
+    assert "switchyard" not in git(outer, "branch", "--list")
+    assert str(stack) not in git(outer, "worktree", "list")
+
+
+# SY-1 and SY-9, claim failure completeness and stack path handling
+
+
+def test_a_blocked_claim_leaves_no_branch_and_the_name_can_be_claimed(stack):
+    blocker = stack / "worktrees" / "alpha"
+    blocker.mkdir()
+    (blocker / "junk.txt").write_text("in the way", encoding="utf-8")
+    code, _, err = run_cli(["claim", "alpha", "--stack", str(stack)])
+    assert code != 0
+    assert git(stack / "repo", "branch", "--list", "switchyard/alpha").strip() == ""
+    assert read_registry(stack)["claims"] == {}
+    shutil.rmtree(blocker)
+    code, _, err = run_cli(["claim", "alpha", "--stack", str(stack)])
+    assert code == 0, err
+    assert (stack / "worktrees" / "alpha").is_dir()
+
+
+def test_a_failed_claim_reports_an_incomplete_rollback(stack, monkeypatch):
+    real_result = core._git_result
+
+    def flaky_result(repo, *args):
+        if args[:2] == ("branch", "-D"):
+            return subprocess.CompletedProcess(args, 1, "", "the branch is busy")
+        return real_result(repo, *args)
+
+    def broken_save(stack_arg, data):
+        raise core.SwitchyardError("the registry write is broken in this test")
+
+    monkeypatch.setattr(core, "_git_result", flaky_result)
+    monkeypatch.setattr(core, "_save_registry", broken_save)
+    with pytest.raises(core.SwitchyardError) as excinfo:
+        core.claim(stack, "alpha")
+    message = str(excinfo.value)
+    assert "rolling it back was incomplete" in message
+    assert "could not be deleted" in message
+
+
+def test_a_failed_registry_save_leaves_no_temporary_file(stack, monkeypatch):
+    def broken_replace(source, target):
+        raise OSError("no space left in this test")
+
+    monkeypatch.setattr(core.os, "replace", broken_replace)
+    with pytest.raises(core.SwitchyardError):
+        core._save_registry(stack, read_registry(stack))
+    assert not (stack / (core.REGISTRY_NAME + ".tmp")).exists()
+    assert (stack / core.REGISTRY_NAME).is_file()
+
+
+def test_claim_against_a_repository_with_no_commits_fails_and_records_nothing(stack):
+    shutil.rmtree(stack / "repo")
+    git(stack, "init", "-q", "-b", "main", "repo")
+    code, _, err = run_cli(["claim", "alpha", "--stack", str(stack)])
+    assert code != 0
+    assert "no commits" in err
+    assert read_registry(stack)["claims"] == {}
+    assert not (stack / "worktrees" / "alpha").exists()
+
+
+def test_a_relative_stack_path_works_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    code, _, err = run_cli(["init", "--stack", "stack"])
+    assert code == 0, err
+    code, _, err = run_cli(["claim", "alpha", "--stack", "stack"])
+    assert code == 0, err
+    stack = tmp_path / "stack"
+    assert (stack / "worktrees" / "alpha").is_dir()
+    assert not (stack / "repo" / "stack").exists()
+    code, out, err = run_cli(["list", "--stack", "stack"])
+    assert code == 0, err
+    assert "alpha" in out
+    code, _, err = run_cli(["release", "alpha", "--stack", "stack"])
+    assert code == 0, err
+    assert read_registry(stack)["claims"] == {}
+
+
+def test_a_stack_root_that_is_a_file_fails_every_command_cleanly(tmp_path):
+    target = tmp_path / "stack"
+    target.write_text("a file, not a stack", encoding="utf-8")
+    for argv in (
+        ["init", "--stack", str(target)],
+        ["claim", "alpha", "--stack", str(target)],
+        ["list", "--stack", str(target)],
+        ["release", "alpha", "--stack", str(target)],
+    ):
+        code, _, err = run_cli(argv)
+        assert code != 0, argv
+        assert err.strip(), argv
+    assert target.read_text(encoding="utf-8") == "a file, not a stack"
+
+
+def test_a_failed_init_leaves_no_half_initialised_stack(tmp_path):
+    stack = tmp_path / "stack"
+    stack.mkdir()
+    (stack / "repo").write_text("a file where the repo belongs", encoding="utf-8")
+    code, _, err = run_cli(["init", "--stack", str(stack)])
+    assert code != 0
+    assert err.strip()
+    assert sorted(p.name for p in stack.iterdir()) == ["repo"]
+    assert (stack / "repo").read_text(encoding="utf-8") == (
+        "a file where the repo belongs"
+    )
+    code, _, err = run_cli(["list", "--stack", str(stack)])
+    assert code != 0
+    assert "no registry" in err
+
+
+# SY-10, the name length cap
+
+
+def test_the_agent_name_cap_is_forty_characters(stack):
+    code, _, err = run_cli(["claim", "a" * 41, "--stack", str(stack)])
+    assert code != 0
+    assert "40" in err
+    assert read_registry(stack)["claims"] == {}
+    code, _, err = run_cli(["claim", "a" * 40, "--stack", str(stack)])
+    assert code == 0, err
 
 
 # The module entry point

@@ -28,7 +28,7 @@ The feature obligations below rest on behaviour probed against the real tools on
 
 ## Obligation SY-1
 
-Obligation SY-1 covers complete allocation. A successful claim creates a git worktree on a new branch for the agent and draws one port range from the pool recorded in the registry and derives a database name from the agent name and writes an env file inside the worktree, and the registry record for the agent matches the branch and the range and the database and the paths that exist on disk. A claim that creates some of these and not others, or records values that differ from what it created, fails this obligation. This is covered by the claim tests in the tests folder, which read the registry and the disk and the repository after a claim and compare all three.
+Obligation SY-1 covers complete allocation. A successful claim creates a git worktree on a new branch for the agent and draws one port range from the pool recorded in the registry and derives a database name from the agent name and writes an env file inside the worktree, and the registry record for the agent matches the branch and the range and the database and the paths that exist on disk, and the record carries claimed_at, the time the claim was made. A claim that creates some of these and not others, or records values that differ from what it created, fails this obligation. This is covered by the claim tests in the tests folder, which read the registry and the disk and the repository after a claim and compare all three.
 
 ## Obligation SY-2
 
@@ -64,7 +64,7 @@ Obligation SY-9 covers an uninitialised stack. When the stack root holds no regi
 
 ## Obligation SY-10
 
-Obligation SY-10 covers agent name safety. A claim rejects an agent name that is not one path safe component of lowercase letters and digits and hyphens, so no claim can create a worktree or a file outside the stack root, and a rejected name changes nothing. This is covered by the name tests in the tests folder, which try traversal names and names with spaces and check that nothing appears inside or outside the stack.
+Obligation SY-10 covers agent name safety. A claim rejects an agent name that is not one path safe component of lowercase letters and digits and hyphens of at most 40 characters, so no claim can create a worktree or a file outside the stack root, and a rejected name changes nothing. This is covered by the name tests in the tests folder, which try traversal names and names with spaces and check that nothing appears inside or outside the stack.
 
 ## How the stub grew
 

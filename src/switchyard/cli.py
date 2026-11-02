@@ -68,16 +68,17 @@ def _print_table(records):
         )
         for record in records
     ]
-    widths = [
-        max(len(cell) for cell in column)
-        for column in zip(header, *rows)
-    ] if rows else [len(cell) for cell in header]
+    widths = [len(cell) for cell in header]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
     for row in [header, *rows]:
         print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)))
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args.stack = args.stack.resolve()
     try:
         if args.command == "init":
             pool = core.init_stack(

@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -64,8 +65,9 @@ def validate_agent_name(agent):
         or not AGENT_NAME_PATTERN.match(agent)
     ):
         raise InvalidAgentNameError(
-            f"invalid agent name {agent!r}, use lowercase letters and digits "
-            "and hyphens as one path safe component"
+            f"invalid agent name {agent!r}, use one path safe component of "
+            f"lowercase letters and digits and hyphens, at most "
+            f"{AGENT_NAME_MAX} characters long"
         )
 
 
@@ -89,32 +91,83 @@ def _corrupt(path, why):
     return CorruptRegistryError(f"registry at {path} is corrupt, {why}")
 
 
+REGISTRY_KEYS = {"version", "port_pool", "claims"}
+POOL_KEYS = {"start", "range_size", "range_count"}
+RECORD_KEYS = {
+    "agent",
+    "branch",
+    "worktree",
+    "port_start",
+    "port_end",
+    "database",
+    "env_file",
+    "claimed_at",
+}
+
+
+def _derived_fields(agent):
+    worktree = f"{WORKTREES_NAME}/{agent}"
+    return {
+        "branch": branch_name(agent),
+        "worktree": worktree,
+        "database": database_name(agent),
+        "env_file": f"{worktree}/{ENV_NAME}",
+    }
+
+
 def _validate_registry(data, path):
     if not isinstance(data, dict):
         raise _corrupt(path, "the top level is not an object")
-    if data.get("version") != REGISTRY_VERSION:
+    if set(data) != REGISTRY_KEYS:
+        raise _corrupt(
+            path,
+            "the top level fields are not exactly version and port_pool and claims",
+        )
+    if not _is_int(data["version"]) or data["version"] != REGISTRY_VERSION:
         raise _corrupt(path, "the version is missing or unsupported")
-    pool = data.get("port_pool")
+    pool = data["port_pool"]
     if not isinstance(pool, dict):
         raise _corrupt(path, "the port pool is missing")
+    if set(pool) != POOL_KEYS:
+        raise _corrupt(
+            path,
+            "the port pool fields are not exactly start and range_size and range_count",
+        )
     for key in ("start", "range_size", "range_count"):
-        if not _is_int(pool.get(key)) or pool[key] <= 0:
+        if not _is_int(pool[key]) or pool[key] <= 0:
             raise _corrupt(path, f"the port pool field {key} is not a positive integer")
     pool_end = pool["start"] + pool["range_size"] * pool["range_count"] - 1
-    claims = data.get("claims")
+    claims = data["claims"]
     if not isinstance(claims, dict):
         raise _corrupt(path, "the claims are missing or not an object")
     ranges = []
     for agent, record in claims.items():
+        try:
+            validate_agent_name(agent)
+        except InvalidAgentNameError:
+            raise _corrupt(
+                path, f"the claim key {agent} is not a safe agent name"
+            ) from None
         if not isinstance(record, dict):
             raise _corrupt(path, f"the claim for {agent} is not an object")
-        if record.get("agent") != agent:
+        if set(record) != RECORD_KEYS:
+            raise _corrupt(
+                path, f"the claim for {agent} does not carry exactly the recorded fields"
+            )
+        if record["agent"] != agent:
             raise _corrupt(path, f"the claim keyed {agent} names a different agent")
-        for key in ("branch", "worktree", "database", "env_file"):
-            if not isinstance(record.get(key), str) or not record[key]:
+        for key in ("branch", "worktree", "database", "env_file", "claimed_at"):
+            if not isinstance(record[key], str) or not record[key]:
                 raise _corrupt(path, f"the claim for {agent} has no sound {key}")
+        for key, expected in _derived_fields(agent).items():
+            if record[key] != expected:
+                raise _corrupt(
+                    path,
+                    f"the claim for {agent} records {key} as {record[key]} "
+                    f"where the agent name derives {expected}",
+                )
         for key in ("port_start", "port_end"):
-            if not _is_int(record.get(key)):
+            if not _is_int(record[key]):
                 raise _corrupt(path, f"the claim for {agent} has no sound {key}")
         if record["port_start"] > record["port_end"]:
             raise _corrupt(path, f"the claim for {agent} has an inverted port range")
@@ -136,12 +189,16 @@ def _validate_registry(data, path):
 def load_registry(stack):
     """Read and validate the registry, changing nothing on disk."""
     path = _registry_path(stack)
-    if not path.is_file():
+    if not path.exists():
         raise NotInitialisedError(
             f"no registry at {path}, run switchyard init to create the stack"
         )
+    if not path.is_file():
+        raise _corrupt(path, "the registry path is not a file")
     try:
         raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise _corrupt(path, f"it is not valid UTF-8 text, {exc}") from exc
     except OSError as exc:
         raise _corrupt(path, f"it cannot be read, {exc}") from exc
     try:
@@ -154,8 +211,19 @@ def load_registry(stack):
 def _save_registry(stack, data):
     path = _registry_path(stack)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(
+            json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise SwitchyardError(
+            f"the registry at {path} cannot be written, {exc}"
+        ) from exc
 
 
 @contextmanager
@@ -163,9 +231,11 @@ def _locked(stack):
     lock_path = stack / LOCK_NAME
     try:
         fd = os.open(lock_path, os.O_RDWR)
-    except FileNotFoundError as exc:
-        raise NotInitialisedError(
-            f"no lock file at {lock_path}, run switchyard init to create the stack"
+    except FileNotFoundError:
+        fd = _recreate_lock(stack, lock_path)
+    except OSError as exc:
+        raise SwitchyardError(
+            f"the lock file at {lock_path} cannot be opened, {exc}"
         ) from exc
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -175,12 +245,37 @@ def _locked(stack):
         os.close(fd)
 
 
-def _git(repo, *args):
-    result = subprocess.run(
+def _recreate_lock(stack, lock_path):
+    """Recreate a missing lock file when the registry survives.
+
+    The lock file is an empty marker whose only job is to be flocked,
+    so a stack whose registry is intact but whose lock file was deleted
+    recovers by recreating the marker. A stack with no registry is not
+    initialised, and nothing is created for it here.
+    """
+    if not _registry_path(stack).is_file():
+        raise NotInitialisedError(
+            f"the stack at {stack} is not initialised, it holds no registry, "
+            "run switchyard init to create the stack"
+        )
+    try:
+        return os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        raise SwitchyardError(
+            f"the lock file at {lock_path} cannot be recreated, {exc}"
+        ) from exc
+
+
+def _git_result(repo, *args):
+    return subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
     )
+
+
+def _git(repo, *args):
+    result = _git_result(repo, *args)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise SwitchyardError(
@@ -189,50 +284,121 @@ def _git(repo, *args):
     return result.stdout
 
 
-def _git_quiet(repo, *args):
-    subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-    )
+def _verify_own_repo(stack):
+    """Refuse to run git unless the stack repo is its own repository.
+
+    Git finds a repository by walking upward, so a stack repo that lost
+    its .git entry while sitting inside a larger repository would make
+    every git operation land silently in the ancestor. Claim and
+    release call this before they run any git command.
+    """
+    repo = stack / REPO_NAME
+    if not (repo / ".git").exists():
+        raise SwitchyardError(
+            f"the stack repository at {repo} has no .git entry of its own, "
+            "so switchyard will not run git against it"
+        )
+    result = _git_result(repo, "rev-parse", "--show-toplevel")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise SwitchyardError(
+            f"the stack repository at {repo} cannot be read by git, {detail}"
+        )
+    top = result.stdout.strip()
+    if Path(top).resolve() != repo.resolve():
+        raise SwitchyardError(
+            f"the stack repository at {repo} resolves to the repository at "
+            f"{top}, which is not the stack repository, "
+            "so switchyard will not run git against it"
+        )
+
+
+def _positive_int(value, label):
+    if not _is_int(value) or value <= 0:
+        raise SwitchyardError(f"the {label} must be a positive integer")
+    return value
+
+
+def _remove_created(paths):
+    problems = []
+    for path in paths:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError as exc:
+            problems.append(f"{path} could not be removed, {exc}")
+    return problems
 
 
 def init_stack(stack, port_start, range_size, range_count):
-    """Create a stack root with a repository, a lock file, and a registry."""
-    stack = Path(stack)
+    """Create a stack root with a repository, a lock file, and a registry.
+
+    Init is failure atomic in effect. If any step fails, everything
+    init created is removed again and the failure is reported as one
+    clean error, so no half initialised stack is left for later
+    commands to misread.
+    """
+    stack = Path(stack).resolve()
     if _registry_path(stack).is_file():
         raise SwitchyardError(f"stack at {stack} is already initialised")
-    if not _is_int(port_start) or port_start <= 0:
-        raise SwitchyardError("the port start must be a positive integer")
-    if not _is_int(range_size) or range_size <= 0:
-        raise SwitchyardError("the range size must be a positive integer")
-    if not _is_int(range_count) or range_count <= 0:
-        raise SwitchyardError("the range count must be a positive integer")
+    port_start = _positive_int(port_start, "port start")
+    range_size = _positive_int(range_size, "range size")
+    range_count = _positive_int(range_count, "range count")
     if port_start + range_size * range_count - 1 > 65535:
         raise SwitchyardError("the port pool reaches past port 65535")
     repo = stack / REPO_NAME
-    (stack / WORKTREES_NAME).mkdir(parents=True, exist_ok=True)
-    repo.mkdir(parents=True, exist_ok=True)
-    _git(stack, "init", "-q", "-b", "main", str(repo))
-    _git(repo, "config", "user.email", "switchyard@example.invalid")
-    _git(repo, "config", "user.name", "switchyard")
-    (repo / "README.md").write_text(
-        "Synthetic stack repository created by switchyard init.\n",
-        encoding="utf-8",
+    worktrees = stack / WORKTREES_NAME
+    lock_path = stack / LOCK_NAME
+    registry = _registry_path(stack)
+    watched = (
+        registry.with_name(registry.name + ".tmp"),
+        registry,
+        lock_path,
+        repo,
+        worktrees,
+        stack,
     )
-    _git(repo, "add", "README.md")
-    _git(repo, "commit", "-q", "-m", "Initialise the stack repository")
-    (stack / LOCK_NAME).touch()
-    data = {
-        "version": REGISTRY_VERSION,
-        "port_pool": {
-            "start": port_start,
-            "range_size": range_size,
-            "range_count": range_count,
-        },
-        "claims": {},
-    }
-    _save_registry(stack, data)
+    preexisting = {path for path in watched if path.exists() or path.is_symlink()}
+    try:
+        worktrees.mkdir(parents=True, exist_ok=True)
+        repo.mkdir(parents=True, exist_ok=True)
+        _git(stack, "init", "-q", "-b", "main", str(repo))
+        _git(repo, "config", "user.email", "switchyard@example.invalid")
+        _git(repo, "config", "user.name", "switchyard")
+        (repo / "README.md").write_text(
+            "Synthetic stack repository created by switchyard init.\n",
+            encoding="utf-8",
+        )
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "Initialise the stack repository")
+        lock_path.touch()
+        data = {
+            "version": REGISTRY_VERSION,
+            "port_pool": {
+                "start": port_start,
+                "range_size": range_size,
+                "range_count": range_count,
+            },
+            "claims": {},
+        }
+        _save_registry(stack, data)
+    except BaseException as exc:
+        created = [path for path in watched if path not in preexisting]
+        problems = _remove_created(created)
+        if problems:
+            raise SwitchyardError(
+                f"init of the stack at {stack} failed, {exc}, and the partial "
+                f"stack could not be fully removed, {', '.join(problems)}"
+            ) from exc
+        if isinstance(exc, SwitchyardError):
+            raise
+        if isinstance(exc, OSError):
+            raise SwitchyardError(
+                f"the stack at {stack} cannot be created, {exc}"
+            ) from exc
+        raise
     return data["port_pool"]
 
 
@@ -265,6 +431,44 @@ def _env_text(record):
     return "\n".join(lines) + "\n"
 
 
+def _require_committed_head(repo):
+    result = _git_result(repo, "rev-parse", "--verify", "--quiet", "HEAD")
+    if result.returncode != 0:
+        raise SwitchyardError(
+            f"the stack repository at {repo} has no commits yet, "
+            "so no claim can branch from it"
+        )
+
+
+def _rollback_claim(repo, worktree, branch):
+    """Best effort removal of whatever a failed claim created.
+
+    The branch is deleted whether or not the worktree add reported
+    success, because git creates the branch inside the add command
+    itself, so a failed add can still leave a branch behind that would
+    block every later claim for the agent. The worktree is removed
+    only when it carries the .git file of a real worktree, so a
+    directory that was already in the way is left untouched. Returns a
+    list of problem descriptions, empty when everything was removed
+    or never existed.
+    """
+    problems = []
+    if (worktree / ".git").exists():
+        result = _git_result(repo, "worktree", "remove", "--force", str(worktree))
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            problems.append(
+                f"the worktree at {worktree} could not be removed, {detail}"
+            )
+    listed = _git_result(repo, "branch", "--list", branch)
+    if listed.returncode == 0 and listed.stdout.strip():
+        result = _git_result(repo, "branch", "-D", branch)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            problems.append(f"the branch {branch} could not be deleted, {detail}")
+    return problems
+
+
 def claim(stack, agent):
     """Allocate a worktree, a branch, a port range, a database, an env file.
 
@@ -272,7 +476,7 @@ def claim(stack, agent):
     is loaded only after the lock is held, so a racing process can
     never act on a stale read.
     """
-    stack = Path(stack)
+    stack = Path(stack).resolve()
     validate_agent_name(agent)
     repo = stack / REPO_NAME
     branch = branch_name(agent)
@@ -281,6 +485,7 @@ def claim(stack, agent):
     env_rel = f"{worktree_rel}/{ENV_NAME}"
     with _locked(stack):
         data = load_registry(stack)
+        _verify_own_repo(stack)
         if agent in data["claims"]:
             raise SwitchyardError(
                 f"agent {agent} already holds a claim in this stack"
@@ -301,29 +506,32 @@ def claim(stack, agent):
             "env_file": env_rel,
             "claimed_at": datetime.now(timezone.utc).isoformat(),
         }
-        created = False
         try:
+            _require_committed_head(repo)
             _git(repo, "worktree", "add", "-b", branch, str(worktree))
-            created = True
+            _git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
             (stack / env_rel).write_text(_env_text(record), encoding="utf-8")
             data["claims"][agent] = record
             _save_registry(stack, data)
-        except BaseException:
-            if created:
-                _git_quiet(repo, "worktree", "remove", "--force", str(worktree))
-                _git_quiet(repo, "branch", "-D", branch)
-            data["claims"].pop(agent, None)
+        except BaseException as exc:
+            problems = _rollback_claim(repo, worktree, branch)
+            if problems:
+                raise SwitchyardError(
+                    f"the claim for {agent} failed, {exc}, and rolling it "
+                    f"back was incomplete, {', '.join(problems)}"
+                ) from exc
             raise
         return record
 
 
 def release(stack, agent):
     """Return every resource a claim holds and remove its record."""
-    stack = Path(stack)
+    stack = Path(stack).resolve()
     validate_agent_name(agent)
     repo = stack / REPO_NAME
     with _locked(stack):
         data = load_registry(stack)
+        _verify_own_repo(stack)
         record = data["claims"].get(agent)
         if record is None:
             raise SwitchyardError(f"agent {agent} holds no claim in this stack")
@@ -342,6 +550,6 @@ def release(stack, agent):
 
 def list_claims(stack):
     """Return the recorded claims sorted by agent, reading nothing else."""
-    stack = Path(stack)
+    stack = Path(stack).resolve()
     data = load_registry(stack)
     return [data["claims"][agent] for agent in sorted(data["claims"])]
