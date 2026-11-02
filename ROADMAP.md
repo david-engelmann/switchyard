@@ -1,0 +1,19 @@
+# Switchyard roadmap
+
+Switchyard furnishes the box. It gives every parallel agent its own branch, port range, database, and env file with one command, and it stands at 1 of 100 closed rounds, with claim and list and release landed in Round 1 over one registry file. The deterministic core deepens first. The wait queue, declared allocation profiles, and everything in the decision model section below enter only behind that core, each in its own round under the same review discipline as Round 1.
+
+## Decision models
+
+Judgment enters switchyard at exactly two edges, and nowhere else.
+
+An intent level request is the first edge. A claim today is fully specified by its caller. A later slice lets an agent describe the job in prose instead, and a decision model maps that description to one of the declared allocation profiles. The model returns a choice among the profiles the repo declares, and the deterministic layer validates the choice and allocates exactly as it does today.
+
+Contention is the second edge. When the port pool is exhausted, a later slice adds a wait queue, and released ranges become the scarce resource. The model scores each waiting request, and the deterministic queue orders by that score rather than by arrival alone. A score is advice to an ordering rule, never an allocation.
+
+The model is Typesafe Jev, reached only through the program's Typesafe connector route, which is a System One decision model returning a typed choice or a score with a calibrated confidence and per label probabilities. The OpenAI decision model is the named comparison point. The same recorded vignettes are scored by both models in evaluation, and wiring the comparison model waits on a route and a budget set at program level.
+
+What stays deterministic is everything that makes switchyard trustworthy. The registry and its validation, the lock, the port arithmetic, the allocation itself, and every refusal the validator makes today never pass through a model. The model never writes the registry and never allocates. Its outputs are inputs to deterministic code, and every model influenced decision is recorded with the model name, the confidence it returned, and the fallback taken when it abstained or the call failed. Abstention always has a deterministic landing. An intent level request falls back to the profile the caller declared as its default, and a queue with no scores orders first come first served, which is the behaviour a reader of Round 1 already knows.
+
+Tests stay offline. A bounded recording window captures synthetic request and response pairs from live calls and stores them in the repo as JSON fixtures, each fixture carrying the model name and the exact call shape. The suite replays those fixtures through a fixture transport, and no test performs a network call. The policy code that consumes a choice or a score is tested deterministically against the recorded responses, including the abstain and low confidence shapes, so a model version change shows up as fixture changes in review rather than as behaviour drift in the night.
+
+The live call budget proposed for this repo, awaiting approval at program level before any spend beyond verification, is a call count budget, because the observed call is small. The verification call made while drafting this section used 375 input tokens and returned in one call. The proposal is at most 10 verification calls while the client shim is built, at most 200 calls in the single fixture recording window, and at most 100 live evaluation calls in the round that lands a decision feature, with the recorded usage printed in that round's gate report. At the vendor's claimed price the expected spend across all three allowances is under a cent, and the binding cap is the count, with a hard stop of 5 dollars per repo per month if real pricing or call sizes differ from the claim. Any surprise is reported before any further call is made.
