@@ -285,14 +285,13 @@ def _recreate_lock(stack, lock_path):
 
     The lock file is an empty marker whose only job is to be flocked,
     so a stack whose registry is intact but whose lock file was deleted
-    recovers by recreating the marker. A stack with no registry is not
-    initialised, and nothing is created for it here.
+    recovers by recreating the marker. The registry is loaded and
+    validated before the marker is created, so a stack with no registry
+    is reported as uninitialised and a stack whose registry is corrupt
+    is reported as corrupt, and neither report leaves a new lock file
+    behind.
     """
-    if not _registry_path(stack).is_file():
-        raise NotInitialisedError(
-            f"the stack at {stack} is not initialised, it holds no registry, "
-            "run switchyard init to create the stack"
-        )
+    load_registry(stack)
     try:
         return os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as exc:
@@ -454,6 +453,17 @@ def init_stack(stack, port_start, range_size, range_count):
     worktrees = stack / WORKTREES_NAME
     lock_path = stack / LOCK_NAME
     registry = _registry_path(stack)
+    if repo.exists() or repo.is_symlink():
+        raise SwitchyardError(
+            f"init refuses the stack at {stack} because {repo} already "
+            "exists, and the stack root must not already hold a repo path "
+            "that init did not create, so nothing was changed"
+        )
+    if (worktrees.exists() or worktrees.is_symlink()) and not worktrees.is_dir():
+        raise SwitchyardError(
+            f"init refuses the stack at {stack} because {worktrees} "
+            "already exists and is not a directory, so nothing was changed"
+        )
     watched = (
         registry.with_name(registry.name + ".tmp"),
         registry,
