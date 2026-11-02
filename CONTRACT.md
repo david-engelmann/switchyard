@@ -8,7 +8,7 @@ Obligation S1 covers seed integrity. The seed files README.md and LICENSE and .g
 
 ## Obligation S2
 
-Obligation S2 covers the local gate. The test suite runs with python and pytest alone and needs no network access and no paid service, and the continuous integration workflow runs the same commands as the local gate. This is covered by the tests in the tests folder and by the workflow file under .github/workflows.
+Obligation S2 covers the local gate. The test suite runs with python and pytest alone and running it needs no network access and no paid service, and the continuous integration workflow runs the same commands as the local gate. This is covered by the tests in the tests folder and by the workflow file under .github/workflows.
 
 ## Obligation S3
 

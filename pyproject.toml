@@ -1,8 +1,5 @@
-[project]
-name = "switchyard"
-version = "0.0.0"
-description = "A worktree and port orchestrator that gives every parallel agent its own branch, port range, database, and env file with one command"
-requires-python = ">=3.12"
+# Packaging metadata arrives with the first package in this repo.
+# Until then this file carries the pytest configuration only.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,7 +8,7 @@ Parallel agents collide where worktree tools stop, on ports, databases, and env 
 
 ## Status
 
-The remote seed was verified on 2026-11-02 against the staged seed and its commit is e7e7d53dcd4d41fe5b46d0c51f1808872ff133fb. Setup is landing through a pull request. The contract lives in CONTRACT.md and setup obligations S1 to S5 are the contract state until the full contract lands as the first build act. Closed perfection rounds are 0 of 100. The local gate is python -m pytest -q plus python scripts/codepoint_scan.py.
+The remote seed was verified on 2026-11-02 against the staged seed and its commit is e7e7d53dcd4d41fe5b46d0c51f1808872ff133fb. All work arrives through pull requests and nothing lands on main directly. The contract lives in CONTRACT.md and setup obligations S1 to S5 are the contract state until the full contract lands as the first build act. Closed perfection rounds are 0 of 100. The local gate is python -m pytest -q plus python scripts/codepoint_scan.py.
 
 ## Licence
 
