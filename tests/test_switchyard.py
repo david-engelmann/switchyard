@@ -542,6 +542,24 @@ def test_a_missing_lock_file_is_recreated_when_the_registry_survives(stack):
     assert set(read_registry(stack)["claims"]) == {"beta"}
 
 
+def test_a_corrupt_registry_with_no_lock_file_creates_no_lock_file(stack):
+    (stack / core.REGISTRY_NAME).write_text(
+        "this is not json", encoding="utf-8"
+    )
+    (stack / core.LOCK_NAME).unlink()
+    before = snapshot(stack)
+    for argv in (
+        ["claim", "alpha", "--stack", str(stack)],
+        ["list", "--stack", str(stack)],
+        ["release", "alpha", "--stack", str(stack)],
+    ):
+        code, _, err = run_cli(argv)
+        assert code == 2, argv
+        assert "corrupt" in err, argv
+    assert not (stack / core.LOCK_NAME).exists()
+    assert snapshot(stack) == before
+
+
 def test_claim_refuses_a_stack_repo_that_lost_its_git_inside_an_outer_repo(tmp_path):
     git(tmp_path, "init", "-q", "-b", "main", "outer")
     outer = tmp_path / "outer"
@@ -665,6 +683,65 @@ def test_a_failed_init_leaves_no_half_initialised_stack(tmp_path):
     code, _, err = run_cli(["list", "--stack", str(stack)])
     assert code != 0
     assert "no registry" in err
+
+
+def test_init_refuses_a_foreign_repository_at_the_repo_path(tmp_path):
+    stack = tmp_path / "stack"
+    repo = stack / core.REPO_NAME
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "foreign@example.invalid")
+    git(repo, "config", "user.name", "foreign owner")
+    (repo / "README.md").write_text("the foreign readme\n", encoding="utf-8")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-q", "-m", "foreign commit")
+    head_before = git(repo, "rev-parse", "HEAD")
+    before = snapshot(stack)
+    code, _, err = run_cli(["init", "--stack", str(stack)])
+    assert code != 0
+    assert str(repo) in err
+    assert git(repo, "rev-parse", "HEAD") == head_before
+    assert git(repo, "config", "user.email").strip() == (
+        "foreign@example.invalid"
+    )
+    assert (repo / "README.md").read_text(encoding="utf-8") == (
+        "the foreign readme\n"
+    )
+    assert snapshot(stack) == before
+
+
+def test_init_refuses_a_plain_file_at_the_repo_path(tmp_path):
+    stack = tmp_path / "stack"
+    stack.mkdir()
+    repo = stack / core.REPO_NAME
+    repo.write_text("a file where the repo belongs", encoding="utf-8")
+    before = snapshot(stack)
+    code, _, err = run_cli(["init", "--stack", str(stack)])
+    assert code != 0
+    assert str(repo) in err
+    assert "already exists" in err
+    assert snapshot(stack) == before
+
+
+def test_init_refuses_a_plain_file_at_the_worktrees_path(tmp_path):
+    stack = tmp_path / "stack"
+    stack.mkdir()
+    blocker = stack / core.WORKTREES_NAME
+    blocker.write_text("a file where the worktrees belong", encoding="utf-8")
+    before = snapshot(stack)
+    code, _, err = run_cli(["init", "--stack", str(stack)])
+    assert code != 0
+    assert "already exists" in err
+    assert snapshot(stack) == before
+
+
+def test_init_into_a_pre_created_empty_stack_root_succeeds(tmp_path):
+    stack = tmp_path / "stack"
+    stack.mkdir()
+    code, _, err = run_cli(["init", "--stack", str(stack)])
+    assert code == 0, err
+    assert (stack / core.REGISTRY_NAME).is_file()
+    assert (stack / core.REPO_NAME / ".git").exists()
 
 
 # SY-10, the name length cap
