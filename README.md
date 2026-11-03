@@ -23,6 +23,19 @@ switchyard release alpha --stack ./stack
 
 A claim creates a worktree on a fresh branch and draws one port range from the pool recorded in the registry and derives a database name from the agent name and writes an env file into the worktree. Claims and releases hold one file lock across the whole read and check and write of the registry, so processes racing for the same name or for ranges cannot both win. A release removes the worktree and the env file inside it and deletes the branch and returns the range to the pool, and releasing is destructive, because the worktree goes away with whatever the agent left uncommitted in it. A corrupt registry stops every command with a loud error while nothing on disk changes, and releasing an agent that holds no claim is an error rather than a quiet success.
 
+## Python binding
+
+The crate carries a thin Python binding for the orchestrators that furnish runs from Python. The binding lives in the bindings folder as its own crate and wraps the same library the command line wraps, so a claim made through Python and a claim made through the binary land in the same registry and follow the same rules. Build it into a virtual environment with maturin.
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install maturin
+maturin develop --manifest-path bindings/Cargo.toml
+```
+
+The switchyard package exposes the four lifecycle operations as the functions init and claim and release and list. Each takes the stack path as a string or a path and the agent name where the operation names one, and each returns plain dictionaries carrying the facts the command line prints, with init returning the port pool and claim and release returning the claim record and list returning one record per live claim. A refusal raises a subclass of SwitchyardError carrying the same message text the command line prints, and the subclass names the class of the refusal, with RefusalError for a plain refusal and NotInitialisedError for an uninitialised stack and CorruptRegistryError for a corrupt registry and InvalidNameError for an agent name the library rejects.
+
 ## Licence
 
 MIT. See LICENSE.
