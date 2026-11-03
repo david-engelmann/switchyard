@@ -16,8 +16,9 @@
 use std::path::PathBuf;
 
 use pyo3::create_exception;
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDict};
 
 use switchyard_core::{Error, Record};
 
@@ -54,20 +55,54 @@ fn record_dict(py: Python<'_>, record: &Record) -> PyResult<Py<PyDict>> {
     Ok(dict.unbind())
 }
 
+/// Resolve one pool argument of init.
+///
+/// An argument the caller leaves out resolves to the default the
+/// library records for it, read from the library constant at call
+/// time, so the library stays the single source of truth for its
+/// own defaults. A boolean is refused outright with a TypeError
+/// naming the argument, because Python spells True and False as
+/// the integers 1 and 0 and a pool argument is never meant as a
+/// truth value.
+fn pool_argument(value: Option<&Bound<'_, PyAny>>, name: &str, default: i64) -> PyResult<i128> {
+    match value {
+        None => Ok(i128::from(default)),
+        Some(value) if value.is_instance_of::<PyBool>() => Err(PyTypeError::new_err(format!(
+            "{name} must be an integer, not a boolean"
+        ))),
+        Some(value) => value.extract::<i128>(),
+    }
+}
+
 /// Create a stack at the given path and return its port pool.
 ///
-/// The pool arguments carry the same defaults the command line
-/// carries, the defaults the library records as DEFAULT_PORT_START
-/// and DEFAULT_RANGE_SIZE and DEFAULT_RANGE_COUNT.
+/// The pool arguments default to the values the library records
+/// as DEFAULT_PORT_START and DEFAULT_RANGE_SIZE and
+/// DEFAULT_RANGE_COUNT, resolved from the library itself.
 #[pyfunction]
-#[pyo3(signature = (stack, port_start = 20000, range_size = 10, range_count = 16))]
+#[pyo3(signature = (stack, port_start = None, range_size = None, range_count = None))]
 fn init(
     py: Python<'_>,
     stack: PathBuf,
-    port_start: i128,
-    range_size: i128,
-    range_count: i128,
+    port_start: Option<Bound<'_, PyAny>>,
+    range_size: Option<Bound<'_, PyAny>>,
+    range_count: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyDict>> {
+    let port_start = pool_argument(
+        port_start.as_ref(),
+        "port_start",
+        switchyard_core::DEFAULT_PORT_START,
+    )?;
+    let range_size = pool_argument(
+        range_size.as_ref(),
+        "range_size",
+        switchyard_core::DEFAULT_RANGE_SIZE,
+    )?;
+    let range_count = pool_argument(
+        range_count.as_ref(),
+        "range_count",
+        switchyard_core::DEFAULT_RANGE_COUNT,
+    )?;
     let pool = py
         .detach(|| switchyard_core::init_stack(&stack, port_start, range_size, range_count))
         .map_err(to_py_error)?;

@@ -11,4 +11,4 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 switchyard-core = { package = "switchyard", path = ".." }
-pyo3 = { version = "0.30", features = ["extension-module"] }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"] }
