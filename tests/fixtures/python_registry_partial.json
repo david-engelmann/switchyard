@@ -1,0 +1,30 @@
+{
+  "claims": {
+    "alpha": {
+      "agent": "alpha",
+      "branch": "switchyard/alpha",
+      "claimed_at": "2026-11-03T06:11:43.270429+00:00",
+      "database": "switchyard_alpha",
+      "env_file": "worktrees/alpha/.env.switchyard",
+      "port_end": 20009,
+      "port_start": 20000,
+      "worktree": "worktrees/alpha"
+    },
+    "beta": {
+      "agent": "beta",
+      "branch": "switchyard/beta",
+      "claimed_at": "2026-11-03T06:11:43.677124+00:00",
+      "database": "switchyard_beta",
+      "env_file": "worktrees/beta/.env.switchyard",
+      "port_end": 20019,
+      "port_start": 20010,
+      "worktree": "worktrees/beta"
+    }
+  },
+  "port_pool": {
+    "range_count": 4,
+    "range_size": 10,
+    "start": 20000
+  },
+  "version": 1
+}
