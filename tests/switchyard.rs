@@ -1401,3 +1401,137 @@ fn python_written_released_registry_claim_reuses_the_freed_slot_and_matches_pyth
     let expected = String::from_utf8(fixture("python_registry_after_reclaim.json")).unwrap();
     assert_eq!(blank_stamps(&written), blank_stamps(&expected));
 }
+
+// The port repair pins. The pool arithmetic overflow, the planted
+// temporary name, and the counts behind them come from the three
+// reviews of the port head, and the overflow shapes are the red
+// team's own drives.
+
+#[test]
+fn an_init_whose_pool_product_overflows_is_refused_and_creates_nothing() {
+    let base = temp_dir("overflow-product");
+    let stack = base.join("stack");
+    let (code, _, err) = run_cli(&[
+        "init",
+        "--stack",
+        &stack.to_string_lossy(),
+        "--range-size",
+        "4611686018427387904",
+        "--range-count",
+        "4",
+    ]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("the port pool reaches past port 65535"),
+        "{err}"
+    );
+    assert!(!stack.exists(), "a refused init leaves no stack behind");
+}
+
+#[test]
+fn an_init_with_a_26_digit_port_start_is_refused_and_creates_nothing() {
+    let base = temp_dir("overflow-start");
+    let stack = base.join("stack");
+    let (code, _, err) = run_cli(&[
+        "init",
+        "--stack",
+        &stack.to_string_lossy(),
+        "--port-start",
+        "99999999999999999999999999",
+    ]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("the port pool reaches past port 65535"),
+        "{err}"
+    );
+    assert!(!stack.exists(), "a refused init leaves no stack behind");
+}
+
+#[test]
+fn an_init_with_a_50_digit_port_start_is_refused_and_creates_nothing() {
+    let base = temp_dir("overflow-saturate");
+    let stack = base.join("stack");
+    let (code, _, err) = run_cli(&[
+        "init",
+        "--stack",
+        &stack.to_string_lossy(),
+        "--port-start",
+        "99999999999999999999999999999999999999999999999999",
+    ]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("the port pool reaches past port 65535"),
+        "{err}"
+    );
+    assert!(!stack.exists(), "a refused init leaves no stack behind");
+}
+
+#[test]
+fn a_registry_whose_pool_product_overflows_reads_corrupt_and_changes_nothing() {
+    let stack = stack_fixture();
+    let path = stack.join(REGISTRY_NAME);
+    let body = serde_json::json!({
+        "version": 1,
+        "port_pool": {"start": 20000, "range_size": 4611686018427387904i64, "range_count": 4},
+        "claims": {}
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap() + "\n").unwrap();
+    let planted = std::fs::read(&path).unwrap();
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, err) = run_cli(&["list", "--stack", &stack_arg]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("the port pool reaches past port 65535"),
+        "{err}"
+    );
+    let (code, _, err) = run_cli(&["claim", "alpha", "--stack", &stack_arg]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("the port pool reaches past port 65535"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), planted);
+}
+
+#[test]
+fn a_registry_whose_pool_end_addition_overflows_reads_corrupt() {
+    let stack = stack_fixture();
+    let path = stack.join(REGISTRY_NAME);
+    let body = serde_json::json!({
+        "version": 1,
+        "port_pool": {"start": 9223372036854775797i64, "range_size": 100, "range_count": 100},
+        "claims": {}
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap() + "\n").unwrap();
+    let planted = std::fs::read(&path).unwrap();
+    let (code, _, err) = run_cli(&["list", "--stack", &stack.to_string_lossy()]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("the port pool reaches past port 65535"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), planted);
+}
+
+#[test]
+fn a_registry_save_never_writes_through_a_link_at_the_retired_tmp_name() {
+    let stack = stack_fixture();
+    let victim = stack.join("victim.txt");
+    std::fs::write(&victim, "sentinel\n").unwrap();
+    let retired = stack.join(format!("{REGISTRY_NAME}.tmp"));
+    std::os::unix::fs::symlink(&victim, &retired).unwrap();
+    switchyard::claim(&stack, "alpha").unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel\n");
+    let registry_meta = std::fs::symlink_metadata(stack.join(REGISTRY_NAME)).unwrap();
+    assert!(registry_meta.is_file() && !registry_meta.file_type().is_symlink());
+    let data = read_registry(&stack);
+    assert_eq!(data["claims"]["alpha"]["port_start"], 20000);
+    // The plant itself is left standing, and no save residue of
+    // any temporary shape remains in the stack.
+    let retired_meta = std::fs::symlink_metadata(&retired).unwrap();
+    assert!(retired_meta.file_type().is_symlink());
+    for entry in std::fs::read_dir(&stack).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!name.contains(".tmp-"), "{name}");
+    }
+}
