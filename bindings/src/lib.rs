@@ -3,7 +3,10 @@
 //! Every rule lives in the library this crate wraps. The functions
 //! here translate Python values into the library arguments, call
 //! the one library function each one names, and translate the
-//! result or the refusal back, and nothing else. A library refusal
+//! result or the refusal back, and nothing else. Each call runs
+//! detached from the interpreter, so the filesystem and lock and
+//! git work inside a call never stalls the other threads of the
+//! calling process while it waits. A library refusal
 //! becomes a Python exception carrying the same message text the
 //! command line prints, under a subclass of SwitchyardError picked
 //! by the exit class of the refusal, so a Python caller can tell a
@@ -65,7 +68,8 @@ fn init(
     range_size: i128,
     range_count: i128,
 ) -> PyResult<Py<PyDict>> {
-    let pool = switchyard_core::init_stack(&stack, port_start, range_size, range_count)
+    let pool = py
+        .detach(|| switchyard_core::init_stack(&stack, port_start, range_size, range_count))
         .map_err(to_py_error)?;
     let dict = PyDict::new(py);
     dict.set_item("port_start", pool.start)?;
@@ -78,7 +82,9 @@ fn init(
 /// for one agent in the stack at the given path.
 #[pyfunction]
 fn claim(py: Python<'_>, stack: PathBuf, agent: &str) -> PyResult<Py<PyDict>> {
-    let record = switchyard_core::claim(&stack, agent).map_err(to_py_error)?;
+    let record = py
+        .detach(|| switchyard_core::claim(&stack, agent))
+        .map_err(to_py_error)?;
     record_dict(py, &record)
 }
 
@@ -86,7 +92,9 @@ fn claim(py: Python<'_>, stack: PathBuf, agent: &str) -> PyResult<Py<PyDict>> {
 /// given path and remove its record.
 #[pyfunction]
 fn release(py: Python<'_>, stack: PathBuf, agent: &str) -> PyResult<Py<PyDict>> {
-    let record = switchyard_core::release(&stack, agent).map_err(to_py_error)?;
+    let record = py
+        .detach(|| switchyard_core::release(&stack, agent))
+        .map_err(to_py_error)?;
     record_dict(py, &record)
 }
 
@@ -94,7 +102,9 @@ fn release(py: Python<'_>, stack: PathBuf, agent: &str) -> PyResult<Py<PyDict>> 
 /// derived only from the registry.
 #[pyfunction(name = "list")]
 fn list_claims(py: Python<'_>, stack: PathBuf) -> PyResult<Vec<Py<PyDict>>> {
-    let records = switchyard_core::list_claims(&stack).map_err(to_py_error)?;
+    let records = py
+        .detach(|| switchyard_core::list_claims(&stack))
+        .map_err(to_py_error)?;
     records
         .iter()
         .map(|record| record_dict(py, record))
