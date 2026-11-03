@@ -1,0 +1,9 @@
+{
+  "claims": {},
+  "port_pool": {
+    "range_count": 16,
+    "range_size": 10,
+    "start": 20000
+  },
+  "version": 1
+}
