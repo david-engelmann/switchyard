@@ -1,0 +1,24 @@
+[package]
+name = "switchyard"
+version = "0.1.0"
+edition = "2021"
+description = "A worktree and port orchestrator that gives every parallel agent its own branch, port range, database, and env file with one command"
+license = "MIT"
+
+[lib]
+name = "switchyard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "switchyard"
+path = "src/bin/switchyard.rs"
+
+[[bin]]
+name = "codepoint_scan"
+path = "src/bin/codepoint_scan.rs"
+
+[dependencies]
+serde = "1"
+serde_json = "1"
+fs2 = "0.4"
+sha2 = "0.10"
