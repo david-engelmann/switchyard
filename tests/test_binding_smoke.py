@@ -67,6 +67,24 @@ def test_refusals_raise_with_the_command_line_messages(tmp_path):
         switchyard.claim(stack, "alpha")
 
 
+def test_init_refuses_boolean_pool_arguments(tmp_path):
+    stack = str(tmp_path / "stack")
+
+    with pytest.raises(TypeError) as start:
+        switchyard.init(stack, port_start=True)
+    assert "port_start" in str(start.value)
+
+    with pytest.raises(TypeError) as size:
+        switchyard.init(stack, range_size=False)
+    assert "range_size" in str(size.value)
+
+    with pytest.raises(TypeError) as count:
+        switchyard.init(stack, range_count=True)
+    assert "range_count" in str(count.value)
+
+    assert not (tmp_path / "stack").exists()
+
+
 def test_the_other_refusal_classes_raise_their_own_types(tmp_path):
     stack = str(tmp_path / "stack")
 
