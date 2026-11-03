@@ -1,0 +1,14 @@
+[package]
+name = "switchyard-bindings"
+version = "0.1.0"
+edition = "2021"
+description = "The thin Python binding over the switchyard crate, carrying no logic of its own"
+license = "MIT"
+
+[lib]
+name = "switchyard"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+switchyard-core = { package = "switchyard", path = ".." }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"] }
