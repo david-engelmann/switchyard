@@ -13,7 +13,7 @@ pub mod cli;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -379,6 +379,19 @@ fn derived_fields(agent: &str) -> [(&'static str, String); 4] {
     ]
 }
 
+/// The last port of a pool, computed wide with checked
+/// multiplication, so pool numbers of any magnitude the caller or
+/// the file can carry resolve to a value or to no value, and never
+/// wrap into a small plausible port. Python computed this in
+/// unbounded integers and refused any pool reaching past the port
+/// limit, so no value here means exactly that refusal.
+fn pool_end_wide(start: i128, range_size: i128, range_count: i128) -> Option<i128> {
+    range_size
+        .checked_mul(range_count)
+        .and_then(|span| start.checked_add(span))
+        .map(|end| end - 1)
+}
+
 fn validate_registry(data: &JVal, path: &Path) -> Result<Registry> {
     let pairs = match data {
         JVal::Obj(pairs) => pairs,
@@ -422,10 +435,14 @@ fn validate_registry(data: &JVal, path: &Path) -> Result<Registry> {
         range_size: pool_ints[1],
         range_count: pool_ints[2],
     };
-    let pool_end = pool.start + pool.range_size * pool.range_count - 1;
-    if pool_end > 65535 {
-        return Err(corrupt(path, "the port pool reaches past port 65535"));
-    }
+    let pool_end = match pool_end_wide(
+        pool.start as i128,
+        pool.range_size as i128,
+        pool.range_count as i128,
+    ) {
+        Some(end) if end <= 65535 => end as i64,
+        _ => return Err(corrupt(path, "the port pool reaches past port 65535")),
+    };
     let claims_value = data.get("claims").unwrap();
     let claim_pairs = match claims_value {
         JVal::Obj(pairs) => pairs,
@@ -628,29 +645,92 @@ fn registry_value(data: &Registry) -> serde_json::Value {
     serde_json::Value::Object(top)
 }
 
-/// Save the registry by rename from a sibling temporary file, so a
-/// reader never sees a half written registry.
-pub fn save_registry(stack: &Path, data: &Registry) -> Result<()> {
-    let path = stack.join(REGISTRY_NAME);
-    let tmp = stack.join(format!("{REGISTRY_NAME}.tmp"));
-    let text = serde_json::to_string_pretty(&registry_value(data)).unwrap() + "\n";
-    let written = fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, &path));
-    match written {
-        Ok(()) => Ok(()),
-        Err(exc) => {
-            let _ = fs::remove_file(&tmp);
-            Err(Error::plain(format!(
-                "the registry at {} cannot be written, {exc}",
-                path.display()
-            )))
+/// A random suffix for one save's temporary file, drawn fresh on
+/// every call, so the name is never standing in the stack before
+/// the save creates it.
+fn random_suffix() -> String {
+    let mut bytes = [0u8; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+        Err(_) => {
+            // The random source failed, so fall back to the clock,
+            // the process id, and a counter. The create_new open in
+            // the save still refuses any name that already stands,
+            // so a collision here costs a retry and never becomes
+            // a write through a planted name.
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tick = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|span| span.as_nanos() as u64)
+                .unwrap_or(0);
+            let mixed = nanos
+                ^ (std::process::id() as u64) << 32
+                ^ tick.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            format!("{mixed:016x}")
         }
     }
 }
 
+/// Save the registry by rename from a sibling temporary file, so a
+/// reader never sees a half written registry.
+///
+/// The temporary file carries a random suffix drawn for this save
+/// alone and is created with create_new, so the save never opens a
+/// name that already stands in the stack. A fixed temporary name
+/// would be a plant target, because a link left at that name would
+/// redirect the write through itself onto whatever it points at
+/// and the rename would then leave the registry path as that link.
+/// The save removes its own temporary file on every failure path.
+pub fn save_registry(stack: &Path, data: &Registry) -> Result<()> {
+    let path = stack.join(REGISTRY_NAME);
+    let text = serde_json::to_string_pretty(&registry_value(data)).unwrap() + "\n";
+    let mut attempt = 0;
+    let result = loop {
+        attempt += 1;
+        let tmp = stack.join(format!("{REGISTRY_NAME}.tmp-{}", random_suffix()));
+        let written = (|| -> io::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            drop(file);
+            fs::rename(&tmp, &path)
+        })();
+        match written {
+            Ok(()) => break Ok(()),
+            Err(exc) => {
+                let _ = fs::remove_file(&tmp);
+                if exc.kind() == io::ErrorKind::AlreadyExists && attempt < 8 {
+                    continue;
+                }
+                break Err(exc);
+            }
+        }
+    };
+    result.map_err(|exc| {
+        Error::plain(format!(
+            "the registry at {} cannot be written, {exc}",
+            path.display()
+        ))
+    })
+}
+
 /// The stack lock, held across the whole read and check and modify
 /// and write of the registry.
+///
+/// The lock is a file identity and not a path name. A lock file
+/// deleted and recreated at the same path while a command holds
+/// the old file gives the next command a different file to lock,
+/// and two holders of two different files exclude nobody. So the
+/// holder confirms the file it holds is the file the lock path
+/// still names, once after taking the lock and again immediately
+/// before publishing the registry, and a mismatch aborts the
+/// command with the registry untouched.
 struct Locked {
     file: fs::File,
+    lock_path: PathBuf,
 }
 
 impl Drop for Locked {
@@ -659,29 +739,75 @@ impl Drop for Locked {
     }
 }
 
+fn lock_identity_error(lock_path: &Path) -> Error {
+    Error::plain(format!(
+        "the lock file at {} is not the file this command locked, \
+         so the registry was left unchanged",
+        lock_path.display()
+    ))
+}
+
+impl Locked {
+    /// Confirm the lock path still names the very file this lock
+    /// holds, by device and inode on both sides.
+    fn verify_current(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let held = match self.file.metadata() {
+            Ok(meta) => meta,
+            Err(_) => return Err(lock_identity_error(&self.lock_path)),
+        };
+        let same = match fs::metadata(&self.lock_path) {
+            Ok(meta) => meta.dev() == held.dev() && meta.ino() == held.ino(),
+            Err(_) => false,
+        };
+        if same {
+            Ok(())
+        } else {
+            Err(lock_identity_error(&self.lock_path))
+        }
+    }
+}
+
+/// How many times taking the lock retries when the lock file is
+/// replaced between the open and the identity check.
+const LOCK_ACQUIRE_ATTEMPTS: usize = 5;
+
 fn locked(stack: &Path) -> Result<Locked> {
     let lock_path = stack.join(LOCK_NAME);
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(file) => file,
-        Err(exc) if exc.kind() == io::ErrorKind::NotFound => recreate_lock(stack, &lock_path)?,
-        Err(exc) => {
-            return Err(Error::plain(format!(
-                "the lock file at {} cannot be opened, {exc}",
+    for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(exc) if exc.kind() == io::ErrorKind::NotFound => recreate_lock(stack, &lock_path)?,
+            Err(exc) => {
+                return Err(Error::plain(format!(
+                    "the lock file at {} cannot be opened, {exc}",
+                    lock_path.display()
+                )));
+            }
+        };
+        file.lock_exclusive().map_err(|exc| {
+            Error::plain(format!(
+                "the lock file at {} cannot be locked, {exc}",
                 lock_path.display()
-            )));
+            ))
+        })?;
+        let held = Locked {
+            file,
+            lock_path: lock_path.clone(),
+        };
+        if held.verify_current().is_ok() {
+            return Ok(held);
         }
-    };
-    file.lock_exclusive().map_err(|exc| {
-        Error::plain(format!(
-            "the lock file at {} cannot be locked, {exc}",
-            lock_path.display()
-        ))
-    })?;
-    Ok(Locked { file })
+    }
+    Err(Error::plain(format!(
+        "the lock file at {} kept being replaced while it was being locked, \
+         so nothing was changed",
+        lock_path.display()
+    )))
 }
 
 /// Recreate a missing lock file when the registry survives.
@@ -1018,8 +1144,13 @@ fn run_git(
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = out_thread.join();
-                    let _ = err_thread.join();
+                    // The reader threads end detached on this
+                    // path. A grandchild of git can hold the
+                    // pipes open after git itself is dead, and
+                    // joining here would block past the timeout
+                    // this call was promised to keep.
+                    drop(out_thread);
+                    drop(err_thread);
                     return Err(Error::plain(format!(
                         "git {joined} did not finish within {} seconds and was stopped",
                         timeout.as_secs()
@@ -1128,15 +1259,6 @@ fn verify_own_repo(git: &dyn GitRunner, stack: &Path) -> Result<()> {
     Ok(())
 }
 
-fn positive_int(value: i64, label: &str) -> Result<i64> {
-    if value <= 0 {
-        return Err(Error::plain(format!(
-            "the {label} must be a positive integer"
-        )));
-    }
-    Ok(value)
-}
-
 fn remove_created(paths: &[PathBuf]) -> Vec<String> {
     let mut problems = Vec::new();
     for path in paths {
@@ -1161,18 +1283,18 @@ fn remove_created(paths: &[PathBuf]) -> Vec<String> {
 /// commands to misread.
 pub fn init_stack(
     stack: &Path,
-    port_start: i64,
-    range_size: i64,
-    range_count: i64,
+    port_start: i128,
+    range_size: i128,
+    range_count: i128,
 ) -> Result<Pool> {
     init_stack_with(stack, port_start, range_size, range_count, &ProcessGit)
 }
 
 fn init_stack_with(
     stack: &Path,
-    port_start: i64,
-    range_size: i64,
-    range_count: i64,
+    port_start: i128,
+    range_size: i128,
+    range_count: i128,
     git: &dyn GitRunner,
 ) -> Result<Pool> {
     let stack = resolve_path(stack);
@@ -1182,16 +1304,27 @@ fn init_stack_with(
             stack.display()
         )));
     }
-    let port_start = positive_int(port_start, "port start")?;
-    let range_size = positive_int(range_size, "range size")?;
-    let range_count = positive_int(range_count, "range count")?;
-    if port_start + range_size * range_count - 1 > 65535 {
-        return Err(Error::plain("the port pool reaches past port 65535"));
+    for (value, label) in [
+        (port_start, "port start"),
+        (range_size, "range size"),
+        (range_count, "range count"),
+    ] {
+        if value <= 0 {
+            return Err(Error::plain(format!(
+                "the {label} must be a positive integer"
+            )));
+        }
     }
+    match pool_end_wide(port_start, range_size, range_count) {
+        Some(end) if end <= 65535 => {}
+        _ => return Err(Error::plain("the port pool reaches past port 65535")),
+    }
+    // Every pool number is positive and the pool ends at or before
+    // port 65535, so each number fits the recorded width exactly.
     let pool = Pool {
-        start: port_start,
-        range_size,
-        range_count,
+        start: port_start as i64,
+        range_size: range_size as i64,
+        range_count: range_count as i64,
     };
     let repo = stack.join(REPO_NAME);
     let worktrees = stack.join(WORKTREES_NAME);
@@ -1215,7 +1348,6 @@ fn init_stack_with(
         )));
     }
     let watched: Vec<PathBuf> = vec![
-        stack.join(format!("{REGISTRY_NAME}.tmp")),
         registry,
         lock_path.clone(),
         repo.clone(),
@@ -1434,7 +1566,7 @@ fn claim_with(
     let worktree_rel = format!("{WORKTREES_NAME}/{agent}");
     let worktree = stack.join(&worktree_rel);
     let env_rel = format!("{worktree_rel}/{ENV_NAME}");
-    let _lock = locked(&stack)?;
+    let lock = locked(&stack)?;
     let mut data = load_registry(&stack)?;
     verify_own_repo(git, &stack)?;
     if data.claims.contains_key(agent) {
@@ -1482,6 +1614,7 @@ fn claim_with(
         )?;
         write_env_file(&stack, &env_rel, &record)?;
         data.claims.insert(agent.to_string(), record.clone());
+        lock.verify_current()?;
         saver(&stack, &data)?;
         Ok(())
     })();
@@ -1510,7 +1643,7 @@ fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<Record
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     let repo = stack.join(REPO_NAME);
-    let _lock = locked(&stack)?;
+    let lock = locked(&stack)?;
     let mut data = load_registry(&stack)?;
     verify_own_repo(git, &stack)?;
     let record = match data.claims.get(agent) {
@@ -1536,6 +1669,7 @@ fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<Record
         git_checked(git, &repo, &["branch", "-D", &record.branch])?;
     }
     data.claims.remove(agent);
+    lock.verify_current()?;
     save_registry(&stack, &data)?;
     Ok(record)
 }
@@ -1613,10 +1747,15 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let fake_bin = dir.join("bin");
         fs::create_dir_all(&fake_bin).unwrap();
-        let fake_git = fake_bin.join("git");
-        fs::write(&fake_git, "#!/bin/sh\nsleep 10\n").unwrap();
+        // The fake git is staged under a temporary name and
+        // renamed into place, so the spawn can never race the
+        // writer still holding the file open.
+        let staged_git = fake_bin.join("git.staged");
+        fs::write(&staged_git, "#!/bin/sh\nsleep 10\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&staged_git, fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_git = fake_bin.join("git");
+        fs::rename(&staged_git, &fake_git).unwrap();
         let real_git = dir.join("repo");
         fs::create_dir_all(&real_git).unwrap();
         let env = vec![(
@@ -1660,9 +1799,9 @@ mod tests {
         let stack = dir.join("stack");
         init_stack(
             &stack,
-            DEFAULT_PORT_START,
-            DEFAULT_RANGE_SIZE,
-            DEFAULT_RANGE_COUNT,
+            DEFAULT_PORT_START as i128,
+            DEFAULT_RANGE_SIZE as i128,
+            DEFAULT_RANGE_COUNT as i128,
         )
         .unwrap();
         let broken_save = |_: &Path, _: &Registry| -> Result<()> {
@@ -1688,5 +1827,113 @@ mod tests {
         assert!(!is_valid_timestamp("2026-13-02T00:00:00+00:00"));
         assert!(!is_valid_timestamp("2026-02-30T00:00:00+00:00"));
         assert!(!is_valid_timestamp(""));
+    }
+
+    #[test]
+    fn a_replaced_lock_file_fails_the_identity_check() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-lock-identity",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        init_stack(
+            &stack,
+            DEFAULT_PORT_START as i128,
+            DEFAULT_RANGE_SIZE as i128,
+            DEFAULT_RANGE_COUNT as i128,
+        )
+        .unwrap();
+        let held = locked(&stack).unwrap();
+        held.verify_current()
+            .expect("the lock just taken names the file it holds");
+        fs::remove_file(stack.join(LOCK_NAME)).unwrap();
+        fs::write(stack.join(LOCK_NAME), "").unwrap();
+        let error = held
+            .verify_current()
+            .expect_err("a replaced lock file is a different file");
+        drop(held);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(error.exit_code(), 1);
+        assert!(
+            error
+                .message()
+                .contains("is not the file this command locked"),
+            "{}",
+            error.message()
+        );
+    }
+
+    /// A git seam staging the lock tamper from the repair brief.
+    /// On the first worktree add it deletes the lock file under
+    /// the in flight claim and runs a second claim to completion,
+    /// the way a racing claim against a fresh lock file and the
+    /// not yet saved registry would.
+    struct LockReplacingGit {
+        stack: PathBuf,
+        fired: std::cell::Cell<bool>,
+    }
+
+    impl GitRunner for LockReplacingGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if !self.fired.get() && args.first() == Some(&"worktree") && args.get(1) == Some(&"add")
+            {
+                self.fired.set(true);
+                fs::remove_file(self.stack.join(LOCK_NAME)).unwrap();
+                claim(&self.stack, "beta")
+                    .expect("the nested claim completes against the fresh lock");
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    #[test]
+    fn a_claim_whose_lock_was_replaced_fails_loudly_and_rolls_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-lock-replaced",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        init_stack(&stack, 26000, 5, 4).unwrap();
+        let git = LockReplacingGit {
+            stack: stack.clone(),
+            fired: std::cell::Cell::new(false),
+        };
+        let error = claim_with(&stack, "alpha", &git, &save_registry)
+            .expect_err("the claim under a replaced lock must fail");
+        assert_eq!(error.exit_code(), 1);
+        assert!(
+            error
+                .message()
+                .contains("is not the file this command locked"),
+            "{}",
+            error.message()
+        );
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(data.claims.len(), 1);
+        let beta = data
+            .claims
+            .get("beta")
+            .expect("only the second claim is recorded");
+        assert_eq!((beta.port_start, beta.port_end), (26000, 26004));
+        assert!(stack.join("worktrees/beta").is_dir());
+        assert!(!stack.join("worktrees/alpha").exists());
+        let listing = ProcessGit
+            .result(&stack.join(REPO_NAME), &["branch", "--list"])
+            .unwrap();
+        assert!(
+            listing.stdout.contains("switchyard/beta"),
+            "{}",
+            listing.stdout
+        );
+        assert!(
+            !listing.stdout.contains("switchyard/alpha"),
+            "{}",
+            listing.stdout
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

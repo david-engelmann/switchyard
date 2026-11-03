@@ -31,9 +31,9 @@ struct Args {
     command: String,
     agent: Option<String>,
     stack: PathBuf,
-    port_start: i64,
-    range_size: i64,
-    range_count: i64,
+    port_start: i128,
+    range_size: i128,
+    range_count: i128,
 }
 
 enum Parsed {
@@ -41,9 +41,28 @@ enum Parsed {
     Exit(i32),
 }
 
-fn parse_int(text: &str) -> Option<i64> {
-    let value: i128 = text.parse().ok()?;
-    Some(value.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+/// Parse an integer at whatever magnitude the caller wrote it.
+///
+/// Python's parser accepted integers of any size and let the pool
+/// validation refuse the absurd ones, so a value that fits no
+/// machine integer saturates here instead of failing the parse,
+/// and the refusal still comes from validation in the same exit
+/// class Python raised it in.
+fn parse_int(text: &str) -> Option<i128> {
+    match text.parse::<i128>() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            let (sign, digits) = match text.strip_prefix('-') {
+                Some(rest) => (-1i128, rest),
+                None => (1i128, text.strip_prefix('+').unwrap_or(text)),
+            };
+            if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                Some(sign * i128::MAX)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, String> {
@@ -70,9 +89,9 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
     let command = first;
     let mut agent: Option<String> = None;
     let mut stack: Option<PathBuf> = None;
-    let mut port_start = DEFAULT_PORT_START;
-    let mut range_size = DEFAULT_RANGE_SIZE;
-    let mut range_count = DEFAULT_RANGE_COUNT;
+    let mut port_start: i128 = DEFAULT_PORT_START as i128;
+    let mut range_size: i128 = DEFAULT_RANGE_SIZE as i128;
+    let mut range_count: i128 = DEFAULT_RANGE_COUNT as i128;
     let mut index = 1;
     while index < tokens.len() {
         let token = &tokens[index];
