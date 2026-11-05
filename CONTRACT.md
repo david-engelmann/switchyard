@@ -128,6 +128,6 @@ Obligation SY-16 covers the transport and the verdict grammar. The library perfo
 
 The routing slice adds the second claim surface the roadmap promised behind the deterministic core, and the wait queue and contention scoring of the roadmap remain unbuilt and untouched by this amendment.
 
-The registry format is unchanged by this amendment, and the byte compatibility the port amendment established is carried whole, because the one growth is in which port spans a record may carry and not in any field or rule of the document.
+The registry format is unchanged by this amendment, and the byte compatibility the port amendment established is carried whole, because the one growth is in which port spans a record may carry and not in any field or rule of the document. The landed rule the growth retires is the Round 1 rule that a claim holds exactly one slot of the port pool grid. A reader from before this slice reads a stack holding a profiled or routed record of more than one range as corrupt and refuses it, which is that reader's honest report of a span it cannot price, and only a binary of this slice or later can release such a claim.
 
 The routing log is a new document of this repo, named switchyard-routing.jsonl in the stack root, written only by routed claims and read by no command.
