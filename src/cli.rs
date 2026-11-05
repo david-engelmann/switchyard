@@ -269,7 +269,10 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
 /// theirs, so the claim lands on its declared default under the
 /// transport class. The request write is judged before the reply
 /// is read at all, because the recorded request digest must be the
-/// request the judge actually judged.
+/// request the judge actually judged. The deadline bounds the
+/// whole consultation, the collection of the writer and the reader
+/// included, because a descendant of the judge holding the reply
+/// pipe open cannot stretch a read past it.
 struct SubprocessTransport {
     program: String,
 }
@@ -290,18 +293,20 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
         .map_err(|exc| format!("the judge command {program} could not be started, {exc}"))?;
     let mut stdin = child.stdin.take().unwrap();
     let payload = request.as_bytes().to_vec();
-    let writer = std::thread::spawn(move || {
+    let (writer_out, writer_in) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let written = stdin
             .write_all(&payload)
             .and_then(|()| stdin.write_all(b"\n"));
         drop(stdin);
-        written
+        let _ = writer_out.send(written);
     });
     let mut stdout = child.stdout.take().unwrap();
-    let reader = std::thread::spawn(move || {
+    let (reader_out, reader_in) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let read = stdout.read_to_end(&mut bytes);
-        (read, bytes)
+        let _ = reader_out.send((read, bytes));
     });
     let status = loop {
         match child.try_wait() {
@@ -310,8 +315,6 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = writer.join();
-                    let _ = reader.join();
                     return Err(format!(
                         "the judge command {program} did not finish inside the deadline of {JUDGE_TIMEOUT_SECONDS} seconds"
                     ));
@@ -319,29 +322,51 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(exc) => {
-                let _ = writer.join();
-                let _ = reader.join();
                 return Err(format!(
                     "the judge command {program} could not be waited on, {exc}"
                 ));
             }
         }
     };
-    let written = writer
-        .join()
-        .map_err(|_| "the judge writer thread failed".to_string())?;
-    if written.is_err() {
-        let _ = reader.join();
-        return Err(format!(
-            "the request could not be written to the judge command {program}"
-        ));
-    }
-    let (read, bytes) = reader
-        .join()
-        .map_err(|_| "the judge reader thread failed".to_string())?;
     if !status.success() {
         return Err(format!("the judge command {program} exited with {status}"));
     }
+    // The command answered, so the request write and the reply
+    // read are collected over channels against the same deadline.
+    // A descendant of the command can hold a pipe open past the
+    // command's own exit, and a collection without the bound would
+    // wait on that descendant without limit, so a collection that
+    // runs out of the time that stands is the deadline expiring,
+    // judged exactly as the command running past it is judged.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match writer_in.recv_timeout(remaining) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err(format!(
+                "the request could not be written to the judge command {program}"
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(format!(
+                "the judge command {program} did not finish inside the deadline of {JUDGE_TIMEOUT_SECONDS} seconds"
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("the judge writer thread failed".to_string());
+        }
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let (read, bytes) = match reader_in.recv_timeout(remaining) {
+        Ok(carried) => carried,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(format!(
+                "the judge command {program} did not finish inside the deadline of {JUDGE_TIMEOUT_SECONDS} seconds"
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("the judge reader thread failed".to_string());
+        }
+    };
     read.map_err(|exc| {
         format!("the reply of the judge command {program} could not be read, {exc}")
     })?;
