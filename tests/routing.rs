@@ -891,3 +891,198 @@ fn the_fixture_transport_replays_by_digest_and_a_missing_reply_is_a_transport_la
     let lines = read_log(&stack);
     assert_eq!(lines[0]["fallback"], "transport");
 }
+
+// The recorded fixture replay groups. The fixtures under
+// tests/fixtures/routing carry the exact request bytes the library
+// built and the exact reply bytes the endpoint returned for the 48
+// live cases, and hand built replies for the seven constructed
+// failure cases, each with the routing log line and the claim
+// outcome its reply settles. The manifest beside them states each
+// case's provenance.
+
+fn fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routing")
+}
+
+fn load_fixture(id: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(fixture_dir().join(format!("{id}.json"))).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+fn all_fixture_ids() -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(fixture_dir())
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|id| id.starts_with("sw-"))
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn replay(fixture: &serde_json::Value) -> (PathBuf, switchyard::Record, serde_json::Value) {
+    let pool = &fixture["pool"];
+    let stack = stack_with(
+        "replay",
+        pool["start"].as_i64().unwrap() as i128,
+        pool["range_size"].as_i64().unwrap() as i128,
+        pool["range_count"].as_i64().unwrap() as i128,
+    );
+    let request = fixture["request"].as_str().unwrap();
+    let transport = FixtureTransport::from_pairs([(
+        sha256_hex(request.as_bytes()),
+        fixture["reply"].as_str().unwrap().to_string(),
+    )]);
+    let default = profile_named(fixture["default_profile"].as_str().unwrap()).unwrap();
+    let record = claim_routed(
+        &stack,
+        fixture["agent"].as_str().unwrap(),
+        fixture["description"].as_str().unwrap(),
+        default,
+        Some(&transport),
+    )
+    .unwrap();
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 1);
+    (stack, record, lines.into_iter().next().unwrap())
+}
+
+#[test]
+fn every_recorded_fixture_replays_to_its_recorded_outcome() {
+    let ids = all_fixture_ids();
+    assert_eq!(ids.len(), 55, "{ids:?}");
+    for id in &ids {
+        let fixture = load_fixture(id);
+        assert_eq!(
+            routing_request(fixture["description"].as_str().unwrap()),
+            fixture["request"].as_str().unwrap(),
+            "{id} request drifted from the library"
+        );
+        let (_, record, line) = replay(&fixture);
+        let outcome = &fixture["expected_outcome"];
+        assert_eq!(
+            (record.port_start, record.port_end),
+            (
+                outcome["port_start"].as_i64().unwrap(),
+                outcome["port_end"].as_i64().unwrap()
+            ),
+            "{id} span"
+        );
+        assert_eq!(
+            record.agent,
+            fixture["agent"].as_str().unwrap(),
+            "{id} agent"
+        );
+        assert_eq!(log_field_set(&line), LOG_FIELDS, "{id} field set");
+        let expected = &fixture["expected_log_line"];
+        for key in LOG_FIELDS {
+            if key == "at" {
+                assert!(line["at"].as_str().unwrap().contains('T'), "{id} stamp");
+                continue;
+            }
+            assert_eq!(line[key], expected[key], "{id} field {key}");
+        }
+    }
+}
+
+#[test]
+fn the_request_document_is_pinned_byte_for_byte_for_one_description_of_each_band() {
+    for id in ["sw-l03", "sw-s02", "sw-r01"] {
+        let fixture = load_fixture(id);
+        let request = routing_request(fixture["description"].as_str().unwrap());
+        assert_eq!(request, fixture["request"].as_str().unwrap(), "{id}");
+        let document: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(document["model"], "jev-1.13.0", "{id}");
+        let question = &document["questions"]["profile"];
+        assert_eq!(question["type"], "choice", "{id}");
+        let state = document["state"].as_str().unwrap();
+        assert!(
+            state.starts_with("A furnishing tool has been asked to size one claim"),
+            "{id} framing"
+        );
+        assert!(
+            state.contains(fixture["description"].as_str().unwrap()),
+            "{id} description verbatim"
+        );
+        assert!(
+            state.ends_with("the description does not determine the count."),
+            "{id} closing"
+        );
+    }
+}
+
+#[test]
+fn a_mixed_stack_lists_plain_and_profiled_and_routed_claims_together() {
+    let stack = default_stack("mixed");
+    claim(&stack, "plain-one").unwrap();
+    claim_profile(&stack, "profiled-one", Profile::Standard).unwrap();
+    let fixture = load_fixture("sw-r01");
+    let request = fixture["request"].as_str().unwrap();
+    let transport = FixtureTransport::from_pairs([(
+        sha256_hex(request.as_bytes()),
+        fixture["reply"].as_str().unwrap().to_string(),
+    )]);
+    claim_routed(
+        &stack,
+        "routed-one",
+        fixture["description"].as_str().unwrap(),
+        Profile::Lean,
+        Some(&transport),
+    )
+    .unwrap();
+    let rows = switchyard::list_claims(&stack).unwrap();
+    let summary: Vec<(&str, i64, i64)> = rows
+        .iter()
+        .map(|record| (record.agent.as_str(), record.port_start, record.port_end))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("plain-one", 20000, 20009),
+            ("profiled-one", 20010, 20029),
+            ("routed-one", 20030, 20069),
+        ]
+    );
+    let registry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(stack.join(REGISTRY_NAME)).unwrap()).unwrap();
+    assert_eq!(registry["version"], 1);
+}
+
+#[test]
+fn registry_bytes_of_a_routed_claim_match_the_landed_writer_shape() {
+    let fixture = load_fixture("sw-l03");
+    let (stack, record, _) = replay(&fixture);
+    let text = std::fs::read_to_string(stack.join(REGISTRY_NAME)).unwrap();
+    let stamp = "\"claimed_at\": \"";
+    let start = text.find(stamp).unwrap() + stamp.len();
+    let end = text[start..].find('"').unwrap() + start;
+    let blanked = format!("{}STAMP{}", &text[..start], &text[end..]);
+    let agent = fixture["agent"].as_str().unwrap();
+    let expected = serde_json::json!({
+        "claims": {
+            agent: {
+                "agent": agent,
+                "branch": format!("switchyard/{agent}"),
+                "claimed_at": "STAMP",
+                "database": format!("switchyard_{}", agent.replace('-', "_")),
+                "env_file": format!("worktrees/{agent}/.env.switchyard"),
+                "port_end": record.port_end,
+                "port_start": record.port_start,
+                "worktree": format!("worktrees/{agent}"),
+            }
+        },
+        "port_pool": {"range_count": 16, "range_size": 10, "start": 20000},
+        "version": 1,
+    });
+    assert_eq!(
+        blanked,
+        serde_json::to_string_pretty(&expected).unwrap() + "\n"
+    );
+}
