@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use switchyard::{
     claim, claim_profile, claim_routed, init_stack, load_registry, profile_named, release,
     routing_request, sha256_hex, FixtureTransport, JudgeTransport, Profile, REGISTRY_NAME,
-    ROUTING_LOG_NAME,
+    REPO_NAME, ROUTING_LOG_NAME,
 };
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -155,6 +155,68 @@ impl JudgeTransport for ClaimOnConsultTransport {
             *self.fired.borrow_mut() = true;
             claim_profile(&self.stack, &self.agent, self.profile)
                 .map_err(|error| error.message().to_string())?;
+        }
+        Ok(self.body.clone())
+    }
+}
+
+/// A transport that takes a plain claim for the routed claim's
+/// own agent while the consultation stands open, so the third
+/// phase finds a standing claim for the agent under the lock
+/// again.
+struct ClaimSameAgentOnConsultTransport {
+    stack: PathBuf,
+    agent: String,
+    body: String,
+    fired: RefCell<bool>,
+}
+
+impl JudgeTransport for ClaimSameAgentOnConsultTransport {
+    fn consult(&self, _request: &str) -> Result<String, String> {
+        if !*self.fired.borrow() {
+            *self.fired.borrow_mut() = true;
+            claim(&self.stack, &self.agent).map_err(|error| error.message().to_string())?;
+        }
+        Ok(self.body.clone())
+    }
+}
+
+/// A transport that corrupts the registry file while the
+/// consultation stands open, so the registry read of the third
+/// phase fails.
+struct CorruptRegistryOnConsultTransport {
+    stack: PathBuf,
+    body: String,
+    fired: RefCell<bool>,
+}
+
+impl JudgeTransport for CorruptRegistryOnConsultTransport {
+    fn consult(&self, _request: &str) -> Result<String, String> {
+        if !*self.fired.borrow() {
+            *self.fired.borrow_mut() = true;
+            std::fs::write(self.stack.join(REGISTRY_NAME), "not a registry")
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(self.body.clone())
+    }
+}
+
+/// A transport that moves the stack repository's .git entry
+/// aside while the consultation stands open, so the repository
+/// verification of the third phase fails.
+struct BreakRepoOnConsultTransport {
+    stack: PathBuf,
+    body: String,
+    fired: RefCell<bool>,
+}
+
+impl JudgeTransport for BreakRepoOnConsultTransport {
+    fn consult(&self, _request: &str) -> Result<String, String> {
+        if !*self.fired.borrow() {
+            *self.fired.borrow_mut() = true;
+            let repo = self.stack.join(REPO_NAME);
+            std::fs::rename(repo.join(".git"), repo.join(".git-moved"))
+                .map_err(|error| error.to_string())?;
         }
         Ok(self.body.clone())
     }
@@ -418,7 +480,7 @@ fn a_pool_that_can_furnish_nothing_refuses_before_any_consultation_and_records_i
     assert_eq!(line["model"], "jev-1.13.0");
     assert_eq!(line["verdict"], serde_json::Value::Null);
     assert_eq!(line["confidence"], serde_json::Value::Null);
-    assert_eq!(line["fallback"], "none");
+    assert_eq!(line["fallback"], "no consultation");
     assert_eq!(line["allocated"], serde_json::Value::Null);
     assert_eq!(line["refusal"], "pool");
 }
@@ -520,6 +582,103 @@ fn a_default_made_unfurnishable_between_phases_refuses_as_a_pool_refusal() {
     assert_eq!(line["fallback"], "silence");
     assert_eq!(line["allocated"], serde_json::Value::Null);
     assert_eq!(line["refusal"], "pool");
+}
+
+#[test]
+fn a_claim_taken_for_the_agent_during_the_consultation_refuses_as_a_duplicate_and_records_it() {
+    let stack = default_stack("envelope-duplicate");
+    let transport = ClaimSameAgentOnConsultTransport {
+        stack: stack.clone(),
+        agent: "alpha".to_string(),
+        body: verdict_body("roomy", probs("roomy", 0.95), 0.5),
+        fired: RefCell::new(false),
+    };
+    let error = claim_routed(
+        &stack,
+        "alpha",
+        DESCRIPTION,
+        Profile::Lean,
+        Some(&transport),
+    )
+    .expect_err("a standing claim found in the third phase refuses the routed claim");
+    assert!(
+        error.message().contains("already holds a claim"),
+        "{}",
+        error.message()
+    );
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 1);
+    let line = &lines[0];
+    assert_eq!(log_field_set(line), LOG_FIELDS);
+    assert_eq!(line["verdict"], "roomy");
+    assert_eq!(line["confidence"], 0.95);
+    assert_eq!(line["fallback"], "none");
+    assert_eq!(line["allocated"], serde_json::Value::Null);
+    assert_eq!(line["refusal"], "duplicate");
+}
+
+#[test]
+fn a_registry_corrupted_during_the_consultation_refuses_as_corrupt_and_records_it() {
+    let stack = default_stack("envelope-corrupt");
+    let transport = CorruptRegistryOnConsultTransport {
+        stack: stack.clone(),
+        body: verdict_body("roomy", probs("roomy", 0.95), 0.5),
+        fired: RefCell::new(false),
+    };
+    let error = claim_routed(
+        &stack,
+        "alpha",
+        DESCRIPTION,
+        Profile::Lean,
+        Some(&transport),
+    )
+    .expect_err("a registry read failing in the third phase refuses the routed claim");
+    assert!(
+        error.message().contains("is corrupt"),
+        "{}",
+        error.message()
+    );
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 1);
+    let line = &lines[0];
+    assert_eq!(log_field_set(line), LOG_FIELDS);
+    assert_eq!(line["verdict"], "roomy");
+    assert_eq!(line["confidence"], 0.95);
+    assert_eq!(line["fallback"], "none");
+    assert_eq!(line["allocated"], serde_json::Value::Null);
+    assert_eq!(line["refusal"], "corrupt");
+}
+
+#[test]
+fn a_repository_broken_during_the_consultation_refuses_as_repo_and_records_it() {
+    let stack = default_stack("envelope-repo");
+    let transport = BreakRepoOnConsultTransport {
+        stack: stack.clone(),
+        body: verdict_body("roomy", probs("roomy", 0.95), 0.5),
+        fired: RefCell::new(false),
+    };
+    let error = claim_routed(
+        &stack,
+        "alpha",
+        DESCRIPTION,
+        Profile::Lean,
+        Some(&transport),
+    )
+    .expect_err("a repository verification failing in the third phase refuses the routed claim");
+    assert!(
+        error.message().contains("has no .git entry of its own"),
+        "{}",
+        error.message()
+    );
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 1);
+    let line = &lines[0];
+    assert_eq!(log_field_set(line), LOG_FIELDS);
+    assert_eq!(line["verdict"], "roomy");
+    assert_eq!(line["confidence"], 0.95);
+    assert_eq!(line["fallback"], "none");
+    assert_eq!(line["allocated"], serde_json::Value::Null);
+    assert_eq!(line["refusal"], "repo");
 }
 
 // SY-14, verdicts and fallbacks over constructed replies
@@ -849,6 +1008,82 @@ fn a_routed_claim_through_a_judge_command_and_through_a_failing_one() {
     let lines = read_log(&stack);
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[2]["fallback"], "transport");
+}
+
+#[test]
+fn a_judge_that_answers_and_leaves_a_descendant_on_the_pipe_lands_on_the_default_at_the_deadline() {
+    let stack = cli_stack("cli-judge-descendant");
+    let stack_arg = stack.to_str().unwrap();
+    let verdict = verdict_body("roomy", probs("roomy", 0.9), 0.5);
+    let script = write_judge_script(
+        "cli-judge-descendant",
+        &format!("#!/bin/sh\nsleep 45 &\ncat > /dev/null\nprintf '%s' '{verdict}'\n"),
+    );
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "alpha",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        script.to_str().unwrap(),
+    ]);
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20000-20009"), "{stdout}");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(25),
+        "the consultation returned in {elapsed:?}, before the deadline it was held to"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(40),
+        "the consultation stretched to {elapsed:?}, past the deadline it was held to"
+    );
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["verdict"], serde_json::Value::Null);
+    assert_eq!(lines[0]["fallback"], "transport");
+    assert_eq!(lines[0]["allocated"], "lean");
+}
+
+#[test]
+fn a_judge_that_sleeps_in_the_foreground_past_the_deadline_lands_on_the_default_at_the_deadline() {
+    let stack = cli_stack("cli-judge-foreground");
+    let stack_arg = stack.to_str().unwrap();
+    let script = write_judge_script("cli-judge-foreground", "#!/bin/sh\nsleep 45 &\nsleep 45\n");
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "alpha",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        script.to_str().unwrap(),
+    ]);
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20000-20009"), "{stdout}");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(25),
+        "the consultation returned in {elapsed:?}, before the deadline it was held to"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(40),
+        "the consultation stretched to {elapsed:?}, past the deadline it was held to"
+    );
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["verdict"], serde_json::Value::Null);
+    assert_eq!(lines[0]["fallback"], "transport");
+    assert_eq!(lines[0]["allocated"], "lean");
 }
 
 // SY-16, the fixture transport
