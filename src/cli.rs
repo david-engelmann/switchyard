@@ -2,15 +2,19 @@
 //!
 //! One stack per directory, four commands. Init creates the stack,
 //! claim allocates, list shows who holds what, and release returns
-//! everything.
+//! everything. A claim is plain, or profiled under a declared
+//! profile, or routed by a job description a judge settles.
 
 use std::ffi::OsString;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::{
-    claim, init_stack, list_claims, release, resolve_path, Record, DEFAULT_PORT_START,
-    DEFAULT_RANGE_COUNT, DEFAULT_RANGE_SIZE,
+    claim, claim_profile, claim_routed, init_stack, list_claims, profile_named, release,
+    resolve_path, JudgeTransport, Record, Result, DEFAULT_PORT_START, DEFAULT_RANGE_COUNT,
+    DEFAULT_RANGE_SIZE, JUDGE_TIMEOUT_SECONDS,
 };
 
 const COMMANDS: [&str; 4] = ["init", "claim", "list", "release"];
@@ -25,6 +29,25 @@ commands:
   claim    allocate a worktree, a range, a database, and an env file
   list     print who holds what, derived only from the registry
   release  return every resource an agent holds
+
+claim options:
+  --profile NAME           allocate under a declared profile, one of
+                           lean, standard, or roomy, with no consultation
+  --describe TEXT          route the claim by a job description the
+                           pinned decision model judges
+  --default-profile NAME   the profile a routed claim lands on when the
+                           consultation does not decide, required
+                           beside --describe
+  --judge-command PROGRAM  the one program a routed claim consults,
+                           named beside --describe
+
+A judge command is spawned with no arguments. It receives the request
+document as one line on its standard input and answers with the reply
+document on its standard output, inside a deadline of 30 seconds. A
+judge command that cannot be started, or whose request cannot be
+written, or that answers nothing usable, or that runs past the
+deadline leaves the claim on its declared default, and the routing
+log records the landing.
 ";
 
 struct Args {
@@ -34,10 +57,14 @@ struct Args {
     port_start: i128,
     range_size: i128,
     range_count: i128,
+    describe: Option<String>,
+    default_profile: Option<String>,
+    profile: Option<String>,
+    judge_command: Option<String>,
 }
 
 enum Parsed {
-    Run(Args),
+    Run(Box<Args>),
     Exit(i32),
 }
 
@@ -92,6 +119,10 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
     let mut port_start: i128 = DEFAULT_PORT_START as i128;
     let mut range_size: i128 = DEFAULT_RANGE_SIZE as i128;
     let mut range_count: i128 = DEFAULT_RANGE_COUNT as i128;
+    let mut describe: Option<String> = None;
+    let mut default_profile: Option<String> = None;
+    let mut profile: Option<String> = None;
+    let mut judge_command: Option<String> = None;
     let mut index = 1;
     while index < tokens.len() {
         let token = &tokens[index];
@@ -108,7 +139,11 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
         let known_option = matches!(
             option.as_str(),
             "--stack" | "--port-start" | "--range-size" | "--range-count"
-        ) && (option == "--stack" || command == "init");
+        ) && (option == "--stack" || command == "init")
+            || matches!(
+                option.as_str(),
+                "--describe" | "--default-profile" | "--profile" | "--judge-command"
+            ) && command == "claim";
         if known_option {
             let value = match inline_value {
                 Some(value) => value,
@@ -155,6 +190,10 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
                         }
                     }
                 }
+                "--describe" => describe = Some(value),
+                "--default-profile" => default_profile = Some(value),
+                "--profile" => profile = Some(value),
+                "--judge-command" => judge_command = Some(value),
                 _ => unreachable!(),
             }
             index += 1;
@@ -177,14 +216,168 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
     if (command == "claim" || command == "release") && agent.is_none() {
         return Err("the following arguments are required: agent".to_string());
     }
-    Ok(Parsed::Run(Args {
+    if command == "claim" {
+        if profile.is_some() && describe.is_some() {
+            return Err(
+                "argument --profile: a claim takes either --profile or --describe, not both"
+                    .to_string(),
+            );
+        }
+        if describe.is_none() && default_profile.is_some() {
+            return Err(
+                "argument --default-profile: a routed claim takes --describe beside it".to_string(),
+            );
+        }
+        if describe.is_none() && judge_command.is_some() {
+            return Err(
+                "argument --judge-command: a routed claim takes --describe beside it".to_string(),
+            );
+        }
+        if let Some(description) = &describe {
+            if default_profile.is_none() {
+                return Err(
+                    "argument --describe: a routed claim requires --default-profile".to_string(),
+                );
+            }
+            if description.trim().is_empty() {
+                return Err("argument --describe: the job description is empty".to_string());
+            }
+        }
+    }
+    Ok(Parsed::Run(Box::new(Args {
         command,
         agent,
         stack,
         port_start,
         range_size,
         range_count,
-    }))
+        describe,
+        default_profile,
+        profile,
+        judge_command,
+    })))
+}
+
+/// The transport that consults a judge through one named program,
+/// the operator's side of the seam of obligation SY-16.
+///
+/// The program is spawned with no arguments, receives the request
+/// document as one line on its standard input, and answers with
+/// the reply body on its standard output. A spawn failure, a failed
+/// request write, a nonzero exit, a run past the deadline, and a
+/// reply that is not text each surface as a transport failure of
+/// theirs, so the claim lands on its declared default under the
+/// transport class. The request write is judged before the reply
+/// is read at all, because the recorded request digest must be the
+/// request the judge actually judged.
+struct SubprocessTransport {
+    program: String,
+}
+
+impl JudgeTransport for SubprocessTransport {
+    fn consult(&self, request: &str) -> std::result::Result<String, String> {
+        run_judge_command(&self.program, request)
+    }
+}
+
+fn run_judge_command(program: &str, request: &str) -> std::result::Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(JUDGE_TIMEOUT_SECONDS);
+    let mut child = Command::new(program)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|exc| format!("the judge command {program} could not be started, {exc}"))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let payload = request.as_bytes().to_vec();
+    let writer = std::thread::spawn(move || {
+        let written = stdin
+            .write_all(&payload)
+            .and_then(|()| stdin.write_all(b"\n"));
+        drop(stdin);
+        written
+    });
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stdout.read_to_end(&mut bytes);
+        (read, bytes)
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = writer.join();
+                    let _ = reader.join();
+                    return Err(format!(
+                        "the judge command {program} did not finish inside the deadline of {JUDGE_TIMEOUT_SECONDS} seconds"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(exc) => {
+                let _ = writer.join();
+                let _ = reader.join();
+                return Err(format!(
+                    "the judge command {program} could not be waited on, {exc}"
+                ));
+            }
+        }
+    };
+    let written = writer
+        .join()
+        .map_err(|_| "the judge writer thread failed".to_string())?;
+    if written.is_err() {
+        let _ = reader.join();
+        return Err(format!(
+            "the request could not be written to the judge command {program}"
+        ));
+    }
+    let (read, bytes) = reader
+        .join()
+        .map_err(|_| "the judge reader thread failed".to_string())?;
+    if !status.success() {
+        return Err(format!("the judge command {program} exited with {status}"));
+    }
+    read.map_err(|exc| {
+        format!("the reply of the judge command {program} could not be read, {exc}")
+    })?;
+    String::from_utf8(bytes)
+        .map_err(|_| format!("the reply of the judge command {program} is not text"))
+}
+
+/// Run one claim of whichever shape its options name, a plain claim
+/// by default, a profiled claim under --profile with no
+/// consultation, and a routed claim under --describe through the
+/// judge command beside it or through no transport at all.
+fn claim_from_args(stack: &Path, parsed: &Args) -> Result<Record> {
+    let agent = parsed.agent.as_deref().unwrap();
+    if let Some(name) = &parsed.profile {
+        let profile = profile_named(name)?;
+        return claim_profile(stack, agent, profile);
+    }
+    if let Some(description) = &parsed.describe {
+        let default = profile_named(parsed.default_profile.as_deref().unwrap())?;
+        let transport = parsed
+            .judge_command
+            .as_ref()
+            .map(|program| SubprocessTransport {
+                program: program.clone(),
+            });
+        return claim_routed(
+            stack,
+            agent,
+            description,
+            default,
+            transport
+                .as_ref()
+                .map(|transport| transport as &dyn JudgeTransport),
+        );
+    }
+    claim(stack, agent)
 }
 
 fn print_claim(out: &mut dyn Write, record: &Record) {
@@ -268,7 +461,7 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 pool.range_count, pool.range_size, pool.start
             );
         }),
-        "claim" => claim(&stack, parsed.agent.as_deref().unwrap()).map(|record| {
+        "claim" => claim_from_args(&stack, &parsed).map(|record| {
             print_claim(out, &record);
         }),
         "list" => list_claims(&stack).map(|records| {

@@ -648,6 +648,209 @@ fn silence_and_malformed_and_transport_land_on_the_default_under_their_classes()
     );
 }
 
+// SY-11, the command line surface
+
+fn run_cli(args: &[&str]) -> (i32, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_switchyard"))
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        output.status.code().unwrap(),
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+fn cli_stack(tag: &str) -> PathBuf {
+    let stack = temp_dir(tag).join("stack");
+    let (code, _, stderr) = run_cli(&["init", "--stack", stack.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    stack
+}
+
+#[test]
+fn a_profiled_claim_from_the_command_line() {
+    let stack = cli_stack("cli-profile");
+    let stack = stack.to_str().unwrap();
+    let (code, stdout, stderr) =
+        run_cli(&["claim", "alpha", "--stack", stack, "--profile", "standard"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20000-20019"), "{stdout}");
+    let (code, _, stderr) = run_cli(&["claim", "beta", "--stack", stack, "--profile", "huge"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("unknown profile huge"), "{stderr}");
+}
+
+#[test]
+fn the_routing_option_shapes_refuse_at_the_parser() {
+    let stack = cli_stack("cli-shapes");
+    let stack = stack.to_str().unwrap();
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (
+            vec![
+                "claim",
+                "alpha",
+                "--stack",
+                stack,
+                "--profile",
+                "lean",
+                "--describe",
+                "work",
+                "--default-profile",
+                "lean",
+            ],
+            "--profile",
+        ),
+        (
+            vec![
+                "claim",
+                "alpha",
+                "--stack",
+                stack,
+                "--default-profile",
+                "lean",
+            ],
+            "--default-profile",
+        ),
+        (
+            vec![
+                "claim",
+                "alpha",
+                "--stack",
+                stack,
+                "--judge-command",
+                "/bin/true",
+            ],
+            "--judge-command",
+        ),
+        (
+            vec!["claim", "alpha", "--stack", stack, "--describe", "work"],
+            "--describe",
+        ),
+        (
+            vec![
+                "claim",
+                "alpha",
+                "--stack",
+                stack,
+                "--describe",
+                "   ",
+                "--default-profile",
+                "lean",
+            ],
+            "--describe",
+        ),
+    ];
+    for (args, named) in cases {
+        let (code, _, stderr) = run_cli(&args);
+        assert_eq!(code, 2, "{args:?} gave {stderr}");
+        assert!(
+            stderr.contains(&format!("argument {named}:")),
+            "{args:?} gave {stderr}"
+        );
+    }
+    // A routing option beside another command is unrecognized.
+    let (code, _, stderr) = run_cli(&["list", "--stack", stack, "--describe", "work"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("unrecognized arguments"), "{stderr}");
+}
+
+#[test]
+fn a_routed_claim_from_the_command_line_with_no_judge_command() {
+    let stack = cli_stack("cli-routed-none");
+    let stack_arg = stack.to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "alpha",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "roomy",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20000-20039"), "{stdout}");
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["fallback"], "no transport");
+    assert_eq!(lines[0]["allocated"], "roomy");
+}
+
+fn write_judge_script(tag: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = temp_dir(tag).join("judge.sh");
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn a_routed_claim_through_a_judge_command_and_through_a_failing_one() {
+    let stack = cli_stack("cli-routed-judge");
+    let stack_arg = stack.to_str().unwrap();
+    let verdict = verdict_body("roomy", probs("roomy", 0.9), 0.5);
+    let script = write_judge_script(
+        "cli-judge-good",
+        &format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{verdict}'\n"),
+    );
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "alpha",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        script.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20000-20039"), "{stdout}");
+    let lines = read_log(&stack);
+    assert_eq!(lines[0]["verdict"], "roomy");
+    assert_eq!(lines[0]["fallback"], "none");
+
+    let failing = write_judge_script("cli-judge-bad", "#!/bin/sh\nexit 3\n");
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "beta",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        failing.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20040-20049"), "{stdout}");
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["fallback"], "transport");
+    assert_eq!(lines[1]["allocated"], "lean");
+
+    let (code, _, stderr) = run_cli(&[
+        "claim",
+        "gamma",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        "/nonexistent/judge",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[2]["fallback"], "transport");
+}
+
 // SY-16, the fixture transport
 
 #[test]
