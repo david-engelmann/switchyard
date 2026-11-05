@@ -96,3 +96,92 @@ def test_the_other_refusal_classes_raise_their_own_types(tmp_path):
     with pytest.raises(switchyard.InvalidNameError) as invalid:
         switchyard.claim(stack, "Not A Name")
     assert "invalid agent name" in str(invalid.value)
+
+
+def _verdict_body(choice, confidence):
+    import json
+
+    rest = (1.0 - confidence) / 3.0
+    probabilities = {
+        label: (confidence if label == choice else rest)
+        for label in ("lean", "standard", "roomy", "other")
+    }
+    return json.dumps(
+        {
+            "model": "jev-1.13.0",
+            "answers": {
+                "profile": {
+                    "type": "choice",
+                    "choice": choice,
+                    "confidence": 0.5,
+                    "probabilities": probabilities,
+                }
+            },
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    )
+
+
+def test_a_profiled_claim_through_the_binding(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    record = switchyard.claim_profile(stack, "alpha", "roomy")
+    assert (record["port_start"], record["port_end"]) == (20000, 20039)
+
+    with pytest.raises(switchyard.RefusalError) as unknown:
+        switchyard.claim_profile(stack, "beta", "huge")
+    assert "unknown profile huge" in str(unknown.value)
+
+
+def test_a_routed_claim_through_a_callable_transport(tmp_path):
+    import json
+
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+    seen = []
+
+    def judge(request):
+        seen.append(request)
+        return _verdict_body("standard", 0.9)
+
+    record = switchyard.claim_routed(
+        stack, "alpha", "Run the app and its API and a worker.", "lean", judge
+    )
+    assert (record["port_start"], record["port_end"]) == (20000, 20019)
+    assert len(seen) == 1
+    assert '"jev-1.13.0"' in seen[0]
+    assert '"profile"' in seen[0]
+
+    lines = (tmp_path / "stack" / "switchyard-routing.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    line = json.loads(lines[0])
+    assert line["fallback"] == "none"
+    assert line["verdict"] == "standard"
+    assert line["allocated"] == "standard"
+    assert line["confidence"] == 0.9
+
+
+def test_a_routed_claim_with_no_transport_and_with_a_raising_callable(tmp_path):
+    import json
+
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    record = switchyard.claim_routed(stack, "alpha", "Run one server.", "standard")
+    assert (record["port_start"], record["port_end"]) == (20000, 20019)
+
+    def broken(request):
+        raise RuntimeError("the judge is down in this test")
+
+    record = switchyard.claim_routed(stack, "beta", "Run one server.", "lean", broken)
+    assert (record["port_start"], record["port_end"]) == (20020, 20029)
+
+    lines = (tmp_path / "stack" / "switchyard-routing.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+    first = json.loads(lines[0])
+    second = json.loads(lines[1])
+    assert first["fallback"] == "no transport"
+    assert first["model"] is None
+    assert second["fallback"] == "transport"
+    assert second["allocated"] == "lean"

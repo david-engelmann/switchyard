@@ -123,6 +123,85 @@ fn claim(py: Python<'_>, stack: PathBuf, agent: &str) -> PyResult<Py<PyDict>> {
     record_dict(py, &record)
 }
 
+/// Allocate a claim under a named declared profile, with no
+/// consultation at all, by the same path a plain claim takes with
+/// the draw of the profile. An unknown profile name is refused
+/// with the message the command line prints for it.
+#[pyfunction]
+fn claim_profile(
+    py: Python<'_>,
+    stack: PathBuf,
+    agent: &str,
+    profile: &str,
+) -> PyResult<Py<PyDict>> {
+    let profile = switchyard_core::profile_named(profile).map_err(to_py_error)?;
+    let record = py
+        .detach(|| switchyard_core::claim_profile(&stack, agent, profile))
+        .map_err(to_py_error)?;
+    record_dict(py, &record)
+}
+
+/// The binding side of the transport seam, a Python callable
+/// standing behind the library trait.
+///
+/// The callable receives the exact request document and answers
+/// with the reply body as text. A callable that raises, and a
+/// callable that returns a value that is not text, each surface
+/// as a transport failure of theirs, so the claim lands on its
+/// declared default under the transport class and the routing log
+/// records the landing.
+struct CallableTransport {
+    callable: Py<PyAny>,
+}
+
+impl switchyard_core::JudgeTransport for CallableTransport {
+    fn consult(&self, request: &str) -> Result<String, String> {
+        Python::attach(|py| {
+            let reply = self
+                .callable
+                .call1(py, (request,))
+                .map_err(|error| format!("the transport callable raised, {error}"))?;
+            reply
+                .extract::<String>(py)
+                .map_err(|_| "the transport callable returned a value that is not text".to_string())
+        })
+    }
+}
+
+/// Allocate a claim whose profile a model settles from a job
+/// description. The transport argument is a callable standing
+/// behind the library seam, and leaving it out configures no
+/// transport at all, so the claim lands on its declared default
+/// under the no transport class exactly as a routed claim from the
+/// command line with no judge command does.
+#[pyfunction]
+#[pyo3(signature = (stack, agent, description, default_profile, transport = None))]
+fn claim_routed(
+    py: Python<'_>,
+    stack: PathBuf,
+    agent: &str,
+    description: &str,
+    default_profile: &str,
+    transport: Option<Py<PyAny>>,
+) -> PyResult<Py<PyDict>> {
+    let default = switchyard_core::profile_named(default_profile).map_err(to_py_error)?;
+    let transport = transport.map(|callable| CallableTransport { callable });
+    let record = py
+        .detach(|| {
+            switchyard_core::claim_routed(
+                &stack,
+                agent,
+                description,
+                default,
+                transport
+                    .as_ref()
+                    .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
+            )
+        })
+        .map_err(to_py_error)?;
+    record_dict(py, &record)
+}
+
 /// Return every resource the agent holds in the stack at the
 /// given path and remove its record.
 #[pyfunction]
@@ -161,6 +240,8 @@ fn _switchyard(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("InvalidNameError", m.py().get_type::<InvalidNameError>())?;
     m.add_function(wrap_pyfunction!(init, m)?)?;
     m.add_function(wrap_pyfunction!(claim, m)?)?;
+    m.add_function(wrap_pyfunction!(claim_profile, m)?)?;
+    m.add_function(wrap_pyfunction!(claim_routed, m)?)?;
     m.add_function(wrap_pyfunction!(release, m)?)?;
     m.add_function(wrap_pyfunction!(list_claims, m)?)?;
     Ok(())

@@ -27,6 +27,7 @@ serde = "1"
 serde_json = "1"
 fs2 = "0.4"
 getrandom = "0.3"
+sha2 = "0.10"
 
 [dev-dependencies]
 sha2 = "0.10"

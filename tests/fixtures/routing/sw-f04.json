@@ -1,0 +1,35 @@
+{
+  "id": "SW-F04",
+  "provenance": "constructed",
+  "family": "constructed failure",
+  "truth": null,
+  "why": "A verdict document cut off mid string, the truncated malformed shape.",
+  "description": "Run the checkout service and its payment stub.",
+  "request": "{\"model\":\"jev-1.13.0\",\"questions\":{\"profile\":{\"criteria\":{\"lean\":\"The job runs at most two processes at the same time that each need a port of their own.\",\"other\":\"None of the listed options is the correct decision, because the description leaves the count undetermined.\",\"roomy\":\"The job runs more than twelve processes at the same time that each need a port of their own.\",\"standard\":\"The job runs three to twelve processes at the same time that each need a port of their own.\"},\"instructions\":\"The question asks the judge to choose the allocation profile for one job from its description. Count only the processes the job itself runs at the same time that each need a port of their own. A process that runs but binds no port does not count. Duration is not footprint, and urgency is not footprint, and data volume is not footprint. A database the job connects to does not count, and neither does any service the job merely talks to. Work that other agents claim for themselves does not count. Enumerations govern, so copies and shards and tenants and replicas and auxiliaries each count when each needs its own port. The lean profile is for a count of at most two. The standard profile is for a count of three to twelve. The roomy profile is for a count of more than twelve. Where the description does not determine the count, the answer is the none of these label, and a guess is a wrong answer. Answer with exactly one of the listed options.\",\"type\":\"choice\"}},\"state\":\"A furnishing tool has been asked to size one claim from a job description.\\nThe judge is to apply the counting doctrine of the question to the description below and to nothing else.\\nThe answer sizes a port allocation and performs no allocation itself.\\n\\nRun the checkout service and its payment stub.\\n\\nThe labels are lean and standard and roomy and other. Lean covers a count of at most two, standard covers a count of three to twelve, and roomy covers a count of more than twelve, and other is the answer where the description does not determine the count.\"}",
+  "reply": "{\"model\": \"jev-1.13.0\", \"answers\": {\"profile\": {\"type\": \"choice\", \"choice\": \"stand",
+  "model": "jev-1.13.0",
+  "pool": {
+    "start": 20000,
+    "range_size": 10,
+    "range_count": 16
+  },
+  "default_profile": "lean",
+  "agent": "sw-f04",
+  "expected_log_line": {
+    "agent": "sw-f04",
+    "allocated": "lean",
+    "at": null,
+    "confidence": null,
+    "description_bytes": 46,
+    "description_sha256": "888f3aea894b94da62390bc402929f34e9aad414663077e4ae5e4ec4959ae89f",
+    "fallback": "malformed",
+    "model": "jev-1.13.0",
+    "refusal": null,
+    "verdict": null
+  },
+  "expected_outcome": {
+    "allocated": "lean",
+    "port_start": 20000,
+    "port_end": 20009
+  }
+}

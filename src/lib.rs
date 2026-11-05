@@ -21,8 +21,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 
 pub const REGISTRY_NAME: &str = "switchyard-registry.json";
+pub const ROUTING_LOG_NAME: &str = "switchyard-routing.jsonl";
 pub const LOCK_NAME: &str = "switchyard.lock";
 pub const REPO_NAME: &str = "repo";
 pub const WORKTREES_NAME: &str = "worktrees";
@@ -35,6 +37,32 @@ pub const DEFAULT_RANGE_COUNT: i64 = 16;
 
 pub const AGENT_NAME_MAX: usize = 40;
 pub const GIT_TIMEOUT_SECONDS: u64 = 120;
+
+/// The model the routed entry point pins in every request it
+/// builds. A request naming any other model is never built,
+/// because the routing log must name a model that was actually
+/// consulted.
+pub const ROUTING_MODEL: &str = "jev-1.13.0";
+
+/// The name of the one question a routing request carries.
+pub const ROUTING_QUESTION: &str = "profile";
+
+/// The bound on a routed claim's job description, in UTF-8 bytes.
+pub const DESCRIPTION_MAX_BYTES: usize = 4096;
+
+/// The confidence bar a verdict must clear to stand. A verdict
+/// below it lands the claim on its declared default profile under
+/// the low confidence class of obligation SY-14.
+pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.5;
+
+/// The timeout the subprocess judge transport runs under, in
+/// seconds, fixed here so every caller shares the one bound.
+pub const JUDGE_TIMEOUT_SECONDS: u64 = 30;
+
+/// The four labels a verdict document may choose among, the three
+/// declared profiles and the none of these label the wire names
+/// other.
+pub const VERDICT_LABELS: [&str; 4] = ["lean", "standard", "roomy", "other"];
 
 /// An error the CLI reports with a nonzero exit and no traceback.
 /// The variants carry the exit codes the Python implementation's
@@ -536,14 +564,16 @@ fn validate_registry(data: &JVal, path: &Path) -> Result<Registry> {
                 format!("the claim for {agent} reaches outside the port pool"),
             ));
         }
-        if (port_start - pool.start) % pool.range_size != 0
-            || port_end != port_start + pool.range_size - 1
-        {
+        // A record holds whole slots of the grid, aligned at its
+        // start. Round 1 records hold exactly one slot, and the
+        // routing slice of Round 3 grows the span a record may
+        // carry to the consecutive slots a profile drew, which
+        // obligation SY-15 names as the one growth of the format.
+        let span = port_end - port_start + 1;
+        if (port_start - pool.start) % pool.range_size != 0 || span % pool.range_size != 0 {
             return Err(corrupt(
                 path,
-                format!(
-                    "the claim for {agent} does not hold exactly one slot of the port pool grid"
-                ),
+                format!("the claim for {agent} does not hold whole slots of the port pool grid"),
             ));
         }
         ranges.push((port_start, port_end, agent.clone()));
@@ -1427,16 +1457,23 @@ fn init_stack_with(
     }
 }
 
-fn free_range(data: &Registry) -> Option<(i64, i64)> {
+/// The first run of consecutive free ranges of the given length,
+/// as its first port and its last port. A draw is made whole or
+/// not at all, so a pool where single ranges stand free but no run
+/// of the needed length stands free furnishes nothing here.
+fn free_run(data: &Registry, ranges: i64) -> Option<(i64, i64)> {
     let pool = &data.port_pool;
+    if ranges < 1 || ranges > pool.range_count {
+        return None;
+    }
     let taken: Vec<(i64, i64)> = data
         .claims
         .values()
         .map(|record| (record.port_start, record.port_end))
         .collect();
-    for index in 0..pool.range_count {
+    for index in 0..=(pool.range_count - ranges) {
         let start = pool.start + index * pool.range_size;
-        let end = start + pool.range_size - 1;
+        let end = start + ranges * pool.range_size - 1;
         if taken.iter().all(|(low, high)| end < *low || start > *high) {
             return Some((start, end));
         }
@@ -1553,6 +1590,32 @@ pub fn claim(stack: &Path, agent: &str) -> Result<Record> {
     claim_with(stack, agent, &ProcessGit, &save_registry)
 }
 
+/// The opening every claim shape shares once the stack stands
+/// resolved and the agent name checked, in the landed order. The
+/// lock is taken, the registry loaded under it, and the stack
+/// repository verified. The standing claim check stands apart
+/// because the third phase of a routed claim records that refusal
+/// before it returns it, where the other shapes return it bare.
+fn claim_prologue(stack: &Path, git: &dyn GitRunner) -> Result<(Locked, Registry)> {
+    let lock = locked(stack)?;
+    let data = load_registry(stack)?;
+    verify_own_repo(git, stack)?;
+    Ok((lock, data))
+}
+
+/// The refusal of a claim whose agent already holds a claim in
+/// the stack, in the one wording every claim shape returns it in.
+fn standing_claim_error(agent: &str) -> Error {
+    Error::plain(format!("agent {agent} already holds a claim in this stack"))
+}
+
+fn refuse_standing_claim(data: &Registry, agent: &str) -> Result<()> {
+    if data.claims.contains_key(agent) {
+        return Err(standing_claim_error(agent));
+    }
+    Ok(())
+}
+
 fn claim_with(
     stack: &Path,
     agent: &str,
@@ -1561,25 +1624,71 @@ fn claim_with(
 ) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
+    let (lock, data) = claim_prologue(&stack, git)?;
+    refuse_standing_claim(&data, agent)?;
+    allocate_locked(AllocParts {
+        stack: &stack,
+        agent,
+        draw: 1,
+        data,
+        lock: &lock,
+        git,
+        saver,
+        routing: None,
+    })
+}
+
+/// The inputs of the shared allocation attempt, bundled because
+/// the attempt is the one path every claim shape takes and its
+/// inputs name one another badly as a bare argument list.
+struct AllocParts<'a> {
+    stack: &'a Path,
+    agent: &'a str,
+    draw: i64,
+    data: Registry,
+    lock: &'a Locked,
+    git: &'a dyn GitRunner,
+    saver: &'a dyn Fn(&Path, &Registry) -> Result<()>,
+    routing: Option<&'a RoutingLine>,
+}
+
+/// The shared allocation attempt, run with the stack lock held and
+/// the registry loaded and the standing claim check already made.
+///
+/// A draw of one range is the claim Round 1 landed. A larger draw
+/// takes that many consecutive ranges for a profiled or routed
+/// claim, and the record carries the start of the first range it
+/// drew and the end of the last in the landed record shape. When a
+/// routing line stands, it is appended to the routing log after
+/// the allocation is built and immediately before the registry
+/// publish, as obligation SY-15 fixes the order.
+fn allocate_locked(parts: AllocParts) -> Result<Record> {
+    let AllocParts {
+        stack,
+        agent,
+        draw,
+        mut data,
+        lock,
+        git,
+        saver,
+        routing,
+    } = parts;
     let repo = stack.join(REPO_NAME);
     let branch = branch_name(agent);
     let worktree_rel = format!("{WORKTREES_NAME}/{agent}");
     let worktree = stack.join(&worktree_rel);
     let env_rel = format!("{worktree_rel}/{ENV_NAME}");
-    let lock = locked(&stack)?;
-    let mut data = load_registry(&stack)?;
-    verify_own_repo(git, &stack)?;
-    if data.claims.contains_key(agent) {
-        return Err(Error::plain(format!(
-            "agent {agent} already holds a claim in this stack"
-        )));
-    }
-    let (port_start, port_end) = match free_range(&data) {
+    let (port_start, port_end) = match free_run(&data, draw) {
         Some(range) => range,
-        None => {
+        None if draw == 1 => {
             return Err(Error::plain(
                 "the port pool is exhausted, every range is held",
             ))
+        }
+        None => {
+            return Err(Error::plain(format!(
+                "the port pool cannot furnish a draw of {draw} consecutive ranges"
+            )))
         }
     };
     let record = Record {
@@ -1612,10 +1721,13 @@ fn claim_with(
             &repo,
             &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
         )?;
-        write_env_file(&stack, &env_rel, &record)?;
+        write_env_file(stack, &env_rel, &record)?;
         data.claims.insert(agent.to_string(), record.clone());
         lock.verify_current()?;
-        saver(&stack, &data)?;
+        if let Some(line) = routing {
+            line.append(stack)?;
+        }
+        saver(stack, &data)?;
         Ok(())
     })();
     match attempt {
@@ -1680,6 +1792,650 @@ pub fn list_claims(stack: &Path) -> Result<Vec<Record>> {
     let stack = resolve_path(stack);
     let data = load_registry(&stack)?;
     Ok(data.claims.values().cloned().collect())
+}
+
+/// One declared allocation profile of obligation SY-12.
+///
+/// The profiles are constants of the library and of the contract,
+/// declared once for every stack. They live in neither registry
+/// state nor claim parameters, because the choice set is the
+/// doctrine the routing prompt states, and a judge whose choices
+/// change from stack to stack or from caller to caller is a judge
+/// applying a doctrine nobody recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Lean,
+    Standard,
+    Roomy,
+}
+
+impl Profile {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Profile::Lean => "lean",
+            Profile::Standard => "standard",
+            Profile::Roomy => "roomy",
+        }
+    }
+
+    /// The draw of the profile, in whole ranges of the recorded
+    /// pool. A plain claim draws one range, as the lean profile
+    /// does, while remaining different in kind, because a plain
+    /// claim names no profile and none is inferred for it.
+    pub fn draw(&self) -> i64 {
+        match self {
+            Profile::Lean => 1,
+            Profile::Standard => 2,
+            Profile::Roomy => 4,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Profile> {
+        PROFILES
+            .iter()
+            .find(|profile| profile.name() == name)
+            .copied()
+    }
+}
+
+/// The declared profiles, in the order the contract names them.
+pub const PROFILES: [Profile; 3] = [Profile::Lean, Profile::Standard, Profile::Roomy];
+
+/// Resolve a caller supplied profile name to a declared profile,
+/// refusing a name outside the declared set the way the init
+/// command refuses a pool number that is not positive.
+pub fn profile_named(name: &str) -> Result<Profile> {
+    Profile::from_name(name).ok_or_else(|| {
+        Error::plain(format!(
+            "unknown profile {name}, the declared profiles are lean and standard and roomy"
+        ))
+    })
+}
+
+/// The seam a model is consulted through, moving text only.
+///
+/// A transport receives the exact request document the library
+/// built and returns the reply body as text, and the library alone
+/// classifies that text under the grammar of obligation SY-16, so
+/// a recorded reply and a live reply and a broken reply are all
+/// judged by the one reader. The error text is the detail of the
+/// failure, which the classification records only as the transport
+/// class.
+pub trait JudgeTransport {
+    fn consult(&self, request: &str) -> std::result::Result<String, String>;
+}
+
+/// A transport that answers from recorded replies, keyed by the
+/// SHA-256 digest of the exact request document.
+///
+/// A request with no recorded reply is a transport failure of its
+/// own recorded kind, so a test that drifts from its fixtures
+/// fails as a named transport event and never as a silent landing
+/// on a default it did not pin.
+pub struct FixtureTransport {
+    replies: std::collections::BTreeMap<String, String>,
+}
+
+impl FixtureTransport {
+    pub fn new(replies: std::collections::BTreeMap<String, String>) -> FixtureTransport {
+        FixtureTransport { replies }
+    }
+
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> FixtureTransport {
+        FixtureTransport {
+            replies: pairs.into_iter().collect(),
+        }
+    }
+}
+
+impl JudgeTransport for FixtureTransport {
+    fn consult(&self, request: &str) -> std::result::Result<String, String> {
+        let digest = sha256_hex(request.as_bytes());
+        self.replies
+            .get(&digest)
+            .cloned()
+            .ok_or_else(|| format!("no recorded reply for the request digest {digest}"))
+    }
+}
+
+/// The SHA-256 digest of a byte string, as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The counting doctrine the routing question carries, stated in
+/// so many words because a judge applies the doctrine the prompt
+/// states and does not supply one left implicit.
+const ROUTING_INSTRUCTIONS: &str = "The question asks the judge to choose the allocation profile for one job from its description. Count only the processes the job itself runs at the same time that each need a port of their own. A process that runs but binds no port does not count. Duration is not footprint, and urgency is not footprint, and data volume is not footprint. A database the job connects to does not count, and neither does any service the job merely talks to. Work that other agents claim for themselves does not count. Enumerations govern, so copies and shards and tenants and replicas and auxiliaries each count when each needs its own port. The lean profile is for a count of at most two. The standard profile is for a count of three to twelve. The roomy profile is for a count of more than twelve. Where the description does not determine the count, the answer is the none of these label, and a guess is a wrong answer. Answer with exactly one of the listed options.";
+
+const ROUTING_FRAMING: &str = "A furnishing tool has been asked to size one claim from a job description.\nThe judge is to apply the counting doctrine of the question to the description below and to nothing else.\nThe answer sizes a port allocation and performs no allocation itself.";
+
+const ROUTING_CLOSING: &str = "The labels are lean and standard and roomy and other. Lean covers a count of at most two, standard covers a count of three to twelve, and roomy covers a count of more than twelve, and other is the answer where the description does not determine the count.";
+
+/// The state text of a routing request, a pure function of the
+/// description and of nothing else. No agent name and no stack
+/// fact and no pool state enter it, so the same description always
+/// builds the same state and the digest in the routing log
+/// identifies the judged bytes exactly.
+fn routing_state(description: &str) -> String {
+    format!("{ROUTING_FRAMING}\n\n{description}\n\n{ROUTING_CLOSING}")
+}
+
+/// Build the exact request document a routed claim hands to a
+/// transport, as one canonical JSON line naming the pinned model.
+pub fn routing_request(description: &str) -> String {
+    let mut criteria = serde_json::Map::new();
+    criteria.insert(
+        "lean".to_string(),
+        "The job runs at most two processes at the same time that each need a port of their own."
+            .into(),
+    );
+    criteria.insert(
+        "other".to_string(),
+        "None of the listed options is the correct decision, because the description leaves the count undetermined."
+            .into(),
+    );
+    criteria.insert(
+        "roomy".to_string(),
+        "The job runs more than twelve processes at the same time that each need a port of their own."
+            .into(),
+    );
+    criteria.insert(
+        "standard".to_string(),
+        "The job runs three to twelve processes at the same time that each need a port of their own."
+            .into(),
+    );
+    let mut question = serde_json::Map::new();
+    question.insert("criteria".to_string(), criteria.into());
+    question.insert("instructions".to_string(), ROUTING_INSTRUCTIONS.into());
+    question.insert("type".to_string(), "choice".into());
+    let mut questions = serde_json::Map::new();
+    questions.insert(ROUTING_QUESTION.to_string(), question.into());
+    let mut document = serde_json::Map::new();
+    document.insert("model".to_string(), ROUTING_MODEL.into());
+    document.insert("questions".to_string(), questions.into());
+    document.insert("state".to_string(), routing_state(description).into());
+    serde_json::to_string(&serde_json::Value::Object(document)).unwrap()
+}
+
+fn jval_f64(value: &JVal) -> Option<f64> {
+    match value {
+        JVal::Int(number) => Some(*number as f64),
+        JVal::UInt(number) => Some(*number as f64),
+        JVal::Float(number) if number.is_finite() => Some(*number),
+        _ => None,
+    }
+}
+
+/// What a reply body classifies as under the grammar of SY-16.
+enum Consultation {
+    Verdict(Profile, f64),
+    LowConfidence(Profile, f64),
+    Abstention(f64),
+    Silence,
+    Malformed,
+}
+
+/// Classify one reply body. The confidence of a verdict is the
+/// probability of the chosen label read from the probabilities
+/// map, and a confidence field the reply also carries is never
+/// read, because the wire evidence recorded in the Round 3
+/// amendment preamble shows it is a separate measurement.
+fn classify_reply(body: &str) -> Consultation {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Consultation::Silence;
+    }
+    let data: JVal = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(_) => return Consultation::Malformed,
+    };
+    if first_duplicate_key(&data).is_some() {
+        return Consultation::Malformed;
+    }
+    let entry = match data
+        .get("answers")
+        .and_then(|answers| answers.get(ROUTING_QUESTION))
+    {
+        Some(entry) => entry,
+        None => return Consultation::Silence,
+    };
+    if !matches!(entry, JVal::Obj(_)) {
+        return Consultation::Malformed;
+    }
+    let choice = match entry.get("choice").and_then(JVal::as_str) {
+        Some(choice) if VERDICT_LABELS.contains(&choice) => choice.to_string(),
+        _ => return Consultation::Malformed,
+    };
+    let probabilities = match entry.get("probabilities") {
+        Some(probabilities @ JVal::Obj(pairs)) if exact_keys(pairs, &VERDICT_LABELS) => {
+            probabilities
+        }
+        _ => return Consultation::Malformed,
+    };
+    let mut values = [0.0_f64; 4];
+    for (slot, label) in values.iter_mut().zip(VERDICT_LABELS.iter()) {
+        match probabilities.get(label).and_then(jval_f64) {
+            Some(number) if (0.0..=1.0).contains(&number) => *slot = number,
+            _ => return Consultation::Malformed,
+        }
+    }
+    let index = VERDICT_LABELS
+        .iter()
+        .position(|label| *label == choice)
+        .unwrap();
+    let confidence = values[index];
+    if choice == "other" {
+        Consultation::Abstention(confidence)
+    } else {
+        let profile = Profile::from_name(&choice).unwrap();
+        if confidence >= LOW_CONFIDENCE_THRESHOLD {
+            Consultation::Verdict(profile, confidence)
+        } else {
+            Consultation::LowConfidence(profile, confidence)
+        }
+    }
+}
+
+/// Refuse a description no consultation may read, an empty or all
+/// whitespace text or one past the stated bound, before any
+/// consultation and before any allocation.
+fn validate_description(description: &str) -> Result<()> {
+    if description.trim().is_empty() {
+        return Err(Error::plain("the job description is empty"));
+    }
+    if description.len() > DESCRIPTION_MAX_BYTES {
+        return Err(Error::plain(format!(
+            "the job description is past the bound of {DESCRIPTION_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// The fallback vocabulary the routing log records, of
+/// obligations SY-14 and SY-15, typed so the classes the log may
+/// carry are checked by the compiler rather than spelled as bare
+/// strings at each site that records one. The name of a class is
+/// the word the log carries for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    None,
+    LowConfidence,
+    Abstention,
+    Silence,
+    Malformed,
+    Transport,
+    NoTransport,
+    NoConsultation,
+}
+
+impl Fallback {
+    fn name(&self) -> &'static str {
+        match self {
+            Fallback::None => "none",
+            Fallback::LowConfidence => "low confidence",
+            Fallback::Abstention => "abstention",
+            Fallback::Silence => "silence",
+            Fallback::Malformed => "malformed",
+            Fallback::Transport => "transport",
+            Fallback::NoTransport => "no transport",
+            Fallback::NoConsultation => "no consultation",
+        }
+    }
+}
+
+/// One line of the routing log of obligation SY-15, carrying the
+/// fields that obligation names and no others.
+struct RoutingLine {
+    agent: String,
+    description: String,
+    model: Option<String>,
+    verdict: Option<String>,
+    confidence: Option<f64>,
+    fallback: Fallback,
+    allocated: Option<String>,
+    refusal: Option<String>,
+}
+
+impl RoutingLine {
+    /// A line for one routed claim, standing with the fields
+    /// every outcome shares and the outcome fields at their null
+    /// defaults, for the caller to fill with the outcome it
+    /// records.
+    fn new(agent: &str, description: &str, model: Option<String>) -> RoutingLine {
+        RoutingLine {
+            agent: agent.to_string(),
+            description: description.to_string(),
+            model,
+            verdict: None,
+            confidence: None,
+            fallback: Fallback::None,
+            allocated: None,
+            refusal: None,
+        }
+    }
+
+    fn append(&self, stack: &Path) -> Result<()> {
+        let text = serde_json::Value::Object(self.fields());
+        let path = stack.join(ROUTING_LOG_NAME);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|exc| {
+                Error::plain(format!(
+                    "the routing log at {} cannot be opened, {exc}",
+                    path.display()
+                ))
+            })?;
+        file.write_all(text.to_string().as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(|exc| {
+                Error::plain(format!(
+                    "the routing log at {} cannot be written, {exc}",
+                    path.display()
+                ))
+            })
+    }
+
+    fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut line = serde_json::Map::new();
+        line.insert("agent".to_string(), self.agent.clone().into());
+        line.insert(
+            "allocated".to_string(),
+            match &self.allocated {
+                Some(profile) => profile.clone().into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert("at".to_string(), now_stamp().into());
+        line.insert(
+            "confidence".to_string(),
+            match self.confidence {
+                Some(number) => serde_json::json!(number),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert(
+            "description_bytes".to_string(),
+            (self.description.len() as i64).into(),
+        );
+        line.insert(
+            "description_sha256".to_string(),
+            sha256_hex(self.description.as_bytes()).into(),
+        );
+        line.insert("fallback".to_string(), self.fallback.name().into());
+        line.insert(
+            "model".to_string(),
+            match &self.model {
+                Some(model) => model.clone().into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert(
+            "refusal".to_string(),
+            match &self.refusal {
+                Some(class) => class.clone().into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert(
+            "verdict".to_string(),
+            match &self.verdict {
+                Some(label) => label.clone().into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        line
+    }
+}
+
+/// Settle the profile of a routed claim from its consultation, in
+/// the second phase of the envelope of obligation SY-13, outside
+/// the stack lock. Returns the settled profile and the verdict
+/// label and the confidence and the fallback class the routing log
+/// records, where the fallback is Fallback::None exactly when the
+/// verdict decided.
+fn settle(
+    description: &str,
+    default_profile: Profile,
+    transport: Option<&dyn JudgeTransport>,
+) -> (Profile, Option<String>, Option<f64>, Fallback) {
+    let transport = match transport {
+        None => return (default_profile, None, None, Fallback::NoTransport),
+        Some(transport) => transport,
+    };
+    let request = routing_request(description);
+    let body = match transport.consult(&request) {
+        Ok(body) => body,
+        Err(_) => return (default_profile, None, None, Fallback::Transport),
+    };
+    match classify_reply(&body) {
+        Consultation::Verdict(profile, confidence) => (
+            profile,
+            Some(profile.name().to_string()),
+            Some(confidence),
+            Fallback::None,
+        ),
+        Consultation::LowConfidence(profile, confidence) => (
+            default_profile,
+            Some(profile.name().to_string()),
+            Some(confidence),
+            Fallback::LowConfidence,
+        ),
+        Consultation::Abstention(confidence) => (
+            default_profile,
+            Some("other".to_string()),
+            Some(confidence),
+            Fallback::Abstention,
+        ),
+        Consultation::Silence => (default_profile, None, None, Fallback::Silence),
+        Consultation::Malformed => (default_profile, None, None, Fallback::Malformed),
+    }
+}
+
+/// Allocate a claim under a named declared profile, with no
+/// consultation at all, by the same path a plain claim takes with
+/// the draw of the profile.
+pub fn claim_profile(stack: &Path, agent: &str, profile: Profile) -> Result<Record> {
+    claim_profile_with(stack, agent, profile, &ProcessGit, &save_registry)
+}
+
+fn claim_profile_with(
+    stack: &Path,
+    agent: &str,
+    profile: Profile,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<Record> {
+    let stack = resolve_path(stack);
+    validate_agent_name(agent)?;
+    let (lock, data) = claim_prologue(&stack, git)?;
+    refuse_standing_claim(&data, agent)?;
+    allocate_locked(AllocParts {
+        stack: &stack,
+        agent,
+        draw: profile.draw(),
+        data,
+        lock: &lock,
+        git,
+        saver,
+        routing: None,
+    })
+}
+
+/// Allocate a claim whose profile a model settles from a job
+/// description, inside the three phase envelope of obligation
+/// SY-13.
+///
+/// The first phase settles every refusal that does not depend on
+/// the verdict under the stack lock and spends no call. The
+/// consultation then takes place outside the lock, on the
+/// description alone. The third phase takes the lock again and
+/// checks the settled profile furnishable against the registry as
+/// it then stands, and a verdict naming a profile that cannot be
+/// furnished refuses naming the profile, because the declared
+/// default is the landing for a consultation that failed to decide
+/// and never for a stack that failed to furnish.
+pub fn claim_routed(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    default_profile: Profile,
+    transport: Option<&dyn JudgeTransport>,
+) -> Result<Record> {
+    claim_routed_with(
+        stack,
+        agent,
+        description,
+        default_profile,
+        transport,
+        &ProcessGit,
+        &save_registry,
+    )
+}
+
+/// Append the routing line of a routed claim refused under the
+/// lock again in the third phase of the envelope of obligation
+/// SY-13, after its consultation stood. The line carries the
+/// verdict and the confidence the consultation returned and the
+/// refusal class SY-15 names for the refusal, and allocates
+/// nothing. The refusal itself returns through the caller, so an
+/// append failure stands in its place, as it does for the pool
+/// refusal of the first phase.
+#[allow(clippy::too_many_arguments)]
+fn refuse_after_consultation(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    model: &Option<String>,
+    verdict: &Option<String>,
+    confidence: Option<f64>,
+    fallback: Fallback,
+    refusal: &str,
+) -> Result<()> {
+    let mut line = RoutingLine::new(agent, description, model.clone());
+    line.verdict = verdict.clone();
+    line.confidence = confidence;
+    line.fallback = fallback;
+    line.refusal = Some(refusal.to_string());
+    line.append(stack)
+}
+
+fn claim_routed_with(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    default_profile: Profile,
+    transport: Option<&dyn JudgeTransport>,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<Record> {
+    let stack = resolve_path(stack);
+    validate_agent_name(agent)?;
+    let model = transport.map(|_| ROUTING_MODEL.to_string());
+    {
+        let (lock, data) = claim_prologue(&stack, git)?;
+        refuse_standing_claim(&data, agent)?;
+        validate_description(description)?;
+        if !PROFILES
+            .iter()
+            .any(|profile| free_run(&data, profile.draw()).is_some())
+        {
+            let mut line = RoutingLine::new(agent, description, model.clone());
+            line.fallback = Fallback::NoConsultation;
+            line.refusal = Some("pool".to_string());
+            line.append(&stack)?;
+            return Err(Error::plain(
+                "the port pool is exhausted, no declared profile can be furnished",
+            ));
+        }
+        drop(lock);
+    }
+    let (settled, verdict, confidence, fallback) = settle(description, default_profile, transport);
+    let lock = locked(&stack)?;
+    let data = match load_registry(&stack) {
+        Ok(data) => data,
+        Err(exc) => {
+            refuse_after_consultation(
+                &stack,
+                agent,
+                description,
+                &model,
+                &verdict,
+                confidence,
+                fallback,
+                "corrupt",
+            )?;
+            return Err(exc);
+        }
+    };
+    if let Err(exc) = verify_own_repo(git, &stack) {
+        refuse_after_consultation(
+            &stack,
+            agent,
+            description,
+            &model,
+            &verdict,
+            confidence,
+            fallback,
+            "repo",
+        )?;
+        return Err(exc);
+    }
+    if data.claims.contains_key(agent) {
+        refuse_after_consultation(
+            &stack,
+            agent,
+            description,
+            &model,
+            &verdict,
+            confidence,
+            fallback,
+            "duplicate",
+        )?;
+        return Err(standing_claim_error(agent));
+    }
+    if free_run(&data, settled.draw()).is_none() {
+        let mut line = RoutingLine::new(agent, description, model.clone());
+        line.verdict = verdict.clone();
+        line.confidence = confidence;
+        line.fallback = fallback;
+        line.refusal = Some("pool".to_string());
+        line.append(&stack)?;
+        return Err(Error::plain(if fallback == Fallback::None {
+            format!(
+                "profile {} cannot be furnished, its draw does not stand free in the port pool",
+                settled.name()
+            )
+        } else {
+            format!(
+                "the default profile {} cannot be furnished, its draw does not stand free in the port pool",
+                settled.name()
+            )
+        }));
+    }
+    let mut line = RoutingLine::new(agent, description, model);
+    line.verdict = verdict;
+    line.confidence = confidence;
+    line.fallback = fallback;
+    line.allocated = Some(settled.name().to_string());
+    allocate_locked(AllocParts {
+        stack: &stack,
+        agent,
+        draw: settled.draw(),
+        data,
+        lock: &lock,
+        git,
+        saver,
+        routing: Some(&line),
+    })
 }
 
 #[cfg(test)]
