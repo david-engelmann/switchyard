@@ -1590,6 +1590,32 @@ pub fn claim(stack: &Path, agent: &str) -> Result<Record> {
     claim_with(stack, agent, &ProcessGit, &save_registry)
 }
 
+/// The opening every claim shape shares once the stack stands
+/// resolved and the agent name checked, in the landed order. The
+/// lock is taken, the registry loaded under it, and the stack
+/// repository verified. The standing claim check stands apart
+/// because the third phase of a routed claim records that refusal
+/// before it returns it, where the other shapes return it bare.
+fn claim_prologue(stack: &Path, git: &dyn GitRunner) -> Result<(Locked, Registry)> {
+    let lock = locked(stack)?;
+    let data = load_registry(stack)?;
+    verify_own_repo(git, stack)?;
+    Ok((lock, data))
+}
+
+/// The refusal of a claim whose agent already holds a claim in
+/// the stack, in the one wording every claim shape returns it in.
+fn standing_claim_error(agent: &str) -> Error {
+    Error::plain(format!("agent {agent} already holds a claim in this stack"))
+}
+
+fn refuse_standing_claim(data: &Registry, agent: &str) -> Result<()> {
+    if data.claims.contains_key(agent) {
+        return Err(standing_claim_error(agent));
+    }
+    Ok(())
+}
+
 fn claim_with(
     stack: &Path,
     agent: &str,
@@ -1598,14 +1624,8 @@ fn claim_with(
 ) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
-    let lock = locked(&stack)?;
-    let data = load_registry(&stack)?;
-    verify_own_repo(git, &stack)?;
-    if data.claims.contains_key(agent) {
-        return Err(Error::plain(format!(
-            "agent {agent} already holds a claim in this stack"
-        )));
-    }
+    let (lock, data) = claim_prologue(&stack, git)?;
+    refuse_standing_claim(&data, agent)?;
     allocate_locked(AllocParts {
         stack: &stack,
         agent,
@@ -2038,6 +2058,38 @@ fn validate_description(description: &str) -> Result<()> {
     Ok(())
 }
 
+/// The fallback vocabulary the routing log records, of
+/// obligations SY-14 and SY-15, typed so the classes the log may
+/// carry are checked by the compiler rather than spelled as bare
+/// strings at each site that records one. The name of a class is
+/// the word the log carries for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    None,
+    LowConfidence,
+    Abstention,
+    Silence,
+    Malformed,
+    Transport,
+    NoTransport,
+    NoConsultation,
+}
+
+impl Fallback {
+    fn name(&self) -> &'static str {
+        match self {
+            Fallback::None => "none",
+            Fallback::LowConfidence => "low confidence",
+            Fallback::Abstention => "abstention",
+            Fallback::Silence => "silence",
+            Fallback::Malformed => "malformed",
+            Fallback::Transport => "transport",
+            Fallback::NoTransport => "no transport",
+            Fallback::NoConsultation => "no consultation",
+        }
+    }
+}
+
 /// One line of the routing log of obligation SY-15, carrying the
 /// fields that obligation names and no others.
 struct RoutingLine {
@@ -2046,12 +2098,29 @@ struct RoutingLine {
     model: Option<String>,
     verdict: Option<String>,
     confidence: Option<f64>,
-    fallback: String,
+    fallback: Fallback,
     allocated: Option<String>,
     refusal: Option<String>,
 }
 
 impl RoutingLine {
+    /// A line for one routed claim, standing with the fields
+    /// every outcome shares and the outcome fields at their null
+    /// defaults, for the caller to fill with the outcome it
+    /// records.
+    fn new(agent: &str, description: &str, model: Option<String>) -> RoutingLine {
+        RoutingLine {
+            agent: agent.to_string(),
+            description: description.to_string(),
+            model,
+            verdict: None,
+            confidence: None,
+            fallback: Fallback::None,
+            allocated: None,
+            refusal: None,
+        }
+    }
+
     fn append(&self, stack: &Path) -> Result<()> {
         let text = serde_json::Value::Object(self.fields());
         let path = stack.join(ROUTING_LOG_NAME);
@@ -2101,7 +2170,7 @@ impl RoutingLine {
             "description_sha256".to_string(),
             sha256_hex(self.description.as_bytes()).into(),
         );
-        line.insert("fallback".to_string(), self.fallback.clone().into());
+        line.insert("fallback".to_string(), self.fallback.name().into());
         line.insert(
             "model".to_string(),
             match &self.model {
@@ -2131,43 +2200,43 @@ impl RoutingLine {
 /// the second phase of the envelope of obligation SY-13, outside
 /// the stack lock. Returns the settled profile and the verdict
 /// label and the confidence and the fallback class the routing log
-/// records, where the fallback is the word none exactly when the
+/// records, where the fallback is Fallback::None exactly when the
 /// verdict decided.
 fn settle(
     description: &str,
     default_profile: Profile,
     transport: Option<&dyn JudgeTransport>,
-) -> (Profile, Option<String>, Option<f64>, &'static str) {
+) -> (Profile, Option<String>, Option<f64>, Fallback) {
     let transport = match transport {
-        None => return (default_profile, None, None, "no transport"),
+        None => return (default_profile, None, None, Fallback::NoTransport),
         Some(transport) => transport,
     };
     let request = routing_request(description);
     let body = match transport.consult(&request) {
         Ok(body) => body,
-        Err(_) => return (default_profile, None, None, "transport"),
+        Err(_) => return (default_profile, None, None, Fallback::Transport),
     };
     match classify_reply(&body) {
         Consultation::Verdict(profile, confidence) => (
             profile,
             Some(profile.name().to_string()),
             Some(confidence),
-            "none",
+            Fallback::None,
         ),
         Consultation::LowConfidence(profile, confidence) => (
             default_profile,
             Some(profile.name().to_string()),
             Some(confidence),
-            "low confidence",
+            Fallback::LowConfidence,
         ),
         Consultation::Abstention(confidence) => (
             default_profile,
             Some("other".to_string()),
             Some(confidence),
-            "abstention",
+            Fallback::Abstention,
         ),
-        Consultation::Silence => (default_profile, None, None, "silence"),
-        Consultation::Malformed => (default_profile, None, None, "malformed"),
+        Consultation::Silence => (default_profile, None, None, Fallback::Silence),
+        Consultation::Malformed => (default_profile, None, None, Fallback::Malformed),
     }
 }
 
@@ -2187,14 +2256,8 @@ fn claim_profile_with(
 ) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
-    let lock = locked(&stack)?;
-    let data = load_registry(&stack)?;
-    verify_own_repo(git, &stack)?;
-    if data.claims.contains_key(agent) {
-        return Err(Error::plain(format!(
-            "agent {agent} already holds a claim in this stack"
-        )));
-    }
+    let (lock, data) = claim_prologue(&stack, git)?;
+    refuse_standing_claim(&data, agent)?;
     allocate_locked(AllocParts {
         stack: &stack,
         agent,
@@ -2238,6 +2301,33 @@ pub fn claim_routed(
     )
 }
 
+/// Append the routing line of a routed claim refused under the
+/// lock again in the third phase of the envelope of obligation
+/// SY-13, after its consultation stood. The line carries the
+/// verdict and the confidence the consultation returned and the
+/// refusal class SY-15 names for the refusal, and allocates
+/// nothing. The refusal itself returns through the caller, so an
+/// append failure stands in its place, as it does for the pool
+/// refusal of the first phase.
+#[allow(clippy::too_many_arguments)]
+fn refuse_after_consultation(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    model: &Option<String>,
+    verdict: &Option<String>,
+    confidence: Option<f64>,
+    fallback: Fallback,
+    refusal: &str,
+) -> Result<()> {
+    let mut line = RoutingLine::new(agent, description, model.clone());
+    line.verdict = verdict.clone();
+    line.confidence = confidence;
+    line.fallback = fallback;
+    line.refusal = Some(refusal.to_string());
+    line.append(stack)
+}
+
 fn claim_routed_with(
     stack: &Path,
     agent: &str,
@@ -2251,30 +2341,17 @@ fn claim_routed_with(
     validate_agent_name(agent)?;
     let model = transport.map(|_| ROUTING_MODEL.to_string());
     {
-        let lock = locked(&stack)?;
-        let data = load_registry(&stack)?;
-        verify_own_repo(git, &stack)?;
-        if data.claims.contains_key(agent) {
-            return Err(Error::plain(format!(
-                "agent {agent} already holds a claim in this stack"
-            )));
-        }
+        let (lock, data) = claim_prologue(&stack, git)?;
+        refuse_standing_claim(&data, agent)?;
         validate_description(description)?;
         if !PROFILES
             .iter()
             .any(|profile| free_run(&data, profile.draw()).is_some())
         {
-            RoutingLine {
-                agent: agent.to_string(),
-                description: description.to_string(),
-                model: model.clone(),
-                verdict: None,
-                confidence: None,
-                fallback: "none".to_string(),
-                allocated: None,
-                refusal: Some("pool".to_string()),
-            }
-            .append(&stack)?;
+            let mut line = RoutingLine::new(agent, description, model.clone());
+            line.fallback = Fallback::NoConsultation;
+            line.refusal = Some("pool".to_string());
+            line.append(&stack)?;
             return Err(Error::plain(
                 "the port pool is exhausted, no declared profile can be furnished",
             ));
@@ -2283,26 +2360,56 @@ fn claim_routed_with(
     }
     let (settled, verdict, confidence, fallback) = settle(description, default_profile, transport);
     let lock = locked(&stack)?;
-    let data = load_registry(&stack)?;
-    verify_own_repo(git, &stack)?;
+    let data = match load_registry(&stack) {
+        Ok(data) => data,
+        Err(exc) => {
+            refuse_after_consultation(
+                &stack,
+                agent,
+                description,
+                &model,
+                &verdict,
+                confidence,
+                fallback,
+                "corrupt",
+            )?;
+            return Err(exc);
+        }
+    };
+    if let Err(exc) = verify_own_repo(git, &stack) {
+        refuse_after_consultation(
+            &stack,
+            agent,
+            description,
+            &model,
+            &verdict,
+            confidence,
+            fallback,
+            "repo",
+        )?;
+        return Err(exc);
+    }
     if data.claims.contains_key(agent) {
-        return Err(Error::plain(format!(
-            "agent {agent} already holds a claim in this stack"
-        )));
+        refuse_after_consultation(
+            &stack,
+            agent,
+            description,
+            &model,
+            &verdict,
+            confidence,
+            fallback,
+            "duplicate",
+        )?;
+        return Err(standing_claim_error(agent));
     }
     if free_run(&data, settled.draw()).is_none() {
-        RoutingLine {
-            agent: agent.to_string(),
-            description: description.to_string(),
-            model: model.clone(),
-            verdict: verdict.clone(),
-            confidence,
-            fallback: fallback.to_string(),
-            allocated: None,
-            refusal: Some("pool".to_string()),
-        }
-        .append(&stack)?;
-        return Err(Error::plain(if fallback == "none" {
+        let mut line = RoutingLine::new(agent, description, model.clone());
+        line.verdict = verdict.clone();
+        line.confidence = confidence;
+        line.fallback = fallback;
+        line.refusal = Some("pool".to_string());
+        line.append(&stack)?;
+        return Err(Error::plain(if fallback == Fallback::None {
             format!(
                 "profile {} cannot be furnished, its draw does not stand free in the port pool",
                 settled.name()
@@ -2314,16 +2421,11 @@ fn claim_routed_with(
             )
         }));
     }
-    let line = RoutingLine {
-        agent: agent.to_string(),
-        description: description.to_string(),
-        model,
-        verdict,
-        confidence,
-        fallback: fallback.to_string(),
-        allocated: Some(settled.name().to_string()),
-        refusal: None,
-    };
+    let mut line = RoutingLine::new(agent, description, model);
+    line.verdict = verdict;
+    line.confidence = confidence;
+    line.fallback = fallback;
+    line.allocated = Some(settled.name().to_string());
     allocate_locked(AllocParts {
         stack: &stack,
         agent,
