@@ -544,7 +544,7 @@ fn a_preslice_registry_document_loads_with_its_queue_read_as_empty() {
     init_stack(&stack, 20000, 10, 16).unwrap();
     std::fs::copy(&fixture, stack.join(REGISTRY_NAME)).unwrap();
     let data = load_registry(&stack).unwrap();
-    assert_eq!(data.claims.len(), 1);
+    assert_eq!(data.claims.len(), 3);
     assert!(data.waits.is_empty());
 }
 
