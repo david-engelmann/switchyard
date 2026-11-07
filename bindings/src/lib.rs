@@ -279,6 +279,7 @@ impl switchyard_core::JudgeTransport for CallableTransport {
 /// standing, the claim waits exactly as a command line claim with
 /// --wait waits, and the same callable answers the scoring
 /// question beside the routing question.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (stack, agent, description, default_profile, transport = None, wait = false, wait_for = None))]
 fn claim_routed(

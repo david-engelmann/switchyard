@@ -762,78 +762,79 @@ fn a_routed_waiting_claim_whose_settled_draw_is_taken_during_scoring_waits_with_
 
 #[test]
 fn one_reply_of_each_scoring_class_lands_with_its_class_recorded() {
-    let mut cases: Vec<(&str, String, Option<i64>, &str)> = Vec::new();
-    cases.push((
-        "a score at the threshold",
-        score_body("8", 0.5),
-        Some(8),
-        "none",
-    ));
-    cases.push((
-        "a score above the threshold",
-        score_body("8", 0.9),
-        Some(8),
-        "none",
-    ));
-    cases.push((
-        "a score below the threshold",
-        score_body("3", 0.49),
-        None,
-        "low confidence",
-    ));
-    cases.push((
-        "the no score label",
-        score_body("other", 0.9),
-        None,
-        "abstention",
-    ));
-    cases.push(("an empty body", String::new(), None, "silence"));
-    cases.push((
-        "a body with no score answer",
-        "{\"model\": \"jev-1.13.0\", \"answers\": {}}".to_string(),
-        None,
-        "silence",
-    ));
     let one = score_body("5", 0.9);
-    cases.push((
-        "a two document body",
-        format!("{one}\n{one}"),
-        None,
-        "malformed",
-    ));
     let mut missing_label =
         serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
     missing_label["answers"]["score"]["probabilities"]
         .as_object_mut()
         .unwrap()
         .remove("7");
-    cases.push((
-        "probabilities missing a label",
-        missing_label.to_string(),
-        None,
-        "malformed",
-    ));
     let mut out_of_range =
         serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
     out_of_range["answers"]["score"]["probabilities"]["5"] = serde_json::json!(1.5);
-    cases.push((
-        "a probability out of range",
-        out_of_range.to_string(),
-        None,
-        "malformed",
-    ));
     let mut outside_label =
         serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
     outside_label["answers"]["score"]["probabilities"]
         .as_object_mut()
         .unwrap()
         .insert("eleven".to_string(), serde_json::json!(0.0));
-    cases.push((
-        "a label outside the eleven",
-        outside_label.to_string(),
-        None,
-        "malformed",
-    ));
+    let cases: Vec<(&str, String, Option<i64>, &str)> = vec![
+        (
+            "a score at the threshold",
+            score_body("8", 0.5),
+            Some(8),
+            "none",
+        ),
+        (
+            "a score above the threshold",
+            score_body("8", 0.9),
+            Some(8),
+            "none",
+        ),
+        (
+            "a score below the threshold",
+            score_body("3", 0.49),
+            None,
+            "low confidence",
+        ),
+        (
+            "the no score label",
+            score_body("other", 0.9),
+            None,
+            "abstention",
+        ),
+        ("an empty body", String::new(), None, "silence"),
+        (
+            "a body with no score answer",
+            "{\"model\": \"jev-1.13.0\", \"answers\": {}}".to_string(),
+            None,
+            "silence",
+        ),
+        (
+            "a two document body",
+            format!("{one}\n{one}"),
+            None,
+            "malformed",
+        ),
+        (
+            "probabilities missing a label",
+            missing_label.to_string(),
+            None,
+            "malformed",
+        ),
+        (
+            "a probability out of range",
+            out_of_range.to_string(),
+            None,
+            "malformed",
+        ),
+        (
+            "a label outside the eleven",
+            outside_label.to_string(),
+            None,
+            "malformed",
+        ),
+    ];
     for (name, body, score, fallback) in cases {
         let stack = default_stack("scoring-class");
         fill_pool(&stack);
