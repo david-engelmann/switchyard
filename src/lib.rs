@@ -2302,6 +2302,11 @@ pub enum ReleaseOutcome {
     Wait(Wait),
 }
 
+/// What serving the standing waits in a release returns, the
+/// waits furnished in offer order and the port span each
+/// furnished claim took, keyed by agent.
+type OfferOutcome = (Vec<Wait>, BTreeMap<String, (i64, i64)>);
+
 /// Serve the standing waits of a release whose claim's removal
 /// already stands computed in the registry, in offer order, under
 /// obligation SY-21. A wait whose whole draw stands free at its
@@ -2317,7 +2322,7 @@ fn serve_offers(
     stack: &Path,
     instant: &str,
     git: &dyn GitRunner,
-) -> Result<(Vec<Wait>, BTreeMap<String, (i64, i64)>)> {
+) -> Result<OfferOutcome> {
     let mut furnished: Vec<Wait> = Vec::new();
     let mut spans: BTreeMap<String, (i64, i64)> = BTreeMap::new();
     for wait in offer_order(&data.waits) {
@@ -2385,7 +2390,13 @@ fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<Releas
     if let Some(wait) = data.waits.iter().find(|wait| wait.agent == agent).cloned() {
         data.waits.retain(|standing| standing.agent != agent);
         append_leavings(&stack, &instant, "expired", &expired, None)?;
-        append_leavings(&stack, &instant, "cancelled", &[wait.clone()], None)?;
+        append_leavings(
+            &stack,
+            &instant,
+            "cancelled",
+            std::slice::from_ref(&wait),
+            None,
+        )?;
         lock.verify_current()?;
         save_registry(&stack, &data)?;
         return Ok(ReleaseOutcome::Wait(wait));
