@@ -3170,8 +3170,8 @@ pub fn scoring_request(
 /// SY-20.
 enum ScoreConsultation {
     Score(i64, f64),
-    LowConfidence(i64, f64),
-    Abstention(f64),
+    LowConfidence,
+    Abstention,
     Silence,
     Malformed,
 }
@@ -3229,11 +3229,11 @@ fn classify_score(body: &str) -> ScoreConsultation {
         .unwrap();
     let confidence = values[index];
     if choice == "other" {
-        ScoreConsultation::Abstention(confidence)
+        ScoreConsultation::Abstention
     } else if confidence >= LOW_CONFIDENCE_THRESHOLD {
         ScoreConsultation::Score(choice.parse().unwrap(), confidence)
     } else {
-        ScoreConsultation::LowConfidence(choice.parse().unwrap(), confidence)
+        ScoreConsultation::LowConfidence
     }
 }
 
@@ -3283,13 +3283,13 @@ fn settle_score(transport: Option<&dyn JudgeTransport>, request: &str) -> ScoreO
             fallback: "none",
             model,
         },
-        ScoreConsultation::LowConfidence(_, _) => ScoreOutcome {
+        ScoreConsultation::LowConfidence => ScoreOutcome {
             score: None,
             confidence: None,
             fallback: "low confidence",
             model,
         },
-        ScoreConsultation::Abstention(_) => ScoreOutcome {
+        ScoreConsultation::Abstention => ScoreOutcome {
             score: None,
             confidence: None,
             fallback: "abstention",
@@ -3739,7 +3739,7 @@ fn claim_routed_waiting_with(
     let model = transport.map(|_| ROUTING_MODEL.to_string());
     let mut pre_settled: Option<Profile> = None;
     let snapshot = {
-        let (lock, mut data) = claim_prologue(&stack, git)?;
+        let (_lock, mut data) = claim_prologue(&stack, git)?;
         let instant = now_stamp();
         let _ = sweep_expired(&mut data, &instant);
         refuse_standing_position(&data, agent)?;

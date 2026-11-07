@@ -1125,7 +1125,8 @@ fn a_wait_stands_short_of_its_bound_and_is_swept_at_and_past_it() {
             );
         } else {
             assert!(!standing.contains(&"waiter"), "{tag}: {standing:?}");
-            let expired: Vec<&serde_json::Value> = read_queue_log(&stack)
+            let queue_log = read_queue_log(&stack);
+            let expired: Vec<&serde_json::Value> = queue_log
                 .iter()
                 .filter(|line| line["kind"] == "expired")
                 .collect::<Vec<_>>();
