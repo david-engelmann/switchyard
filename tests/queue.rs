@@ -16,10 +16,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use switchyard::{
-    claim, claim_profile, claim_profile_waiting, claim_routed_waiting, claim_waiting,
-    init_stack, list_waits, load_registry, release, scoring_request, sha256_hex,
-    ClaimOutcome, FixtureTransport, JudgeTransport, Profile, ReleaseOutcome, Wait,
-    QUEUE_LOG_NAME, REGISTRY_NAME, ROUTING_LOG_NAME,
+    claim, claim_profile, claim_profile_waiting, claim_routed_waiting, claim_waiting, init_stack,
+    list_waits, load_registry, release, scoring_request, sha256_hex, ClaimOutcome,
+    FixtureTransport, JudgeTransport, Profile, ReleaseOutcome, Wait, QUEUE_LOG_NAME, REGISTRY_NAME,
+    ROUTING_LOG_NAME,
 };
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -122,10 +122,10 @@ fn inject_waits(stack: &Path, waits: &[serde_json::Value]) {
     let path = stack.join(REGISTRY_NAME);
     let text = std::fs::read_to_string(&path).unwrap();
     let mut document: serde_json::Value = serde_json::from_str(&text).unwrap();
-    document
-        .as_object_mut()
-        .unwrap()
-        .insert("waits".to_string(), serde_json::Value::Array(waits.to_vec()));
+    document.as_object_mut().unwrap().insert(
+        "waits".to_string(),
+        serde_json::Value::Array(waits.to_vec()),
+    );
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&document).unwrap() + "\n",
@@ -178,9 +178,7 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
 /// does, so every pin here also proves the carried field is never
 /// read.
 fn score_body(choice: &str, confidence: f64) -> String {
-    let labels = [
-        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "other",
-    ];
+    let labels = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "other"];
     let rest = (1.0 - confidence) / 10.0;
     let mut map = serde_json::Map::new();
     for label in labels {
@@ -333,17 +331,12 @@ fn waiting_profiled_claims_wait_with_their_named_profiles() {
     let stack = stack_with("surface-profiles", 20000, 10, 3);
     claim(&stack, "one").unwrap();
     claim(&stack, "two").unwrap();
-    let roomy = waited(
-        claim_profile_waiting(&stack, "big", Profile::Roomy, None, None).unwrap(),
-    );
+    let roomy = waited(claim_profile_waiting(&stack, "big", Profile::Roomy, None, None).unwrap());
     assert_eq!(roomy.profile, "roomy");
-    let standard = waited(
-        claim_profile_waiting(&stack, "mid", Profile::Standard, None, None).unwrap(),
-    );
+    let standard =
+        waited(claim_profile_waiting(&stack, "mid", Profile::Standard, None, None).unwrap());
     assert_eq!(standard.profile, "standard");
-    let lean = claimed(
-        claim_profile_waiting(&stack, "small", Profile::Lean, None, None).unwrap(),
-    );
+    let lean = claimed(claim_profile_waiting(&stack, "small", Profile::Lean, None, None).unwrap());
     assert_eq!((lean.port_start, lean.port_end), (20020, 20029));
 }
 
@@ -424,13 +417,9 @@ fn a_recorded_wait_reads_back_field_by_field() {
     let stack = default_stack("record-fields");
     fill_pool(&stack);
     let request = scoring_request("plain", 1, &[], &[], Some(120), None);
-    let transport = FixtureTransport::from_pairs([(
-        sha256_hex(request.as_bytes()),
-        score_body("7", 0.9),
-    )]);
-    let wait = waited(
-        claim_waiting(&stack, "scored", Some(120), Some(&transport)).unwrap(),
-    );
+    let transport =
+        FixtureTransport::from_pairs([(sha256_hex(request.as_bytes()), score_body("7", 0.9))]);
+    let wait = waited(claim_waiting(&stack, "scored", Some(120), Some(&transport)).unwrap());
     assert_eq!(wait.agent, "scored");
     assert_eq!(wait.profile, "plain");
     assert_eq!(wait.wait_for, Some(120));
@@ -499,8 +488,8 @@ fn wait_record_corruptions_refuse_as_corrupt_and_change_nothing() {
         claim(&stack, "holder").unwrap();
         inject_waits(&stack, &[entry]);
         let before = snapshot_tree(&stack);
-        let error = claim(&stack, "other")
-            .expect_err("a corrupt wait record refuses every command");
+        let error =
+            claim(&stack, "other").expect_err("a corrupt wait record refuses every command");
         assert_eq!(error.exit_code(), 2, "{name}");
         assert!(
             error.message().contains("corrupt"),
@@ -514,8 +503,8 @@ fn wait_record_corruptions_refuse_as_corrupt_and_change_nothing() {
     let stack = default_stack("record-both");
     claim(&stack, "holder").unwrap();
     inject_waits(&stack, &[staged_wait("holder", "lean", None)]);
-    let error = claim(&stack, "other")
-        .expect_err("an agent in both the claims and the waits is corrupt");
+    let error =
+        claim(&stack, "other").expect_err("an agent in both the claims and the waits is corrupt");
     assert_eq!(error.exit_code(), 2);
     let stack = default_stack("record-twice");
     inject_waits(
@@ -525,8 +514,8 @@ fn wait_record_corruptions_refuse_as_corrupt_and_change_nothing() {
             staged_wait("waiter", "roomy", None),
         ],
     );
-    let error = claim(&stack, "other")
-        .expect_err("one agent standing twice in the waits is corrupt");
+    let error =
+        claim(&stack, "other").expect_err("one agent standing twice in the waits is corrupt");
     assert_eq!(error.exit_code(), 2);
 }
 
@@ -600,8 +589,7 @@ fn a_counting_transport_stands_at_zero_behind_every_first_phase_refusal() {
     let stack = default_stack("envelope-corrupt");
     std::fs::write(stack.join(REGISTRY_NAME), "not a registry").unwrap();
     let transport = CountingTransport::new(body.clone());
-    claim_waiting(&stack, "alpha", None, Some(&transport))
-        .expect_err("a corrupt registry refuses");
+    claim_waiting(&stack, "alpha", None, Some(&transport)).expect_err("a corrupt registry refuses");
     assert_eq!(transport.calls(), 0);
     // A standing claim.
     let stack = default_stack("envelope-claim");
@@ -631,14 +619,12 @@ fn a_counting_transport_stands_at_zero_behind_every_first_phase_refusal() {
         .collect();
     inject_waits(&stack, &fillers);
     let transport = CountingTransport::new(body.clone());
-    claim_waiting(&stack, "alpha", None, Some(&transport))
-        .expect_err("a full queue refuses");
+    claim_waiting(&stack, "alpha", None, Some(&transport)).expect_err("a full queue refuses");
     assert_eq!(transport.calls(), 0);
     // A bound that is not positive.
     let stack = default_stack("envelope-bound");
     let transport = CountingTransport::new(body);
-    claim_waiting(&stack, "alpha", Some(0), Some(&transport))
-        .expect_err("a bound of zero refuses");
+    claim_waiting(&stack, "alpha", Some(0), Some(&transport)).expect_err("a bound of zero refuses");
     assert_eq!(transport.calls(), 0);
 }
 
@@ -777,10 +763,30 @@ fn a_routed_waiting_claim_whose_settled_draw_is_taken_during_scoring_waits_with_
 #[test]
 fn one_reply_of_each_scoring_class_lands_with_its_class_recorded() {
     let mut cases: Vec<(&str, String, Option<i64>, &str)> = Vec::new();
-    cases.push(("a score at the threshold", score_body("8", 0.5), Some(8), "none"));
-    cases.push(("a score above the threshold", score_body("8", 0.9), Some(8), "none"));
-    cases.push(("a score below the threshold", score_body("3", 0.49), None, "low confidence"));
-    cases.push(("the no score label", score_body("other", 0.9), None, "abstention"));
+    cases.push((
+        "a score at the threshold",
+        score_body("8", 0.5),
+        Some(8),
+        "none",
+    ));
+    cases.push((
+        "a score above the threshold",
+        score_body("8", 0.9),
+        Some(8),
+        "none",
+    ));
+    cases.push((
+        "a score below the threshold",
+        score_body("3", 0.49),
+        None,
+        "low confidence",
+    ));
+    cases.push((
+        "the no score label",
+        score_body("other", 0.9),
+        None,
+        "abstention",
+    ));
     cases.push(("an empty body", String::new(), None, "silence"));
     cases.push((
         "a body with no score answer",
@@ -789,8 +795,14 @@ fn one_reply_of_each_scoring_class_lands_with_its_class_recorded() {
         "silence",
     ));
     let one = score_body("5", 0.9);
-    cases.push(("a two document body", format!("{one}\n{one}"), None, "malformed"));
-    let mut missing_label = serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
+    cases.push((
+        "a two document body",
+        format!("{one}\n{one}"),
+        None,
+        "malformed",
+    ));
+    let mut missing_label =
+        serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
     missing_label["answers"]["score"]["probabilities"]
         .as_object_mut()
         .unwrap()
@@ -801,7 +813,8 @@ fn one_reply_of_each_scoring_class_lands_with_its_class_recorded() {
         None,
         "malformed",
     ));
-    let mut out_of_range = serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
+    let mut out_of_range =
+        serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
     out_of_range["answers"]["score"]["probabilities"]["5"] = serde_json::json!(1.5);
     cases.push((
         "a probability out of range",
@@ -809,7 +822,8 @@ fn one_reply_of_each_scoring_class_lands_with_its_class_recorded() {
         None,
         "malformed",
     ));
-    let mut outside_label = serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
+    let mut outside_label =
+        serde_json::from_str::<serde_json::Value>(&score_body("5", 0.9)).unwrap();
     outside_label["answers"]["score"]["probabilities"]
         .as_object_mut()
         .unwrap()
@@ -903,20 +917,38 @@ fn the_scoring_request_document_is_pinned_byte_for_byte() {
     assert_eq!(criteria.len(), 11);
     assert!(criteria.contains_key("other"));
     let state = document["state"].as_str().unwrap();
-    assert!(state.contains("settled on the standard profile, a draw of 2 ranges"), "{state}");
+    assert!(
+        state.contains("settled on the standard profile, a draw of 2 ranges"),
+        "{state}"
+    );
     assert!(state.contains("Waits already standing, 2."), "{state}");
-    assert!(state.contains("Standing for a draw of 1 range, 1."), "{state}");
-    assert!(state.contains("Standing for a draw of 2 ranges, 0."), "{state}");
-    assert!(state.contains("Standing for a draw of 4 ranges, 1."), "{state}");
+    assert!(
+        state.contains("Standing for a draw of 1 range, 1."),
+        "{state}"
+    );
+    assert!(
+        state.contains("Standing for a draw of 2 ranges, 0."),
+        "{state}"
+    );
+    assert!(
+        state.contains("Standing for a draw of 4 ranges, 1."),
+        "{state}"
+    );
     assert!(state.contains("in ranges, are 1 and 1."), "{state}");
     assert!(state.contains("a wait bound of 90 seconds"), "{state}");
     assert!(state.contains("Run the indexer."), "{state}");
     let bare = scoring_request("plain", 1, &[], &[], None, None);
     let bare_document: serde_json::Value = serde_json::from_str(&bare).unwrap();
     let bare_state = bare_document["state"].as_str().unwrap();
-    assert!(bare_state.contains("No run stands free in the pool."), "{bare_state}");
+    assert!(
+        bare_state.contains("No run stands free in the pool."),
+        "{bare_state}"
+    );
     assert!(bare_state.contains("carries no wait bound"), "{bare_state}");
-    assert!(bare_state.contains("carries no description"), "{bare_state}");
+    assert!(
+        bare_state.contains("carries no description"),
+        "{bare_state}"
+    );
     assert!(!bare_state.contains("first"), "{bare_state}");
 }
 
@@ -944,8 +976,10 @@ fn a_scored_wait_is_furnished_before_a_scoreless_wait_for_the_same_range() {
     assert_eq!(data.waits.len(), 1);
     assert_eq!(data.waits[0].agent, "early");
     let lines = read_queue_log(&stack);
-    let furnished: Vec<&serde_json::Value> =
-        lines.iter().filter(|line| line["kind"] == "furnished").collect();
+    let furnished: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["kind"] == "furnished")
+        .collect();
     assert_eq!(furnished.len(), 1);
     assert_eq!(furnished[0]["agent"], "late");
     assert_eq!(furnished[0]["ports"], serde_json::json!([20000, 20009]));
@@ -968,7 +1002,10 @@ fn a_skipped_roomy_wait_does_not_block_the_lean_wait_behind_it() {
     let data = load_registry(&stack).unwrap();
     assert!(data.claims.contains_key("small"));
     assert_eq!(
-        (data.claims["small"].port_start, data.claims["small"].port_end),
+        (
+            data.claims["small"].port_start,
+            data.claims["small"].port_end
+        ),
         (20000, 20009)
     );
     assert_eq!(data.waits.len(), 1);
@@ -1011,9 +1048,7 @@ fn one_release_serves_several_waits_in_offer_order_in_one_published_state() {
         body: score_body("9", 0.9),
     };
     waited(claim_waiting(&stack, "lean-five", None, Some(&five)).unwrap());
-    waited(
-        claim_profile_waiting(&stack, "standard-none", Profile::Standard, None, None).unwrap(),
-    );
+    waited(claim_profile_waiting(&stack, "standard-none", Profile::Standard, None, None).unwrap());
     waited(claim_waiting(&stack, "lean-nine", None, Some(&nine)).unwrap());
     release(&stack, "big").unwrap();
     let data = load_registry(&stack).unwrap();
@@ -1026,11 +1061,17 @@ fn one_release_serves_several_waits_in_offer_order_in_one_published_state() {
     assert_eq!(stamps[0], stamps[1]);
     assert_eq!(stamps[1], stamps[2]);
     assert_eq!(
-        (data.claims["lean-nine"].port_start, data.claims["lean-nine"].port_end),
+        (
+            data.claims["lean-nine"].port_start,
+            data.claims["lean-nine"].port_end
+        ),
         (20000, 20009)
     );
     assert_eq!(
-        (data.claims["lean-five"].port_start, data.claims["lean-five"].port_end),
+        (
+            data.claims["lean-five"].port_start,
+            data.claims["lean-five"].port_end
+        ),
         (20010, 20019)
     );
     assert_eq!(
@@ -1054,9 +1095,7 @@ fn a_release_of_an_agent_holding_only_a_wait_makes_no_offer() {
     let stack = stack_with("offer-none", 20000, 10, 2);
     claim(&stack, "holder-a").unwrap();
     claim(&stack, "holder-b").unwrap();
-    waited(
-        claim_profile_waiting(&stack, "big", Profile::Roomy, None, None).unwrap(),
-    );
+    waited(claim_profile_waiting(&stack, "big", Profile::Roomy, None, None).unwrap());
     waited(claim_waiting(&stack, "small", None, None).unwrap());
     let outcome = release(&stack, "big").unwrap();
     assert!(matches!(outcome, ReleaseOutcome::Wait(_)));
@@ -1177,7 +1216,9 @@ fn release_cancels_a_standing_wait_and_a_second_release_refuses() {
     assert_eq!(lines[1]["ports"], serde_json::Value::Null);
     let error = release(&stack, "waiter").expect_err("an agent holding nothing refuses");
     assert!(
-        error.message().contains("agent waiter holds no claim in this stack"),
+        error
+            .message()
+            .contains("agent waiter holds no claim in this stack"),
         "{}",
         error.message()
     );
@@ -1290,15 +1331,19 @@ fn the_wait_options_parse_in_their_valid_and_invalid_shapes() {
     let (code, _, _) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
     assert_eq!(code, 0);
     // A bound with no wait option refuses at exit 2.
-    let (code, _, err) = run_cli(&[
-        "claim", "--stack", &stack_arg, "waiter", "--wait-for", "30",
-    ]);
+    let (code, _, err) = run_cli(&["claim", "--stack", &stack_arg, "waiter", "--wait-for", "30"]);
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("--wait-for"), "{err}");
     // A bound that is not a positive integer refuses at exit 2.
     for bound in ["0", "-3", "abc"] {
         let (code, _, err) = run_cli(&[
-            "claim", "--stack", &stack_arg, "waiter", "--wait", "--wait-for", bound,
+            "claim",
+            "--stack",
+            &stack_arg,
+            "waiter",
+            "--wait",
+            "--wait-for",
+            bound,
         ]);
         assert_eq!(code, 2, "{bound}: {err}");
     }
@@ -1309,7 +1354,13 @@ fn the_wait_options_parse_in_their_valid_and_invalid_shapes() {
     assert_eq!(code, 2);
     // A waiting claim on the full pool succeeds as a wait.
     let (code, out, err) = run_cli(&[
-        "claim", "--stack", &stack_arg, "waiter", "--wait", "--wait-for", "30",
+        "claim",
+        "--stack",
+        &stack_arg,
+        "waiter",
+        "--wait",
+        "--wait-for",
+        "30",
     ]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("waiting waiter"), "{out}");
@@ -1352,7 +1403,10 @@ fn the_queue_table_prints_a_mixed_queue_in_offer_order() {
     let three = out.find("scored-three").unwrap();
     let none = out.find("scoreless-first").unwrap();
     assert!(nine < three && three < none, "{out}");
-    let nine_line = out.lines().find(|line| line.contains("scored-nine")).unwrap();
+    let nine_line = out
+        .lines()
+        .find(|line| line.contains("scored-nine"))
+        .unwrap();
     assert!(nine_line.contains('9'), "{nine_line}");
     let none_line = out
         .lines()
@@ -1376,11 +1430,7 @@ fn a_judge_descendant_holding_the_pipe_open_cannot_stretch_the_consultation() {
     let (code, _, _) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
     assert_eq!(code, 0);
     let judge = temp_dir("cli-deadline-judge").join("judge.sh");
-    std::fs::write(
-        &judge,
-        "#!/bin/sh\nsleep 90 &\ncat > /dev/null\nexit 0\n",
-    )
-    .unwrap();
+    std::fs::write(&judge, "#!/bin/sh\nsleep 90 &\ncat > /dev/null\nexit 0\n").unwrap();
     std::fs::set_permissions(&judge, std::fs::Permissions::from_mode(0o755)).unwrap();
     let started = std::time::Instant::now();
     let (code, out, err) = run_cli(&[

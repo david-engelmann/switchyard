@@ -739,11 +739,21 @@ fn validate_waits(
         }
         let profile = match entry.get("profile").and_then(JVal::as_str) {
             Some(profile) if SETTLED_PROFILES.contains(&profile) => profile.to_string(),
-            _ => return Err(corrupt(path, "a wait carries a settled profile outside the four")),
+            _ => {
+                return Err(corrupt(
+                    path,
+                    "a wait carries a settled profile outside the four",
+                ))
+            }
         };
         let recorded_at = match entry.get("recorded_at").and_then(JVal::as_str) {
             Some(stamp) if is_valid_timestamp(stamp) => stamp.to_string(),
-            _ => return Err(corrupt(path, "a wait carries a recorded instant that is not a timestamp")),
+            _ => {
+                return Err(corrupt(
+                    path,
+                    "a wait carries a recorded instant that is not a timestamp",
+                ))
+            }
         };
         let wait_for = match entry.get("wait_for") {
             Some(JVal::Null) => None,
@@ -770,12 +780,7 @@ fn validate_waits(
             Some(JVal::Null) => None,
             Some(value) => match jval_f64(value) {
                 Some(number) if (0.0..=1.0).contains(&number) => Some(number),
-                _ => {
-                    return Err(corrupt(
-                        path,
-                        "a wait carries a confidence outside 0 to 1",
-                    ))
-                }
+                _ => return Err(corrupt(path, "a wait carries a confidence outside 0 to 1")),
             },
             None => return Err(corrupt(path, "a wait carries no confidence field")),
         };
@@ -1273,10 +1278,7 @@ fn stamp_micros(text: &str) -> Option<i128> {
         }
         Some(_) => return None,
     }
-    let local = days * 86_400
-        + hour as i128 * 3600
-        + minute as i128 * 60
-        + second as i128;
+    let local = days * 86_400 + hour as i128 * 3600 + minute as i128 * 60 + second as i128;
     Some(local * 1_000_000 + micros - offset_seconds * 1_000_000)
 }
 
@@ -2233,7 +2235,13 @@ fn furnish_claim(
             record,
             branch_preexisted,
         }),
-        Err(exc) => Err(rollback_or_report(git, &repo, &record, branch_preexisted, exc)),
+        Err(exc) => Err(rollback_or_report(
+            git,
+            &repo,
+            &record,
+            branch_preexisted,
+            exc,
+        )),
     }
 }
 
@@ -2326,7 +2334,8 @@ fn serve_offers(
     }
     if !furnished.is_empty() {
         let done: BTreeSet<&str> = furnished.iter().map(|wait| wait.agent.as_str()).collect();
-        data.waits.retain(|wait| !done.contains(wait.agent.as_str()));
+        data.waits
+            .retain(|wait| !done.contains(wait.agent.as_str()));
     }
     Ok((furnished, spans))
 }
@@ -2401,9 +2410,17 @@ pub fn list_waits(stack: &Path) -> Result<Vec<Wait>> {
 /// descending with ties by arrival, and scoreless waits order by
 /// arrival, where arrival is the order of the recorded list.
 pub fn offer_order(waits: &[Wait]) -> Vec<Wait> {
-    let mut scored: Vec<Wait> = waits.iter().filter(|wait| wait.score.is_some()).cloned().collect();
+    let mut scored: Vec<Wait> = waits
+        .iter()
+        .filter(|wait| wait.score.is_some())
+        .cloned()
+        .collect();
     scored.sort_by(|left, right| right.score.cmp(&left.score));
-    let scoreless: Vec<Wait> = waits.iter().filter(|wait| wait.score.is_none()).cloned().collect();
+    let scoreless: Vec<Wait> = waits
+        .iter()
+        .filter(|wait| wait.score.is_none())
+        .cloned()
+        .collect();
     scored.extend(scoreless);
     scored
 }
@@ -3064,9 +3081,7 @@ pub const SCORING_QUESTION: &str = "score";
 /// The eleven declared labels of the scoring question, the ten
 /// score levels and the no score label the grammar of SY-20
 /// names.
-pub const SCORE_LABELS: [&str; 11] = [
-    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "other",
-];
+pub const SCORE_LABELS: [&str; 11] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "other"];
 
 const SCORING_INSTRUCTIONS: &str = "The question asks the judge to score one waiting request for preference when port ranges free up, on a scale of ten levels where the tenth is the strongest preference the scale states. Score from the counted facts and nothing else. A request whose draw can be met only by a long run of ranges that rarely stands free scores toward the top. A request whose draw the next small release can furnish scores toward the bottom. The more requests already waiting for the same draw, the higher this request scores. A request carrying a wait bound scores higher as its bound runs shorter against the number already waiting. The description may raise or lower the score only through facts it states as numerals, and a quality the description merely evokes is not a fact and moves the score not at all. Where the counted facts do not determine a preference, the answer is the no score label, and a guess is a wrong answer. The score was taken when the request joined the queue and measures contention at that moment. Answer with exactly one of the listed options.";
 
@@ -3113,8 +3128,9 @@ fn scoring_state(
     };
     let description_text = match description {
         Some(text) => text.to_string(),
-        None => "The request carries no description and stands on its counted facts alone."
-            .to_string(),
+        None => {
+            "The request carries no description and stands on its counted facts alone.".to_string()
+        }
     };
     format!(
         "{SCORING_FRAMING}\n\nThe request that waits settled on the {settled} profile, a draw of {draw} ranges.\nWaits already standing, {}. Standing for a draw of 1 range, {count_one}. Standing for a draw of 2 ranges, {count_two}. Standing for a draw of 4 ranges, {count_four}.\n{runs_text}\n{bound_text}\n\n{description_text}\n\n{SCORING_CLOSING}",
@@ -3211,9 +3227,7 @@ fn classify_score(body: &str) -> ScoreConsultation {
         _ => return ScoreConsultation::Malformed,
     };
     let probabilities = match entry.get("probabilities") {
-        Some(probabilities @ JVal::Obj(pairs)) if exact_keys(pairs, &SCORE_LABELS) => {
-            probabilities
-        }
+        Some(probabilities @ JVal::Obj(pairs)) if exact_keys(pairs, &SCORE_LABELS) => probabilities,
         _ => return ScoreConsultation::Malformed,
     };
     let mut values = [0.0_f64; 11];
@@ -3538,7 +3552,14 @@ pub fn claim_waiting(
     wait_for: Option<i64>,
     transport: Option<&dyn JudgeTransport>,
 ) -> Result<ClaimOutcome> {
-    claim_waiting_with(stack, agent, wait_for, transport, &ProcessGit, &save_registry)
+    claim_waiting_with(
+        stack,
+        agent,
+        wait_for,
+        transport,
+        &ProcessGit,
+        &save_registry,
+    )
 }
 
 fn claim_waiting_with(
@@ -3550,15 +3571,7 @@ fn claim_waiting_with(
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ClaimOutcome> {
     claim_waiting_core(
-        stack,
-        agent,
-        "plain",
-        1,
-        None,
-        wait_for,
-        transport,
-        git,
-        saver,
+        stack, agent, "plain", 1, None, wait_for, transport, git, saver,
     )
 }
 
@@ -3649,7 +3662,14 @@ fn claim_waiting_core(
         }
         (data.waits.clone(), free_runs(&data))
     };
-    let request = scoring_request(settled, draw, &snapshot.0, &snapshot.1, wait_for, description);
+    let request = scoring_request(
+        settled,
+        draw,
+        &snapshot.0,
+        &snapshot.1,
+        wait_for,
+        description,
+    );
     let outcome = settle_score(transport, &request);
     let lock = locked(&stack)?;
     let mut data = load_registry(&stack)?;

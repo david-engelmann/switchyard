@@ -281,9 +281,7 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
             );
         }
         if wait_for.is_some() && !wait {
-            return Err(
-                "argument --wait-for: a wait bound takes --wait beside it".to_string(),
-            );
+            return Err("argument --wait-for: a wait bound takes --wait beside it".to_string());
         }
         if let Some(description) = &describe {
             if default_profile.is_none() {
@@ -459,13 +457,8 @@ fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<(
     if let Some(name) = &parsed.profile {
         let profile = profile_named(name)?;
         if parsed.wait {
-            let outcome = claim_profile_waiting(
-                stack,
-                agent,
-                profile,
-                wait_bound(parsed),
-                transport_ref,
-            )?;
+            let outcome =
+                claim_profile_waiting(stack, agent, profile, wait_bound(parsed), transport_ref)?;
             print_outcome(out, &outcome);
             return Ok(());
         }
@@ -653,8 +646,8 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 })
             }
         }
-        "release" => release(&stack, parsed.agent.as_deref().unwrap()).map(|outcome| {
-            match outcome {
+        "release" => {
+            release(&stack, parsed.agent.as_deref().unwrap()).map(|outcome| match outcome {
                 ReleaseOutcome::Claim(record) => {
                     let _ = writeln!(out, "released {}", record.agent);
                     let _ = writeln!(
@@ -667,8 +660,8 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                     let _ = writeln!(out, "released {}", wait.agent);
                     let _ = writeln!(out, "wait cancelled");
                 }
-            }
-        }),
+            })
+        }
         _ => unreachable!(),
     };
     match result {
