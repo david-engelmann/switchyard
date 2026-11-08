@@ -1,0 +1,58 @@
+{
+  "id": "Q-D01",
+  "provenance": "window",
+  "family": "seam description numeral",
+  "truth": "middle",
+  "why": "The counted facts are thin, two standing with one asking the same draw, which alone would sit at the bottom. The description states a numeral count of 14 jobs blocked behind this one, a fact of this request, which may raise the score. The middle band.",
+  "settled_profile": "standard",
+  "standing": [
+    "standard",
+    "lean"
+  ],
+  "free_runs": [
+    1
+  ],
+  "bound": null,
+  "description": "Run the report builder and its API and a worker. 14 jobs are blocked behind this one.",
+  "routed": true,
+  "pool": {
+    "start": 20000,
+    "range_size": 10,
+    "range_count": 16
+  },
+  "agent": "q-d01",
+  "routing_request": "{\"model\":\"jev-1.13.0\",\"questions\":{\"profile\":{\"criteria\":{\"lean\":\"The job runs at most two processes at the same time that each need a port of their own.\",\"other\":\"None of the listed options is the correct decision, because the description leaves the count undetermined.\",\"roomy\":\"The job runs more than twelve processes at the same time that each need a port of their own.\",\"standard\":\"The job runs three to twelve processes at the same time that each need a port of their own.\"},\"instructions\":\"The question asks the judge to choose the allocation profile for one job from its description. Count only the processes the job itself runs at the same time that each need a port of their own. A process that runs but binds no port does not count. Duration is not footprint, and urgency is not footprint, and data volume is not footprint. A database the job connects to does not count, and neither does any service the job merely talks to. Work that other agents claim for themselves does not count. Enumerations govern, so copies and shards and tenants and replicas and auxiliaries each count when each needs its own port. The lean profile is for a count of at most two. The standard profile is for a count of three to twelve. The roomy profile is for a count of more than twelve. Where the description does not determine the count, the answer is the none of these label, and a guess is a wrong answer. Answer with exactly one of the listed options.\",\"type\":\"choice\"}},\"state\":\"A furnishing tool has been asked to size one claim from a job description.\\nThe judge is to apply the counting doctrine of the question to the description below and to nothing else.\\nThe answer sizes a port allocation and performs no allocation itself.\\n\\nRun the report builder and its API and a worker. 14 jobs are blocked behind this one.\\n\\nThe labels are lean and standard and roomy and other. Lean covers a count of at most two, standard covers a count of three to twelve, and roomy covers a count of more than twelve, and other is the answer where the description does not determine the count.\"}",
+  "routing_reply": "{\n  \"model\": \"jev-1.13.0\",\n  \"answers\": {\n    \"profile\": {\n      \"type\": \"choice\",\n      \"choice\": \"other\",\n      \"confidence\": 0.16,\n      \"probabilities\": {\n        \"lean\": 0.33,\n        \"other\": 0.37,\n        \"roomy\": 0.03,\n        \"standard\": 0.27\n      }\n    }\n  },\n  \"usage\": {\n    \"input_tokens\": 726,\n    \"output_tokens\": 46\n  }\n}\n",
+  "request": "{\"model\":\"jev-1.13.0\",\"questions\":{\"score\":{\"criteria\":{\"1\":\"The bottom of the scale, a request the next small release can furnish, standing under no contention worth the name.\",\"10\":\"The strongest preference the scale states, a request whose draw can be met only by a long run that rarely stands free, standing under the heaviest contention.\",\"2\":\"The bottom band, a request a small release can furnish, standing under light contention.\",\"3\":\"The top of the bottom band, a request a modest release can furnish, standing under some contention.\",\"4\":\"The bottom of the middle band, a request whose draw wants more than the next small release, standing under ordinary contention.\",\"5\":\"The middle of the scale, a request whose draw and contention stand in balance.\",\"6\":\"The middle band, a request whose draw or whose contention stands above the ordinary.\",\"7\":\"The top of the middle band, a request whose draw is hard to furnish or whose contention stands heavy.\",\"8\":\"The bottom of the top band, a request whose draw only a long run can furnish, or one standing under heavy contention.\",\"9\":\"The top band, a request whose draw rarely stands free, standing under heavy contention.\",\"other\":\"The no score label, the answer where the counted facts leave the preference undetermined.\"},\"instructions\":\"The question asks the judge to score one waiting request for preference when port ranges free up, on a scale of ten levels where the tenth is the strongest preference the scale states. Score from the counted facts and nothing else. A request whose draw can be met only by a long run of ranges that rarely stands free scores toward the top. A request whose draw the next small release can furnish scores toward the bottom. The more requests already waiting for the same draw, the higher this request scores. A request carrying a wait bound scores higher as its bound runs shorter against the number already waiting. The description may raise or lower the score only through facts it states as numerals, and a quality the description merely evokes is not a fact and moves the score not at all. Where the counted facts do not determine a preference, the answer is the no score label, and a guess is a wrong answer. The score was taken when the request joined the queue and measures contention at that moment. Answer with exactly one of the listed options.\",\"type\":\"choice\"}},\"state\":\"A furnishing tool holds a queue of requests waiting for port ranges.\\nThe judge is to score the one waiting request the counted facts below describe, for preference when ranges free up, applying the doctrine of the question to those facts and to nothing else.\\nThe score orders the queue and performs no allocation itself.\\n\\nThe request that waits settled on the standard profile, a draw of 2 ranges.\\nWaits already standing, 2. Standing for a draw of 1 range, 1. Standing for a draw of 2 ranges, 1. Standing for a draw of 4 ranges, 0.\\nThe free runs standing in the pool, in ranges, are 1.\\nThe request carries no wait bound.\\n\\nRun the report builder and its API and a worker. 14 jobs are blocked behind this one.\\n\\nThe labels are 1 and 2 and 3 and 4 and 5 and 6 and 7 and 8 and 9 and 10 and other. The levels run from the weakest preference at 1 to the strongest at 10, and other is the no score label, the answer where the counted facts do not determine a preference.\"}",
+  "reply": "{\n  \"model\": \"jev-1.13.0\",\n  \"answers\": {\n    \"score\": {\n      \"type\": \"choice\",\n      \"choice\": \"4\",\n      \"confidence\": 0.35,\n      \"probabilities\": {\n        \"1\": 0.03,\n        \"10\": 0.01,\n        \"2\": 0.07,\n        \"3\": 0.05,\n        \"4\": 0.41,\n        \"5\": 0.07,\n        \"6\": 0.07,\n        \"7\": 0.09,\n        \"8\": 0.11,\n        \"9\": 0.07,\n        \"other\": 0.02\n      }\n    }\n  },\n  \"usage\": {\n    \"input_tokens\": 1077,\n    \"output_tokens\": 95\n  }\n}\n",
+  "model": "jev-1.13.0",
+  "expected_wait": {
+    "agent": "q-d01",
+    "profile": "standard",
+    "wait_for": null,
+    "score": null,
+    "confidence": null,
+    "model": "jev-1.13.0",
+    "fallback": "low confidence"
+  },
+  "expected_queue_line": {
+    "agent": "q-d01",
+    "confidence": null,
+    "fallback": "low confidence",
+    "kind": "queued",
+    "model": "jev-1.13.0",
+    "ports": null,
+    "profile": "standard",
+    "request_bytes": 3354,
+    "request_sha256": "f3b99eae6b34a44c1ea226b52d76f9174b5573a8472fe7336e2d3e94aa52b874",
+    "score": null
+  },
+  "expected_routing_line": {
+    "agent": "q-d01",
+    "allocated": null,
+    "confidence": 0.37,
+    "fallback": "abstention",
+    "refusal": "queued",
+    "verdict": "other"
+  }
+}
