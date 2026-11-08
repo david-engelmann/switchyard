@@ -1,0 +1,54 @@
+{
+  "id": "Q-C12",
+  "provenance": "window",
+  "family": "grid heavy",
+  "truth": "top",
+  "why": "Seven standing with three asking the same draw of one range. A long queue stands between this request and any release meant for it, so the top band.",
+  "settled_profile": "lean",
+  "standing": [
+    "lean",
+    "standard",
+    "plain",
+    "roomy",
+    "lean",
+    "standard",
+    "roomy"
+  ],
+  "free_runs": [],
+  "bound": null,
+  "description": null,
+  "routed": false,
+  "pool": {
+    "start": 20000,
+    "range_size": 10,
+    "range_count": 16
+  },
+  "agent": "q-c12",
+  "routing_request": null,
+  "routing_reply": null,
+  "request": "{\"model\":\"jev-1.13.0\",\"questions\":{\"score\":{\"criteria\":{\"1\":\"The bottom of the scale, a request the next small release can furnish, standing under no contention worth the name.\",\"10\":\"The strongest preference the scale states, a request whose draw can be met only by a long run that rarely stands free, standing under the heaviest contention.\",\"2\":\"The bottom band, a request a small release can furnish, standing under light contention.\",\"3\":\"The top of the bottom band, a request a modest release can furnish, standing under some contention.\",\"4\":\"The bottom of the middle band, a request whose draw wants more than the next small release, standing under ordinary contention.\",\"5\":\"The middle of the scale, a request whose draw and contention stand in balance.\",\"6\":\"The middle band, a request whose draw or whose contention stands above the ordinary.\",\"7\":\"The top of the middle band, a request whose draw is hard to furnish or whose contention stands heavy.\",\"8\":\"The bottom of the top band, a request whose draw only a long run can furnish, or one standing under heavy contention.\",\"9\":\"The top band, a request whose draw rarely stands free, standing under heavy contention.\",\"other\":\"The no score label, the answer where the counted facts leave the preference undetermined.\"},\"instructions\":\"The question asks the judge to score one waiting request for preference when port ranges free up, on a scale of ten levels where the tenth is the strongest preference the scale states. Score from the counted facts and nothing else. A request whose draw can be met only by a long run of ranges that rarely stands free scores toward the top. A request whose draw the next small release can furnish scores toward the bottom. The more requests already waiting for the same draw, the higher this request scores. A request carrying a wait bound scores higher as its bound runs shorter against the number already waiting. The description may raise or lower the score only through facts it states as numerals, and a quality the description merely evokes is not a fact and moves the score not at all. Where the counted facts do not determine a preference, the answer is the no score label, and a guess is a wrong answer. The score was taken when the request joined the queue and measures contention at that moment. Answer with exactly one of the listed options.\",\"type\":\"choice\"}},\"state\":\"A furnishing tool holds a queue of requests waiting for port ranges.\\nThe judge is to score the one waiting request the counted facts below describe, for preference when ranges free up, applying the doctrine of the question to those facts and to nothing else.\\nThe score orders the queue and performs no allocation itself.\\n\\nThe request that waits settled on the lean profile, a draw of 1 ranges.\\nWaits already standing, 7. Standing for a draw of 1 range, 3. Standing for a draw of 2 ranges, 2. Standing for a draw of 4 ranges, 2.\\nNo run stands free in the pool.\\nThe request carries no wait bound.\\n\\nThe request carries no description and stands on its counted facts alone.\\n\\nThe labels are 1 and 2 and 3 and 4 and 5 and 6 and 7 and 8 and 9 and 10 and other. The levels run from the weakest preference at 1 to the strongest at 10, and other is the no score label, the answer where the counted facts do not determine a preference.\"}",
+  "reply": "{\n  \"model\": \"jev-1.13.0\",\n  \"answers\": {\n    \"score\": {\n      \"type\": \"choice\",\n      \"choice\": \"3\",\n      \"confidence\": 0.33,\n      \"probabilities\": {\n        \"1\": 0.12,\n        \"10\": 0.0,\n        \"2\": 0.31,\n        \"3\": 0.39,\n        \"4\": 0.03,\n        \"5\": 0.05,\n        \"6\": 0.04,\n        \"7\": 0.02,\n        \"8\": 0.01,\n        \"9\": 0.01,\n        \"other\": 0.02\n      }\n    }\n  },\n  \"usage\": {\n    \"input_tokens\": 1062,\n    \"output_tokens\": 95\n  }\n}\n",
+  "model": "jev-1.13.0",
+  "expected_wait": {
+    "agent": "q-c12",
+    "profile": "lean",
+    "wait_for": null,
+    "score": null,
+    "confidence": null,
+    "model": "jev-1.13.0",
+    "fallback": "low confidence"
+  },
+  "expected_queue_line": {
+    "agent": "q-c12",
+    "confidence": null,
+    "fallback": "low confidence",
+    "kind": "queued",
+    "model": "jev-1.13.0",
+    "ports": null,
+    "profile": "lean",
+    "request_bytes": 3316,
+    "request_sha256": "7c24d3cac578df6455dbf0567515b409010d1afac484de82907fb344df8d393c",
+    "score": null
+  },
+  "expected_routing_line": null
+}

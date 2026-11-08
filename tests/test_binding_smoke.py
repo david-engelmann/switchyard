@@ -185,3 +185,132 @@ def test_a_routed_claim_with_no_transport_and_with_a_raising_callable(tmp_path):
     assert first["model"] is None
     assert second["fallback"] == "transport"
     assert second["allocated"] == "lean"
+
+
+def _score_body(choice, confidence):
+    import json
+
+    labels = [str(level) for level in range(1, 11)] + ["other"]
+    rest = (1.0 - confidence) / 10.0
+    probabilities = {
+        label: (confidence if label == choice else rest) for label in labels
+    }
+    return json.dumps(
+        {
+            "model": "jev-1.13.0",
+            "answers": {
+                "score": {
+                    "type": "choice",
+                    "choice": choice,
+                    "confidence": 0.5,
+                    "probabilities": probabilities,
+                }
+            },
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    )
+
+
+def test_a_waiting_claim_through_the_binding(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack, range_count=1)
+    switchyard.claim(stack, "holder")
+
+    wait = switchyard.claim(stack, "waiter", wait=True, wait_for=120)
+    assert wait["agent"] == "waiter"
+    assert wait["profile"] == "plain"
+    assert wait["score"] is None
+    assert wait["confidence"] is None
+    assert wait["model"] is None
+    assert wait["fallback"] == "no transport"
+    assert wait["wait_for"] == 120
+    assert wait["recorded_at"]
+
+    rows = switchyard.queue(stack)
+    assert [row["agent"] for row in rows] == ["waiter"]
+    assert rows[0]["profile"] == "plain"
+
+    released = switchyard.release(stack, "waiter")
+    assert released == wait
+    assert switchyard.queue(stack) == []
+
+    offered = switchyard.release(stack, "holder")
+    assert offered["agent"] == "holder"
+
+
+def test_a_scored_wait_through_a_callable_transport(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack, range_count=1)
+    switchyard.claim(stack, "holder")
+    seen = []
+
+    def judge(request):
+        seen.append(request)
+        return _score_body("8", 0.75)
+
+    wait = switchyard.claim(stack, "waiter", wait=True, transport=judge)
+    assert wait["score"] == 8
+    assert wait["confidence"] == 0.75
+    assert wait["fallback"] == "none"
+    assert wait["model"] == "jev-1.13.0"
+    assert len(seen) == 1
+    assert '"score"' in seen[0]
+
+    released = switchyard.release(stack, "holder")
+    assert released["agent"] == "holder"
+    rows = switchyard.list(stack)
+    assert [row["agent"] for row in rows] == ["waiter"]
+    assert (rows[0]["port_start"], rows[0]["port_end"]) == (20000, 20009)
+    assert switchyard.queue(stack) == []
+
+
+def test_a_routed_waiting_claim_through_a_callable_transport(tmp_path):
+    import json
+
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack, range_count=2)
+    switchyard.claim(stack, "holder")
+    seen = []
+
+    def judge(request):
+        seen.append(request)
+        if '"profile"' in request:
+            return _verdict_body("standard", 0.9)
+        return _score_body("5", 0.6)
+
+    wait = switchyard.claim_routed(
+        stack,
+        "waiter",
+        "Run the app and its API and a worker.",
+        "lean",
+        judge,
+        wait=True,
+    )
+    assert wait["profile"] == "standard"
+    assert wait["score"] == 5
+    assert wait["confidence"] == 0.6
+    assert len(seen) == 2
+
+    lines = (tmp_path / "stack" / "switchyard-routing.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    line = json.loads(lines[0])
+    assert line["refusal"] == "queued"
+    assert line["verdict"] == "standard"
+    assert line["allocated"] is None
+
+
+def test_the_wait_bound_refusals_of_the_binding(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    with pytest.raises(switchyard.RefusalError) as beside:
+        switchyard.claim(stack, "waiter", wait_for=30)
+    assert "wait" in str(beside.value)
+
+    with pytest.raises(TypeError) as boolean:
+        switchyard.claim(stack, "waiter", wait=True, wait_for=True)
+    assert "wait_for" in str(boolean.value)
+
+    with pytest.raises(switchyard.RefusalError) as bound:
+        switchyard.claim(stack, "waiter", wait=True, wait_for=0)
+    assert "positive" in str(bound.value)

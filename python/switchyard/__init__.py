@@ -21,6 +21,7 @@ from ._switchyard import (
     claim_routed,
     init,
     list,
+    queue,
     release,
 )
 
@@ -35,6 +36,7 @@ __all__ = [
     "claim_routed",
     "init",
     "list",
+    "queue",
     "release",
 ]
 

@@ -10,7 +10,7 @@
 
 pub mod cli;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -25,6 +25,12 @@ use sha2::{Digest, Sha256};
 
 pub const REGISTRY_NAME: &str = "switchyard-registry.json";
 pub const ROUTING_LOG_NAME: &str = "switchyard-routing.jsonl";
+/// The queue log of obligation SY-23, an append-only evidence
+/// document that no command reads to decide anything.
+pub const QUEUE_LOG_NAME: &str = "switchyard-queue.jsonl";
+/// The most waits that may stand in one stack, the bound of
+/// obligation SY-17.
+pub const QUEUE_BOUND: usize = 64;
 pub const LOCK_NAME: &str = "switchyard.lock";
 pub const REPO_NAME: &str = "repo";
 pub const WORKTREES_NAME: &str = "worktrees";
@@ -234,6 +240,41 @@ pub struct Registry {
     pub version: i64,
     pub port_pool: Pool,
     pub claims: BTreeMap<String, Record>,
+    /// The standing waits of obligation SY-18, in the order they
+    /// were recorded. The registry document carries the waits key
+    /// exactly while this list stands non-empty, under the
+    /// presence rule of that obligation.
+    pub waits: Vec<Wait>,
+}
+
+/// One recorded wait, carrying exactly the fields obligation
+/// SY-18 records and no others.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wait {
+    pub agent: String,
+    /// The settled profile word, one of plain and lean and
+    /// standard and roomy.
+    pub profile: String,
+    pub recorded_at: String,
+    pub wait_for: Option<i64>,
+    pub score: Option<i64>,
+    pub confidence: Option<f64>,
+    pub model: Option<String>,
+    /// The fallback word of obligation SY-20, one of the seven
+    /// scoring vocabulary words, which is none exactly where a
+    /// score stands.
+    pub fallback: String,
+}
+
+/// The draw in ranges of a settled profile word, where plain
+/// settles on its own word with a draw of one range, the same
+/// size as lean and a different kind.
+fn settled_draw(profile: &str) -> i64 {
+    match profile {
+        "standard" => 2,
+        "roomy" => 4,
+        _ => 1,
+    }
 }
 
 /// A parsed JSON value that keeps object pairs in document order,
@@ -389,6 +430,32 @@ const RECORD_KEYS: [&str; 8] = [
     "env_file",
     "claimed_at",
 ];
+/// The field set of one recorded wait, of obligation SY-18.
+const WAIT_KEYS: [&str; 8] = [
+    "agent",
+    "profile",
+    "recorded_at",
+    "wait_for",
+    "score",
+    "confidence",
+    "model",
+    "fallback",
+];
+/// The settled profile words a wait may carry, of obligation
+/// SY-18.
+const SETTLED_PROFILES: [&str; 4] = ["plain", "lean", "standard", "roomy"];
+/// The fallback vocabulary of a wait record, of obligation
+/// SY-20. A wait that carries a score carries the word none, and
+/// every other wait carries the class that left it scoreless.
+const SCORE_FALLBACKS: [&str; 7] = [
+    "none",
+    "low confidence",
+    "abstention",
+    "malformed",
+    "silence",
+    "transport",
+    "no transport",
+];
 
 fn exact_keys(pairs: &[(String, JVal)], expected: &[&str]) -> bool {
     pairs.len() == expected.len()
@@ -425,10 +492,14 @@ fn validate_registry(data: &JVal, path: &Path) -> Result<Registry> {
         JVal::Obj(pairs) => pairs,
         _ => return Err(corrupt(path, "the top level is not an object")),
     };
-    if !exact_keys(pairs, &REGISTRY_KEYS) {
+    let mut top_keys: Vec<&str> = REGISTRY_KEYS.to_vec();
+    if data.get("waits").is_some() {
+        top_keys.push("waits");
+    }
+    if !exact_keys(pairs, &top_keys) {
         return Err(corrupt(
             path,
-            "the top level fields are not exactly version and port_pool and claims",
+            "the top level fields are not exactly version and port_pool and claims, with waits standing only where a wait stands",
         ));
     }
     let version = data.get("version").unwrap();
@@ -605,11 +676,155 @@ fn validate_registry(data: &JVal, path: &Path) -> Result<Registry> {
         .into_iter()
         .map(|record| (record.agent.clone(), record))
         .collect();
+    let waits = match data.get("waits") {
+        Some(value) => validate_waits(value, &claims, path)?,
+        None => Vec::new(),
+    };
     Ok(Registry {
         version: REGISTRY_VERSION,
         port_pool: pool,
         claims,
+        waits,
     })
+}
+
+/// Validate the waits key of a registry document, under
+/// obligation SY-18. A document whose waits do not carry exactly
+/// the fields that obligation names, or whose waits stand in a
+/// shape no writer of this slice writes, is corrupt, and the
+/// reader refuses it whole.
+fn validate_waits(
+    value: &JVal,
+    claims: &BTreeMap<String, Record>,
+    path: &Path,
+) -> Result<Vec<Wait>> {
+    let entries = match value {
+        JVal::Arr(entries) => entries,
+        _ => return Err(corrupt(path, "the waits are not a list")),
+    };
+    if entries.len() > QUEUE_BOUND {
+        return Err(corrupt(
+            path,
+            format!("more than {QUEUE_BOUND} waits stand in the registry"),
+        ));
+    }
+    let mut waits: Vec<Wait> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for entry in entries {
+        let pairs = match entry {
+            JVal::Obj(pairs) => pairs,
+            _ => return Err(corrupt(path, "a wait is not an object")),
+        };
+        if !exact_keys(pairs, &WAIT_KEYS) {
+            return Err(corrupt(
+                path,
+                "the fields of a wait are not exactly the fields obligation SY-18 names",
+            ));
+        }
+        let agent = match entry.get("agent").and_then(JVal::as_str) {
+            Some(agent) if validate_agent_name(agent).is_ok() => agent.to_string(),
+            _ => return Err(corrupt(path, "a wait carries an agent name SY-10 refuses")),
+        };
+        if !seen.insert(agent.clone()) {
+            return Err(corrupt(
+                path,
+                format!("the agent {agent} stands in two waits"),
+            ));
+        }
+        if claims.contains_key(&agent) {
+            return Err(corrupt(
+                path,
+                format!("the agent {agent} stands in both a claim and a wait"),
+            ));
+        }
+        let profile = match entry.get("profile").and_then(JVal::as_str) {
+            Some(profile) if SETTLED_PROFILES.contains(&profile) => profile.to_string(),
+            _ => {
+                return Err(corrupt(
+                    path,
+                    "a wait carries a settled profile outside the four",
+                ))
+            }
+        };
+        let recorded_at = match entry.get("recorded_at").and_then(JVal::as_str) {
+            Some(stamp) if is_valid_timestamp(stamp) => stamp.to_string(),
+            _ => {
+                return Err(corrupt(
+                    path,
+                    "a wait carries a recorded instant that is not a timestamp",
+                ))
+            }
+        };
+        let wait_for = match entry.get("wait_for") {
+            Some(JVal::Null) => None,
+            Some(value) => match value.as_int() {
+                Some(bound) if bound > 0 => Some(bound),
+                _ => {
+                    return Err(corrupt(
+                        path,
+                        "a wait carries a wait bound that is not a positive number of seconds",
+                    ))
+                }
+            },
+            None => return Err(corrupt(path, "a wait carries no wait bound field")),
+        };
+        let score = match entry.get("score") {
+            Some(JVal::Null) => None,
+            Some(value) => match value.as_int() {
+                Some(level) if (1..=10).contains(&level) => Some(level),
+                _ => return Err(corrupt(path, "a wait carries a score outside 1 to 10")),
+            },
+            None => return Err(corrupt(path, "a wait carries no score field")),
+        };
+        let confidence = match entry.get("confidence") {
+            Some(JVal::Null) => None,
+            Some(value) => match jval_f64(value) {
+                Some(number) if (0.0..=1.0).contains(&number) => Some(number),
+                _ => return Err(corrupt(path, "a wait carries a confidence outside 0 to 1")),
+            },
+            None => return Err(corrupt(path, "a wait carries no confidence field")),
+        };
+        if score.is_some() != confidence.is_some() {
+            return Err(corrupt(
+                path,
+                "a wait carries a score without its confidence or a confidence without its score",
+            ));
+        }
+        let model = match entry.get("model") {
+            Some(JVal::Null) => None,
+            Some(value) => match value.as_str() {
+                Some(name) if !name.is_empty() => Some(name.to_string()),
+                _ => return Err(corrupt(path, "a wait carries a model that is not a name")),
+            },
+            None => return Err(corrupt(path, "a wait carries no model field")),
+        };
+        let fallback = match entry.get("fallback").and_then(JVal::as_str) {
+            Some(word) if SCORE_FALLBACKS.contains(&word) => word.to_string(),
+            _ => {
+                return Err(corrupt(
+                    path,
+                    "a wait carries a fallback word outside the vocabulary of SY-20",
+                ))
+            }
+        };
+        if score.is_some() != (fallback == "none") {
+            return Err(corrupt(
+                path,
+                "a wait carries a score beside a fallback word that is not none, or no score beside the word none",
+            ));
+        }
+        waits.push(Wait {
+            agent,
+            profile,
+            recorded_at,
+            wait_for,
+            score,
+            confidence,
+            model,
+            fallback,
+        });
+    }
+    Ok(waits)
 }
 
 /// Read and validate the registry, changing nothing on disk.
@@ -650,6 +865,45 @@ pub fn load_registry(stack: &Path) -> Result<Registry> {
     validate_registry(&data, &path)
 }
 
+/// The JSON object of one recorded wait, carrying exactly the
+/// fields obligation SY-18 names.
+fn wait_value(wait: &Wait) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("agent".to_string(), wait.agent.clone().into());
+    entry.insert(
+        "confidence".to_string(),
+        match wait.confidence {
+            Some(number) => serde_json::json!(number),
+            None => serde_json::Value::Null,
+        },
+    );
+    entry.insert("fallback".to_string(), wait.fallback.clone().into());
+    entry.insert(
+        "model".to_string(),
+        match &wait.model {
+            Some(model) => model.clone().into(),
+            None => serde_json::Value::Null,
+        },
+    );
+    entry.insert("profile".to_string(), wait.profile.clone().into());
+    entry.insert("recorded_at".to_string(), wait.recorded_at.clone().into());
+    entry.insert(
+        "score".to_string(),
+        match wait.score {
+            Some(level) => level.into(),
+            None => serde_json::Value::Null,
+        },
+    );
+    entry.insert(
+        "wait_for".to_string(),
+        match wait.wait_for {
+            Some(bound) => bound.into(),
+            None => serde_json::Value::Null,
+        },
+    );
+    serde_json::Value::Object(entry)
+}
+
 fn registry_value(data: &Registry) -> serde_json::Value {
     let mut claims = serde_json::Map::new();
     for (agent, record) in &data.claims {
@@ -672,6 +926,10 @@ fn registry_value(data: &Registry) -> serde_json::Value {
     top.insert("claims".to_string(), serde_json::Value::Object(claims));
     top.insert("port_pool".to_string(), serde_json::Value::Object(pool));
     top.insert("version".to_string(), data.version.into());
+    if !data.waits.is_empty() {
+        let waits: Vec<serde_json::Value> = data.waits.iter().map(wait_value).collect();
+        top.insert("waits".to_string(), serde_json::Value::Array(waits));
+    }
     serde_json::Value::Object(top)
 }
 
@@ -917,6 +1175,161 @@ fn now_stamp() -> String {
     }
 }
 
+/// The inverse of civil_from_days, the number of days from the
+/// civil date to the epoch, by the same era arithmetic.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = if shifted >= 0 { shifted } else { shifted - 399 } / 400;
+    let yoe = shifted - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The epoch microseconds a timestamp names, for a timestamp in
+/// the grammar is_valid_timestamp accepts. The registry reader
+/// validates every recorded instant against that grammar before
+/// an expiry comparison reads it, so a value outside the grammar
+/// never reaches this parser from a validated document, and the
+/// parser reads every shape inside the grammar, the minute and
+/// the second and the offset second standing optional exactly
+/// where the grammar leaves them optional.
+fn stamp_micros(text: &str) -> Option<i128> {
+    let bytes = text.as_bytes();
+    let (year, mut at) = take_digits(bytes, 0, 4)?;
+    let extended = bytes.get(at) == Some(&b'-');
+    if extended {
+        at += 1;
+    }
+    let (month, next) = take_digits(bytes, at, 2)?;
+    at = next;
+    if extended {
+        if bytes.get(at) != Some(&b'-') {
+            return None;
+        }
+        at += 1;
+    }
+    let (day, next) = take_digits(bytes, at, 2)?;
+    at = next;
+    let days = days_from_civil(year as i64, month, day) as i128;
+    // A date alone stands at the start of its day.
+    let Some(&separator) = bytes.get(at) else {
+        return Some(days * 86_400_000_000);
+    };
+    let _ = separator;
+    at += 1;
+    let (hour, next) = take_digits(bytes, at, 2)?;
+    at = next;
+    let mut minute: u32 = 0;
+    let mut second: u32 = 0;
+    if bytes.get(at) == Some(&b':') {
+        let (parsed, next) = take_digits(bytes, at + 1, 2)?;
+        minute = parsed;
+        at = next;
+        if bytes.get(at) == Some(&b':') {
+            let (parsed, next) = take_digits(bytes, at + 1, 2)?;
+            second = parsed;
+            at = next;
+        }
+    } else if let Some((parsed, next)) = take_digits(bytes, at, 2) {
+        minute = parsed;
+        at = next;
+        if let Some((parsed, next)) = take_digits(bytes, at, 2) {
+            second = parsed;
+            at = next;
+        }
+    }
+    let mut micros: i128 = 0;
+    if matches!(bytes.get(at), Some(b'.') | Some(b',')) {
+        at += 1;
+        let start = at;
+        let mut value: i128 = 0;
+        while let Some(&byte) = bytes.get(at) {
+            if !byte.is_ascii_digit() {
+                break;
+            }
+            value = value * 10 + (byte - b'0') as i128;
+            at += 1;
+        }
+        let digits = (at - start) as u32;
+        if digits == 0 {
+            return None;
+        }
+        micros = if digits <= 6 {
+            value * 10_i128.pow(6 - digits)
+        } else {
+            value / 10_i128.pow(digits - 6)
+        };
+    }
+    let mut offset_seconds: i128 = 0;
+    match bytes.get(at) {
+        None | Some(b'Z') | Some(b'z') => {}
+        Some(sign @ (b'+' | b'-')) => {
+            let direction: i128 = if *sign == b'+' { 1 } else { -1 };
+            at += 1;
+            let (off_hour, next) = take_digits(bytes, at, 2)?;
+            at = next;
+            let mut off_minute: u32 = 0;
+            let mut off_second: u32 = 0;
+            if bytes.get(at) == Some(&b':') {
+                at += 1;
+                if let Some((parsed, next)) = take_digits(bytes, at, 2) {
+                    off_minute = parsed;
+                    at = next;
+                }
+                if bytes.get(at) == Some(&b':') {
+                    at += 1;
+                    if let Some((parsed, _)) = take_digits(bytes, at, 2) {
+                        off_second = parsed;
+                    }
+                }
+            } else {
+                if let Some((parsed, next)) = take_digits(bytes, at, 2) {
+                    off_minute = parsed;
+                    at = next;
+                }
+                if let Some((parsed, _)) = take_digits(bytes, at, 2) {
+                    off_second = parsed;
+                }
+            }
+            offset_seconds = direction
+                * (off_hour as i128 * 3600 + off_minute as i128 * 60 + off_second as i128);
+        }
+        Some(_) => return None,
+    }
+    let local = days * 86_400 + hour as i128 * 3600 + minute as i128 * 60 + second as i128;
+    Some(local * 1_000_000 + micros - offset_seconds * 1_000_000)
+}
+
+/// Whether a wait stands expired at an instant, under obligation
+/// SY-22. A wait is expired where the operation instant stands
+/// at or past the recorded instant plus its bound, and a wait
+/// with no bound never expires.
+fn wait_expired(wait: &Wait, instant: &str) -> bool {
+    let Some(bound) = wait.wait_for else {
+        return false;
+    };
+    let (Some(recorded), Some(now)) = (stamp_micros(&wait.recorded_at), stamp_micros(instant))
+    else {
+        return false;
+    };
+    now >= recorded + bound as i128 * 1_000_000
+}
+
+/// Remove the waits that stand expired at an instant from a
+/// loaded registry, returning them in the order they were
+/// recorded. The removal takes effect only in the publish of the
+/// operation that swept, so a refusing operation publishes
+/// nothing and the expired waits stay recorded.
+fn sweep_expired(data: &mut Registry, instant: &str) -> Vec<Wait> {
+    let (standing, expired): (Vec<Wait>, Vec<Wait>) = std::mem::take(&mut data.waits)
+        .into_iter()
+        .partition(|wait| !wait_expired(wait, instant));
+    data.waits = standing;
+    expired
+}
+
 fn take_digits(bytes: &[u8], at: usize, count: usize) -> Option<(u32, usize)> {
     if at + count > bytes.len() {
         return None;
@@ -1047,7 +1460,15 @@ pub fn is_valid_timestamp(text: &str) -> bool {
             return false;
         }
         let offset_hour = (rest[0] - b'0') as u32 * 10 + (rest[1] - b'0') as u32;
-        return offset_hour <= 23;
+        let pair = |first: u8, second: u8| (first - b'0') as u32 * 10 + (second - b'0') as u32;
+        let (offset_minute, offset_second) = match rest.len() {
+            2 => (0, 0),
+            4 => (pair(rest[2], rest[3]), 0),
+            5 => (pair(rest[3], rest[4]), 0),
+            6 => (pair(rest[2], rest[3]), pair(rest[4], rest[5])),
+            _ => (pair(rest[3], rest[4]), pair(rest[6], rest[7])),
+        };
+        return offset_hour <= 23 && offset_minute <= 59 && offset_second <= 59;
     }
     false
 }
@@ -1423,6 +1844,7 @@ fn init_stack_with(
             version: REGISTRY_VERSION,
             port_pool: pool,
             claims: BTreeMap::new(),
+            waits: Vec::new(),
         };
         save_registry(&stack, &data)?;
         Ok(pool)
@@ -1479,6 +1901,38 @@ fn free_run(data: &Registry, ranges: i64) -> Option<(i64, i64)> {
         }
     }
     None
+}
+
+/// The lengths of the free runs standing in the pool, in pool
+/// order, as the count of ranges each maximal run of untenanted
+/// ranges holds. The scoring vignette of obligation SY-20 states
+/// these lengths and nothing else about the pool's shape.
+fn free_runs(data: &Registry) -> Vec<i64> {
+    let pool = &data.port_pool;
+    let mut taken: BTreeSet<i64> = BTreeSet::new();
+    for record in data.claims.values() {
+        let first = (record.port_start - pool.start) / pool.range_size;
+        let last = (record.port_end - pool.start) / pool.range_size;
+        for index in first..=last {
+            taken.insert(index);
+        }
+    }
+    let mut runs: Vec<i64> = Vec::new();
+    let mut current: i64 = 0;
+    for index in 0..pool.range_count {
+        if taken.contains(&index) {
+            if current > 0 {
+                runs.push(current);
+                current = 0;
+            }
+        } else {
+            current += 1;
+        }
+    }
+    if current > 0 {
+        runs.push(current);
+    }
+    runs
 }
 
 fn env_text(record: &Record) -> String {
@@ -1609,9 +2063,46 @@ fn standing_claim_error(agent: &str) -> Error {
     Error::plain(format!("agent {agent} already holds a claim in this stack"))
 }
 
-fn refuse_standing_claim(data: &Registry, agent: &str) -> Result<()> {
-    if data.claims.contains_key(agent) {
+/// The standing position check of obligation SY-19, where an
+/// agent holding a claim or a wait refuses as duplicate under
+/// the one refusal and the one wording. Every claim shape takes
+/// this check, because an agent standing in both the claims and
+/// the waits of one document is a shape the reader refuses as
+/// corrupt, and no claim shape may publish it.
+fn refuse_standing_position(data: &Registry, agent: &str) -> Result<()> {
+    if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
         return Err(standing_claim_error(agent));
+    }
+    Ok(())
+}
+
+/// Refuse a wait bound that is not a positive number of seconds,
+/// before anything is read or recorded, in every waiting entry
+/// point, under obligation SY-17.
+fn validate_wait_bound(wait_for: Option<i64>) -> Result<()> {
+    if let Some(bound) = wait_for {
+        if bound <= 0 {
+            return Err(Error::plain(format!(
+                "a wait bound must be a positive number of seconds, not {bound}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The queue full refusal of obligation SY-17, naming the
+/// bound, in the one wording every claim shape returns it in.
+fn queue_full_error() -> Error {
+    Error::plain(format!(
+        "the wait queue is full, at most {QUEUE_BOUND} waits may stand in one stack"
+    ))
+}
+
+/// Refuse a waiting claim where the queue already stands at the
+/// bound of obligation SY-17, with a message naming the bound.
+fn refuse_queue_full(data: &Registry) -> Result<()> {
+    if data.waits.len() >= QUEUE_BOUND {
+        return Err(queue_full_error());
     }
     Ok(())
 }
@@ -1624,8 +2115,10 @@ fn claim_with(
 ) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
-    let (lock, data) = claim_prologue(&stack, git)?;
-    refuse_standing_claim(&data, agent)?;
+    let (lock, mut data) = claim_prologue(&stack, git)?;
+    let instant = now_stamp();
+    let expired = sweep_expired(&mut data, &instant);
+    refuse_standing_position(&data, agent)?;
     allocate_locked(AllocParts {
         stack: &stack,
         agent,
@@ -1635,6 +2128,8 @@ fn claim_with(
         git,
         saver,
         routing: None,
+        expired,
+        instant,
     })
 }
 
@@ -1650,35 +2145,73 @@ struct AllocParts<'a> {
     git: &'a dyn GitRunner,
     saver: &'a dyn Fn(&Path, &Registry) -> Result<()>,
     routing: Option<&'a RoutingLine>,
+    /// The waits the caller's sweep removed from the loaded
+    /// registry, whose leavings the queue log records in the same
+    /// act as this allocation's publish, under obligation SY-22.
+    expired: Vec<Wait>,
+    /// The one instant of the locked act, which the claim record
+    /// carries as its claimed_at.
+    instant: String,
 }
 
-/// The shared allocation attempt, run with the stack lock held and
-/// the registry loaded and the standing claim check already made.
-///
-/// A draw of one range is the claim Round 1 landed. A larger draw
-/// takes that many consecutive ranges for a profiled or routed
-/// claim, and the record carries the start of the first range it
-/// drew and the end of the last in the landed record shape. When a
-/// routing line stands, it is appended to the routing log after
-/// the allocation is built and immediately before the registry
-/// publish, as obligation SY-15 fixes the order.
-fn allocate_locked(parts: AllocParts) -> Result<Record> {
-    let AllocParts {
-        stack,
-        agent,
-        draw,
-        mut data,
-        lock,
-        git,
-        saver,
-        routing,
-    } = parts;
+/// One furnished claim built inside a caller's registry, with
+/// the side effects of the landed allocation attempt standing
+/// done and the claim standing in the caller's map, for the
+/// caller to publish. The branch preexistence flag rides along
+/// because a rollback needs it.
+struct Furnished {
+    record: Record,
+    branch_preexisted: bool,
+}
+
+/// Roll a failed furnishing back, returning the bare error where
+/// the rollback completed and the landed combined message where
+/// it did not.
+fn rollback_or_report(
+    git: &dyn GitRunner,
+    repo: &Path,
+    record: &Record,
+    branch_preexisted: bool,
+    exc: Error,
+) -> Error {
+    let worktree = repo
+        .parent()
+        .map(|stack| stack.join(&record.worktree))
+        .unwrap_or_default();
+    let problems = rollback_claim(git, repo, &worktree, &record.branch, branch_preexisted);
+    if problems.is_empty() {
+        exc
+    } else {
+        Error::plain(format!(
+            "the claim for {} failed, {}, and rolling it back was incomplete, {}",
+            record.agent,
+            exc.message(),
+            problems.join(", ")
+        ))
+    }
+}
+
+/// Furnish one claim inside a loaded registry whose lock the
+/// caller holds, performing the landed allocation side effects
+/// without publishing. The pool refusals are the landed
+/// messages, and the record carries the instant the caller
+/// names, which is the instant of the locked act the claim
+/// stands in. A failure rolls the furnishing itself back and
+/// returns the error, and the caller publishes nothing.
+fn furnish_claim(
+    data: &mut Registry,
+    stack: &Path,
+    agent: &str,
+    draw: i64,
+    claimed_at: &str,
+    git: &dyn GitRunner,
+) -> Result<Furnished> {
     let repo = stack.join(REPO_NAME);
     let branch = branch_name(agent);
     let worktree_rel = format!("{WORKTREES_NAME}/{agent}");
     let worktree = stack.join(&worktree_rel);
     let env_rel = format!("{worktree_rel}/{ENV_NAME}");
-    let (port_start, port_end) = match free_run(&data, draw) {
+    let (port_start, port_end) = match free_run(data, draw) {
         Some(range) => range,
         None if draw == 1 => {
             return Err(Error::plain(
@@ -1699,7 +2232,7 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
         port_end,
         database: database_name(agent),
         env_file: env_rel.clone(),
-        claimed_at: now_stamp(),
+        claimed_at: claimed_at.to_string(),
     };
     let listed = git.result(&repo, &["branch", "--list", &branch])?;
     let branch_preexisted = listed.code == 0 && !listed.stdout.trim().is_empty();
@@ -1723,7 +2256,52 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
         )?;
         write_env_file(stack, &env_rel, &record)?;
         data.claims.insert(agent.to_string(), record.clone());
+        Ok(())
+    })();
+    match attempt {
+        Ok(()) => Ok(Furnished {
+            record,
+            branch_preexisted,
+        }),
+        Err(exc) => Err(rollback_or_report(
+            git,
+            &repo,
+            &record,
+            branch_preexisted,
+            exc,
+        )),
+    }
+}
+
+/// The shared allocation attempt, run with the stack lock held and
+/// the registry loaded and the standing claim check already made.
+///
+/// A draw of one range is the claim Round 1 landed. A larger draw
+/// takes that many consecutive ranges for a profiled or routed
+/// claim, and the record carries the start of the first range it
+/// drew and the end of the last in the landed record shape. When a
+/// routing line stands, it is appended to the routing log after
+/// the allocation is built and immediately before the registry
+/// publish, as obligation SY-15 fixes the order, and the queue
+/// lines of the caller's sweep stand before the routing line in
+/// the same act, under obligation SY-23.
+fn allocate_locked(parts: AllocParts) -> Result<Record> {
+    let AllocParts {
+        stack,
+        agent,
+        draw,
+        mut data,
+        lock,
+        git,
+        saver,
+        routing,
+        expired,
+        instant,
+    } = parts;
+    let furnished = furnish_claim(&mut data, stack, agent, draw, &instant, git)?;
+    let attempt = (|| -> Result<()> {
         lock.verify_current()?;
+        append_leavings(stack, &instant, "expired", &expired, None)?;
         if let Some(line) = routing {
             line.append(stack)?;
         }
@@ -1731,59 +2309,204 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
         Ok(())
     })();
     match attempt {
-        Ok(()) => Ok(record),
-        Err(exc) => {
-            let problems = rollback_claim(git, &repo, &worktree, &branch, branch_preexisted);
-            if !problems.is_empty() {
-                return Err(Error::plain(format!(
-                    "the claim for {agent} failed, {}, and rolling it back was incomplete, {}",
-                    exc.message(),
-                    problems.join(", ")
-                )));
-            }
-            Err(exc)
-        }
+        Ok(()) => Ok(furnished.record),
+        Err(exc) => Err(rollback_or_report(
+            git,
+            &stack.join(REPO_NAME),
+            &furnished.record,
+            furnished.branch_preexisted,
+            exc,
+        )),
     }
 }
 
-/// Return every resource a claim holds and remove its record.
-pub fn release(stack: &Path, agent: &str) -> Result<Record> {
+/// What a release did, of obligation SY-21 and SY-22. A release
+/// of an agent holding a claim returns the claim it released, and
+/// a release of an agent holding only a wait cancels that wait
+/// and returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReleaseOutcome {
+    Claim(Record),
+    Wait(Wait),
+}
+
+/// What serving the standing waits in a release returns, the
+/// waits furnished in offer order and the port span each
+/// furnished claim took, keyed by agent.
+type OfferOutcome = (Vec<Wait>, BTreeMap<String, (i64, i64)>, Vec<Furnished>);
+
+/// Serve the standing waits of a release whose claim's removal
+/// already stands computed in the registry, in offer order, under
+/// obligation SY-21. A wait whose whole draw stands free at its
+/// turn is furnished whole through the landed allocation path of
+/// its kind, its claim record carrying the instant of the
+/// release, and a wait whose draw does not stand free is skipped
+/// and does not block the waits behind it. A wait whose
+/// furnishing itself fails is skipped the same way, the
+/// furnishing having rolled itself back, so one unfurnishable
+/// wait can never wedge the release or the queue behind it.
+/// Returns the waits furnished, in offer order, with the span
+/// each furnished claim took and the furnishings themselves, for
+/// the caller's rollback if a later step of the release fails,
+/// and the registry carries every furnishing at once, for the
+/// caller's one publish.
+fn serve_offers(
+    data: &mut Registry,
+    stack: &Path,
+    instant: &str,
+    git: &dyn GitRunner,
+) -> Result<OfferOutcome> {
+    let mut furnished: Vec<Wait> = Vec::new();
+    let mut offers: Vec<Furnished> = Vec::new();
+    let mut spans: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for wait in offer_order(&data.waits) {
+        let draw = settled_draw(&wait.profile);
+        if free_run(data, draw).is_none() {
+            continue;
+        }
+        let done = match furnish_claim(data, stack, &wait.agent, draw, instant, git) {
+            Ok(done) => done,
+            Err(_) => continue,
+        };
+        spans.insert(
+            wait.agent.clone(),
+            (done.record.port_start, done.record.port_end),
+        );
+        furnished.push(wait);
+        offers.push(done);
+    }
+    if !furnished.is_empty() {
+        let done: BTreeSet<&str> = furnished.iter().map(|wait| wait.agent.as_str()).collect();
+        data.waits
+            .retain(|wait| !done.contains(wait.agent.as_str()));
+    }
+    Ok((furnished, spans, offers))
+}
+
+/// Roll back every offer a release furnished, when a step after
+/// the offers fails before the release publishes. Each
+/// furnishing is undone through the landed rollback, and the
+/// error returned is the failure itself where every rollback
+/// completed and a report of the incompleteness where one did
+/// not, in the shape rollback_or_report already speaks.
+fn rollback_offers(git: &dyn GitRunner, stack: &Path, offers: &[Furnished], exc: Error) -> Error {
+    let repo = stack.join(REPO_NAME);
+    let mut problems = Vec::new();
+    for offer in offers {
+        problems.extend(rollback_claim(
+            git,
+            &repo,
+            &stack.join(&offer.record.worktree),
+            &offer.record.branch,
+            offer.branch_preexisted,
+        ));
+    }
+    if problems.is_empty() {
+        exc
+    } else {
+        Error::plain(format!(
+            "the release failed, {}, and rolling its offers back was incomplete, {}",
+            exc.message(),
+            problems.join(", ")
+        ))
+    }
+}
+
+/// Return every resource a claim holds and remove its record, or
+/// cancel the wait of an agent who holds only a wait, under
+/// obligations SY-21 and SY-22. The sweep of expired waits stands
+/// at the head of the operation, after validation and before any
+/// other queue decision, and the release and the sweep and every
+/// offer the release makes publish in the one rename.
+pub fn release(stack: &Path, agent: &str) -> Result<ReleaseOutcome> {
     release_with(stack, agent, &ProcessGit)
 }
 
-fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<Record> {
+fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<ReleaseOutcome> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     let repo = stack.join(REPO_NAME);
     let lock = locked(&stack)?;
     let mut data = load_registry(&stack)?;
     verify_own_repo(git, &stack)?;
-    let record = match data.claims.get(agent) {
-        Some(record) => record.clone(),
-        None => {
-            return Err(Error::plain(format!(
-                "agent {agent} holds no claim in this stack"
-            )))
+    let instant = now_stamp();
+    let expired = sweep_expired(&mut data, &instant);
+    if let Some(record) = data.claims.get(agent).cloned() {
+        let worktree = stack.join(&record.worktree);
+        if worktree.exists() {
+            git_checked(
+                git,
+                &repo,
+                &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+            )?;
+        } else {
+            git_checked(git, &repo, &["worktree", "prune"])?;
         }
-    };
-    let worktree = stack.join(&record.worktree);
-    if worktree.exists() {
-        git_checked(
-            git,
-            &repo,
-            &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+        let listed = git_checked(git, &repo, &["branch", "--list", &record.branch])?;
+        if !listed.trim().is_empty() {
+            git_checked(git, &repo, &["branch", "-D", &record.branch])?;
+        }
+        data.claims.remove(agent);
+        let (furnished, spans, offers) = serve_offers(&mut data, &stack, &instant, git)?;
+        let published = (|| -> Result<()> {
+            append_leavings(&stack, &instant, "expired", &expired, None)?;
+            append_leavings(&stack, &instant, "furnished", &furnished, Some(&spans))?;
+            lock.verify_current()?;
+            save_registry(&stack, &data)?;
+            Ok(())
+        })();
+        if let Err(exc) = published {
+            return Err(rollback_offers(git, &stack, &offers, exc));
+        }
+        return Ok(ReleaseOutcome::Claim(record));
+    }
+    if let Some(wait) = data.waits.iter().find(|wait| wait.agent == agent).cloned() {
+        data.waits.retain(|standing| standing.agent != agent);
+        append_leavings(&stack, &instant, "expired", &expired, None)?;
+        append_leavings(
+            &stack,
+            &instant,
+            "cancelled",
+            std::slice::from_ref(&wait),
+            None,
         )?;
-    } else {
-        git_checked(git, &repo, &["worktree", "prune"])?;
+        lock.verify_current()?;
+        save_registry(&stack, &data)?;
+        return Ok(ReleaseOutcome::Wait(wait));
     }
-    let listed = git_checked(git, &repo, &["branch", "--list", &record.branch])?;
-    if !listed.trim().is_empty() {
-        git_checked(git, &repo, &["branch", "-D", &record.branch])?;
-    }
-    data.claims.remove(agent);
-    lock.verify_current()?;
-    save_registry(&stack, &data)?;
-    Ok(record)
+    Err(Error::plain(format!(
+        "agent {agent} holds no claim in this stack"
+    )))
+}
+
+/// The standing waits in offer order, derived only from the
+/// registry, under obligation SY-24. The list takes no lock and
+/// sweeps nothing, because expiry is evaluated on access by the
+/// operations that publish, and a reader changes nothing.
+pub fn list_waits(stack: &Path) -> Result<Vec<Wait>> {
+    let stack = resolve_path(stack);
+    let data = load_registry(&stack)?;
+    Ok(offer_order(&data.waits))
+}
+
+/// The offer order of obligation SY-21. Scored waits stand
+/// before scoreless waits, scored waits order by score
+/// descending with ties by arrival, and scoreless waits order by
+/// arrival, where arrival is the order of the recorded list.
+pub fn offer_order(waits: &[Wait]) -> Vec<Wait> {
+    let mut scored: Vec<Wait> = waits
+        .iter()
+        .filter(|wait| wait.score.is_some())
+        .cloned()
+        .collect();
+    scored.sort_by(|left, right| right.score.cmp(&left.score));
+    let scoreless: Vec<Wait> = waits
+        .iter()
+        .filter(|wait| wait.score.is_none())
+        .cloned()
+        .collect();
+    scored.extend(scoreless);
+    scored
 }
 
 /// Return the recorded claims sorted by agent, reading nothing
@@ -2196,6 +2919,200 @@ impl RoutingLine {
     }
 }
 
+/// One line of the queue log of obligation SY-23, carrying the
+/// fields that obligation names and no others. The log is
+/// evidence, not state, and no command reads it to decide
+/// anything.
+struct QueueLine {
+    at: String,
+    kind: &'static str,
+    agent: String,
+    profile: String,
+    request_sha256: Option<String>,
+    request_bytes: Option<usize>,
+    score: Option<i64>,
+    confidence: Option<f64>,
+    model: Option<String>,
+    fallback: String,
+    ports: Option<(i64, i64)>,
+}
+
+impl QueueLine {
+    /// A line for one wait leaving or joining, carrying the
+    /// wait's own recorded fields. A joining line carries the
+    /// digest of the scoring request the library built for the
+    /// wait, and a leaving line leaves the digest fields to the
+    /// caller to recover from the wait's joining line, because
+    /// the vignette the request was built from no longer stands
+    /// when the wait leaves.
+    fn for_wait(at: &str, kind: &'static str, wait: &Wait) -> QueueLine {
+        QueueLine {
+            at: at.to_string(),
+            kind,
+            agent: wait.agent.clone(),
+            profile: wait.profile.clone(),
+            request_sha256: None,
+            request_bytes: None,
+            score: wait.score,
+            confidence: wait.confidence,
+            model: wait.model.clone(),
+            fallback: wait.fallback.clone(),
+            ports: None,
+        }
+    }
+
+    fn append(&self, stack: &Path) -> Result<()> {
+        let text = serde_json::Value::Object(self.fields());
+        let path = stack.join(QUEUE_LOG_NAME);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|exc| {
+                Error::plain(format!(
+                    "the queue log at {} cannot be opened, {exc}",
+                    path.display()
+                ))
+            })?;
+        file.write_all(text.to_string().as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(|exc| {
+                Error::plain(format!(
+                    "the queue log at {} cannot be written, {exc}",
+                    path.display()
+                ))
+            })
+    }
+
+    fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut line = serde_json::Map::new();
+        line.insert("agent".to_string(), self.agent.clone().into());
+        line.insert("at".to_string(), self.at.clone().into());
+        line.insert(
+            "confidence".to_string(),
+            match self.confidence {
+                Some(number) => serde_json::json!(number),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert("fallback".to_string(), self.fallback.clone().into());
+        line.insert("kind".to_string(), self.kind.into());
+        line.insert(
+            "model".to_string(),
+            match &self.model {
+                Some(model) => model.clone().into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert(
+            "ports".to_string(),
+            match self.ports {
+                Some((start, end)) => serde_json::json!([start, end]),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert("profile".to_string(), self.profile.clone().into());
+        line.insert(
+            "request_bytes".to_string(),
+            match self.request_bytes {
+                Some(count) => (count as i64).into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert(
+            "request_sha256".to_string(),
+            match &self.request_sha256 {
+                Some(digest) => digest.clone().into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        line.insert(
+            "score".to_string(),
+            match self.score {
+                Some(level) => level.into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        line
+    }
+}
+
+/// The digest and byte count each standing wait's joining line
+/// recorded in the queue log, keyed by agent, best effort. A
+/// leaving line carries the digest of the exact scoring request
+/// bytes the library built for the wait, and the registry record
+/// carries no digest, so a leaving operation recovers the pair
+/// from the wait's own joining line. Reading the log to complete
+/// a later evidence line decides nothing, because no allocation
+/// and no refusal and no ordering and no expiry ever consults
+/// it, and where the log or the joining line does not stand the
+/// leaving line carries the digest fields as null rather than a
+/// fabricated digest.
+fn queued_digests(stack: &Path) -> BTreeMap<String, (String, usize)> {
+    let mut digests: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    let path = stack.join(QUEUE_LOG_NAME);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return digests;
+    };
+    for text in raw.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        let agent = value.get("agent").and_then(|field| field.as_str());
+        match value.get("kind").and_then(|field| field.as_str()) {
+            Some("queued") => {
+                let digest = value
+                    .get("request_sha256")
+                    .and_then(|field| field.as_str())
+                    .map(str::to_string);
+                let bytes = value
+                    .get("request_bytes")
+                    .and_then(|field| field.as_u64())
+                    .map(|count| count as usize);
+                if let (Some(agent), Some(digest), Some(bytes)) = (agent, digest, bytes) {
+                    digests.insert(agent.to_string(), (digest, bytes));
+                }
+            }
+            Some(_) => {
+                if let Some(agent) = agent {
+                    digests.remove(agent);
+                }
+            }
+            None => {}
+        }
+    }
+    digests
+}
+
+/// Append the leaving lines of one locked act to the queue log,
+/// in the order the waits stand in the given list, recovering
+/// each wait's request digest from its joining line and carrying
+/// the furnished span where the act furnished the wait.
+fn append_leavings(
+    stack: &Path,
+    at: &str,
+    kind: &'static str,
+    waits: &[Wait],
+    furnished_spans: Option<&BTreeMap<String, (i64, i64)>>,
+) -> Result<()> {
+    if waits.is_empty() {
+        return Ok(());
+    }
+    let digests = queued_digests(stack);
+    for wait in waits {
+        let mut line = QueueLine::for_wait(at, kind, wait);
+        if let Some((digest, bytes)) = digests.get(&wait.agent) {
+            line.request_sha256 = Some(digest.clone());
+            line.request_bytes = Some(*bytes);
+        }
+        if let Some(spans) = furnished_spans {
+            line.ports = spans.get(&wait.agent).copied();
+        }
+        line.append(stack)?;
+    }
+    Ok(())
+}
+
 /// Settle the profile of a routed claim from its consultation, in
 /// the second phase of the envelope of obligation SY-13, outside
 /// the stack lock. Returns the settled profile and the verdict
@@ -2240,6 +3157,257 @@ fn settle(
     }
 }
 
+/// The scoring question of obligation SY-20, which the same
+/// judge command answers beside the routing question, the two
+/// distinguished by the request document each receives.
+pub const SCORING_QUESTION: &str = "score";
+
+/// The eleven declared labels of the scoring question, the ten
+/// score levels and the no score label the grammar of SY-20
+/// names.
+pub const SCORE_LABELS: [&str; 11] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "other"];
+
+const SCORING_INSTRUCTIONS: &str = "The question asks the judge to score one waiting request for preference when port ranges free up, on a scale of ten levels where the tenth is the strongest preference the scale states. Score from the counted facts and nothing else. A request whose draw can be met only by a long run of ranges that rarely stands free scores toward the top. A request whose draw the next small release can furnish scores toward the bottom. The more requests already waiting for the same draw, the higher this request scores. A request carrying a wait bound scores higher as its bound runs shorter against the number already waiting. The description may raise or lower the score only through facts it states as numerals, and a quality the description merely evokes is not a fact and moves the score not at all. Where the counted facts do not determine a preference, the answer is the no score label, and a guess is a wrong answer. The score was taken when the request joined the queue and measures contention at that moment. Answer with exactly one of the listed options.";
+
+const SCORING_FRAMING: &str = "A furnishing tool holds a queue of requests waiting for port ranges.\nThe judge is to score the one waiting request the counted facts below describe, for preference when ranges free up, applying the doctrine of the question to those facts and to nothing else.\nThe score orders the queue and performs no allocation itself.";
+
+const SCORING_CLOSING: &str = "The labels are 1 and 2 and 3 and 4 and 5 and 6 and 7 and 8 and 9 and 10 and other. The levels run from the weakest preference at 1 to the strongest at 10, and other is the no score label, the answer where the counted facts do not determine a preference.";
+
+/// The state text of one scoring request, the vignette of
+/// obligation SY-20. The text is a pure function of the settled
+/// profile, the waits already standing, the free runs of the
+/// pool, the wait bound, and the description, and of nothing
+/// else, so no agent name and no stack path and no standing
+/// claim and no earlier score ever enters a request.
+fn scoring_state(
+    settled: &str,
+    draw: i64,
+    standing: &[Wait],
+    runs: &[i64],
+    wait_for: Option<i64>,
+    description: Option<&str>,
+) -> String {
+    let mut count_one = 0;
+    let mut count_two = 0;
+    let mut count_four = 0;
+    for wait in standing {
+        match settled_draw(&wait.profile) {
+            1 => count_one += 1,
+            2 => count_two += 1,
+            _ => count_four += 1,
+        }
+    }
+    let runs_text = if runs.is_empty() {
+        "No run stands free in the pool.".to_string()
+    } else {
+        let listed: Vec<String> = runs.iter().map(i64::to_string).collect();
+        format!(
+            "The free runs standing in the pool, in ranges, are {}.",
+            listed.join(" and ")
+        )
+    };
+    let bound_text = match wait_for {
+        Some(bound) => format!("The request carries a wait bound of {bound} seconds."),
+        None => "The request carries no wait bound.".to_string(),
+    };
+    let description_text = match description {
+        Some(text) => text.to_string(),
+        None => {
+            "The request carries no description and stands on its counted facts alone.".to_string()
+        }
+    };
+    format!(
+        "{SCORING_FRAMING}\n\nThe request that waits settled on the {settled} profile, a draw of {draw} ranges.\nWaits already standing, {}. Standing for a draw of 1 range, {count_one}. Standing for a draw of 2 ranges, {count_two}. Standing for a draw of 4 ranges, {count_four}.\n{runs_text}\n{bound_text}\n\n{description_text}\n\n{SCORING_CLOSING}",
+        standing.len()
+    )
+}
+
+/// Build the scoring request document for one waiting claim, in
+/// the shape of the routing request document, pinning the model
+/// of obligation SY-20 and carrying the vignette as its state.
+pub fn scoring_request(
+    settled: &str,
+    draw: i64,
+    standing: &[Wait],
+    runs: &[i64],
+    wait_for: Option<i64>,
+    description: Option<&str>,
+) -> String {
+    let criteria_text = [
+        ("1", "The bottom of the scale, a request the next small release can furnish, standing under no contention worth the name."),
+        ("2", "The bottom band, a request a small release can furnish, standing under light contention."),
+        ("3", "The top of the bottom band, a request a modest release can furnish, standing under some contention."),
+        ("4", "The bottom of the middle band, a request whose draw wants more than the next small release, standing under ordinary contention."),
+        ("5", "The middle of the scale, a request whose draw and contention stand in balance."),
+        ("6", "The middle band, a request whose draw or whose contention stands above the ordinary."),
+        ("7", "The top of the middle band, a request whose draw is hard to furnish or whose contention stands heavy."),
+        ("8", "The bottom of the top band, a request whose draw only a long run can furnish, or one standing under heavy contention."),
+        ("9", "The top band, a request whose draw rarely stands free, standing under heavy contention."),
+        ("10", "The strongest preference the scale states, a request whose draw can be met only by a long run that rarely stands free, standing under the heaviest contention."),
+        ("other", "The no score label, the answer where the counted facts leave the preference undetermined."),
+    ];
+    let mut criteria = serde_json::Map::new();
+    for (label, text) in criteria_text {
+        criteria.insert(label.to_string(), text.into());
+    }
+    let mut question = serde_json::Map::new();
+    question.insert("criteria".to_string(), criteria.into());
+    question.insert("instructions".to_string(), SCORING_INSTRUCTIONS.into());
+    question.insert("type".to_string(), "choice".into());
+    let mut questions = serde_json::Map::new();
+    questions.insert(SCORING_QUESTION.to_string(), question.into());
+    let mut document = serde_json::Map::new();
+    document.insert("model".to_string(), ROUTING_MODEL.into());
+    document.insert("questions".to_string(), questions.into());
+    document.insert(
+        "state".to_string(),
+        scoring_state(settled, draw, standing, runs, wait_for, description).into(),
+    );
+    serde_json::to_string(&serde_json::Value::Object(document)).unwrap()
+}
+
+/// What a scoring reply body classifies as under the grammar of
+/// SY-20.
+enum ScoreConsultation {
+    Score(i64, f64),
+    LowConfidence,
+    Abstention,
+    Silence,
+    Malformed,
+}
+
+/// Classify one scoring reply body. The grammar is the routing
+/// grammar's, one JSON object carrying one answer for the
+/// scoring question, whose choice names one of the eleven
+/// declared labels and whose probabilities carry exactly those
+/// eleven labels each standing in the range 0 to 1. The
+/// confidence of a score is the probability of the chosen label
+/// read from the probabilities map, and a confidence field the
+/// reply also carries is never read.
+fn classify_score(body: &str) -> ScoreConsultation {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return ScoreConsultation::Silence;
+    }
+    let data: JVal = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(_) => return ScoreConsultation::Malformed,
+    };
+    if first_duplicate_key(&data).is_some() {
+        return ScoreConsultation::Malformed;
+    }
+    let entry = match data
+        .get("answers")
+        .and_then(|answers| answers.get(SCORING_QUESTION))
+    {
+        Some(entry) => entry,
+        None => return ScoreConsultation::Silence,
+    };
+    if !matches!(entry, JVal::Obj(_)) {
+        return ScoreConsultation::Malformed;
+    }
+    let choice = match entry.get("choice").and_then(JVal::as_str) {
+        Some(choice) if SCORE_LABELS.contains(&choice) => choice.to_string(),
+        _ => return ScoreConsultation::Malformed,
+    };
+    let probabilities = match entry.get("probabilities") {
+        Some(probabilities @ JVal::Obj(pairs)) if exact_keys(pairs, &SCORE_LABELS) => probabilities,
+        _ => return ScoreConsultation::Malformed,
+    };
+    let mut values = [0.0_f64; 11];
+    for (slot, label) in values.iter_mut().zip(SCORE_LABELS.iter()) {
+        match probabilities.get(label).and_then(jval_f64) {
+            Some(number) if (0.0..=1.0).contains(&number) => *slot = number,
+            _ => return ScoreConsultation::Malformed,
+        }
+    }
+    let index = SCORE_LABELS
+        .iter()
+        .position(|label| *label == choice)
+        .unwrap();
+    let confidence = values[index];
+    if choice == "other" {
+        ScoreConsultation::Abstention
+    } else if confidence >= LOW_CONFIDENCE_THRESHOLD {
+        ScoreConsultation::Score(choice.parse().unwrap(), confidence)
+    } else {
+        ScoreConsultation::LowConfidence
+    }
+}
+
+/// The outcome of the one scoring consultation of a wait, the
+/// score and its confidence where one stands and the fallback
+/// word of obligation SY-20 where none does.
+struct ScoreOutcome {
+    score: Option<i64>,
+    confidence: Option<f64>,
+    fallback: &'static str,
+    model: Option<String>,
+}
+
+/// Score one waiting claim through the transport seam of
+/// obligation SY-16, outside the stack lock. With no transport
+/// configured the wait records no score under the no transport
+/// class and carries a null model name, and every fallback class
+/// leaves the wait scoreless.
+fn settle_score(transport: Option<&dyn JudgeTransport>, request: &str) -> ScoreOutcome {
+    let transport = match transport {
+        None => {
+            return ScoreOutcome {
+                score: None,
+                confidence: None,
+                fallback: "no transport",
+                model: None,
+            }
+        }
+        Some(transport) => transport,
+    };
+    let model = Some(ROUTING_MODEL.to_string());
+    let body = match transport.consult(request) {
+        Ok(body) => body,
+        Err(_) => {
+            return ScoreOutcome {
+                score: None,
+                confidence: None,
+                fallback: "transport",
+                model,
+            }
+        }
+    };
+    match classify_score(&body) {
+        ScoreConsultation::Score(level, confidence) => ScoreOutcome {
+            score: Some(level),
+            confidence: Some(confidence),
+            fallback: "none",
+            model,
+        },
+        ScoreConsultation::LowConfidence => ScoreOutcome {
+            score: None,
+            confidence: None,
+            fallback: "low confidence",
+            model,
+        },
+        ScoreConsultation::Abstention => ScoreOutcome {
+            score: None,
+            confidence: None,
+            fallback: "abstention",
+            model,
+        },
+        ScoreConsultation::Silence => ScoreOutcome {
+            score: None,
+            confidence: None,
+            fallback: "silence",
+            model,
+        },
+        ScoreConsultation::Malformed => ScoreOutcome {
+            score: None,
+            confidence: None,
+            fallback: "malformed",
+            model,
+        },
+    }
+}
+
 /// Allocate a claim under a named declared profile, with no
 /// consultation at all, by the same path a plain claim takes with
 /// the draw of the profile.
@@ -2256,8 +3424,10 @@ fn claim_profile_with(
 ) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
-    let (lock, data) = claim_prologue(&stack, git)?;
-    refuse_standing_claim(&data, agent)?;
+    let (lock, mut data) = claim_prologue(&stack, git)?;
+    let instant = now_stamp();
+    let expired = sweep_expired(&mut data, &instant);
+    refuse_standing_position(&data, agent)?;
     allocate_locked(AllocParts {
         stack: &stack,
         agent,
@@ -2267,6 +3437,8 @@ fn claim_profile_with(
         git,
         saver,
         routing: None,
+        expired,
+        instant,
     })
 }
 
@@ -2341,8 +3513,9 @@ fn claim_routed_with(
     validate_agent_name(agent)?;
     let model = transport.map(|_| ROUTING_MODEL.to_string());
     {
-        let (lock, data) = claim_prologue(&stack, git)?;
-        refuse_standing_claim(&data, agent)?;
+        let (lock, mut data) = claim_prologue(&stack, git)?;
+        let _ = sweep_expired(&mut data, &now_stamp());
+        refuse_standing_position(&data, agent)?;
         validate_description(description)?;
         if !PROFILES
             .iter()
@@ -2360,7 +3533,7 @@ fn claim_routed_with(
     }
     let (settled, verdict, confidence, fallback) = settle(description, default_profile, transport);
     let lock = locked(&stack)?;
-    let data = match load_registry(&stack) {
+    let mut data = match load_registry(&stack) {
         Ok(data) => data,
         Err(exc) => {
             refuse_after_consultation(
@@ -2389,7 +3562,9 @@ fn claim_routed_with(
         )?;
         return Err(exc);
     }
-    if data.claims.contains_key(agent) {
+    let instant = now_stamp();
+    let expired = sweep_expired(&mut data, &instant);
+    if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
         refuse_after_consultation(
             &stack,
             agent,
@@ -2435,7 +3610,452 @@ fn claim_routed_with(
         git,
         saver,
         routing: Some(&line),
+        expired,
+        instant,
     })
+}
+
+/// What a waiting claim did, of obligation SY-17. A waiting
+/// claim whose settled draw stands free allocates exactly as
+/// without the option and returns the claim record, and a
+/// waiting claim whose draw does not stand free records a wait
+/// and returns the wait record, creating no worktree and no
+/// branch and no database and no env file and taking no port
+/// span.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaimOutcome {
+    Claim(Record),
+    Wait(Wait),
+}
+
+/// Allocate a plain claim that waits where its draw does not
+/// stand free, under the waiting envelope of obligation SY-19.
+pub fn claim_waiting(
+    stack: &Path,
+    agent: &str,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+) -> Result<ClaimOutcome> {
+    claim_waiting_with(
+        stack,
+        agent,
+        wait_for,
+        transport,
+        &ProcessGit,
+        &save_registry,
+    )
+}
+
+fn claim_waiting_with(
+    stack: &Path,
+    agent: &str,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ClaimOutcome> {
+    claim_waiting_core(
+        stack, agent, "plain", 1, None, wait_for, transport, git, saver,
+    )
+}
+
+/// Allocate a claim under a named declared profile that waits
+/// where its draw does not stand free.
+pub fn claim_profile_waiting(
+    stack: &Path,
+    agent: &str,
+    profile: Profile,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+) -> Result<ClaimOutcome> {
+    claim_profile_waiting_with(
+        stack,
+        agent,
+        profile,
+        wait_for,
+        transport,
+        &ProcessGit,
+        &save_registry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_profile_waiting_with(
+    stack: &Path,
+    agent: &str,
+    profile: Profile,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ClaimOutcome> {
+    claim_waiting_core(
+        stack,
+        agent,
+        profile.name(),
+        profile.draw(),
+        None,
+        wait_for,
+        transport,
+        git,
+        saver,
+    )
+}
+
+/// The waiting envelope of obligation SY-19 for a claim whose
+/// settled profile and draw already stand determined, the plain
+/// and profiled shapes. The first phase runs under the lock and
+/// spends no call, the scoring consultation runs outside the
+/// lock, and the third phase takes the lock again and allocates
+/// or records the wait against the registry as it then stands.
+#[allow(clippy::too_many_arguments)]
+fn claim_waiting_core(
+    stack: &Path,
+    agent: &str,
+    settled: &str,
+    draw: i64,
+    description: Option<&str>,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ClaimOutcome> {
+    let stack = resolve_path(stack);
+    validate_agent_name(agent)?;
+    validate_wait_bound(wait_for)?;
+    let snapshot = {
+        let (lock, mut data) = claim_prologue(&stack, git)?;
+        let instant = now_stamp();
+        let expired = sweep_expired(&mut data, &instant);
+        refuse_standing_position(&data, agent)?;
+        refuse_queue_full(&data)?;
+        if free_run(&data, draw).is_some() {
+            let record = allocate_locked(AllocParts {
+                stack: &stack,
+                agent,
+                draw,
+                data,
+                lock: &lock,
+                git,
+                saver,
+                routing: None,
+                expired,
+                instant,
+            })?;
+            return Ok(ClaimOutcome::Claim(record));
+        }
+        (data.waits.clone(), free_runs(&data))
+    };
+    let request = scoring_request(
+        settled,
+        draw,
+        &snapshot.0,
+        &snapshot.1,
+        wait_for,
+        description,
+    );
+    let outcome = settle_score(transport, &request);
+    let lock = locked(&stack)?;
+    let mut data = load_registry(&stack)?;
+    verify_own_repo(git, &stack)?;
+    let instant = now_stamp();
+    let expired = sweep_expired(&mut data, &instant);
+    refuse_standing_position(&data, agent)?;
+    refuse_queue_full(&data)?;
+    if free_run(&data, draw).is_some() {
+        let record = allocate_locked(AllocParts {
+            stack: &stack,
+            agent,
+            draw,
+            data,
+            lock: &lock,
+            git,
+            saver,
+            routing: None,
+            expired,
+            instant,
+        })?;
+        return Ok(ClaimOutcome::Claim(record));
+    }
+    let wait = Wait {
+        agent: agent.to_string(),
+        profile: settled.to_string(),
+        recorded_at: instant.clone(),
+        wait_for,
+        score: outcome.score,
+        confidence: outcome.confidence,
+        model: outcome.model,
+        fallback: outcome.fallback.to_string(),
+    };
+    let mut line = QueueLine::for_wait(&instant, "queued", &wait);
+    line.request_sha256 = Some(sha256_hex(request.as_bytes()));
+    line.request_bytes = Some(request.len());
+    line.append(&stack)?;
+    append_leavings(&stack, &instant, "expired", &expired, None)?;
+    data.waits.push(wait.clone());
+    lock.verify_current()?;
+    saver(&stack, &data)?;
+    Ok(ClaimOutcome::Wait(wait))
+}
+
+/// Allocate a routed claim that waits where its settled draw
+/// does not stand free, under the waiting envelope of obligation
+/// SY-19. A routed claim refused in the first phase because no
+/// declared profile could be furnished settles for waiting
+/// purposes on its declared default and proceeds to wait without
+/// a routing consultation, and its routing line carries the no
+/// consultation fallback word. Once the routing consultation
+/// settles the draw, the allocation check is made again under
+/// the lock before any scoring consultation, so a claim whose
+/// settled draw stands free allocates without being scored.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_routed_waiting(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    default_profile: Profile,
+    transport: Option<&dyn JudgeTransport>,
+    wait_for: Option<i64>,
+) -> Result<ClaimOutcome> {
+    claim_routed_waiting_with(
+        stack,
+        agent,
+        description,
+        default_profile,
+        transport,
+        wait_for,
+        &ProcessGit,
+        &save_registry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_routed_waiting_with(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    default_profile: Profile,
+    transport: Option<&dyn JudgeTransport>,
+    wait_for: Option<i64>,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ClaimOutcome> {
+    let stack = resolve_path(stack);
+    validate_agent_name(agent)?;
+    validate_wait_bound(wait_for)?;
+    let model = transport.map(|_| ROUTING_MODEL.to_string());
+    let mut pre_settled: Option<Profile> = None;
+    {
+        let (_lock, mut data) = claim_prologue(&stack, git)?;
+        let instant = now_stamp();
+        let _ = sweep_expired(&mut data, &instant);
+        refuse_standing_position(&data, agent)?;
+        validate_description(description)?;
+        refuse_queue_full(&data)?;
+        if !PROFILES
+            .iter()
+            .any(|profile| free_run(&data, profile.draw()).is_some())
+        {
+            pre_settled = Some(default_profile);
+        }
+    }
+    let (settled, verdict, confidence, fallback) = match pre_settled {
+        Some(profile) => (profile, None, None, Fallback::NoConsultation),
+        None => settle(description, default_profile, transport),
+    };
+    // The allocation check of the envelope, made under the lock
+    // again now the routing consultation has settled the draw. A
+    // settled draw that stands free allocates from this point
+    // exactly as the same claim allocates without the wait
+    // option, and no scoring consultation is spent on a claim
+    // that does not wait, exactly as SY-17 and SY-20 stand. The
+    // snapshot the scoring request is built from is taken here,
+    // from the registry as it stands at this check.
+    let snapshot = {
+        let lock = locked(&stack)?;
+        let mut data = match load_registry(&stack) {
+            Ok(data) => data,
+            Err(exc) => {
+                refuse_after_consultation(
+                    &stack,
+                    agent,
+                    description,
+                    &model,
+                    &verdict,
+                    confidence,
+                    fallback,
+                    "corrupt",
+                )?;
+                return Err(exc);
+            }
+        };
+        if let Err(exc) = verify_own_repo(git, &stack) {
+            refuse_after_consultation(
+                &stack,
+                agent,
+                description,
+                &model,
+                &verdict,
+                confidence,
+                fallback,
+                "repo",
+            )?;
+            return Err(exc);
+        }
+        let instant = now_stamp();
+        let expired = sweep_expired(&mut data, &instant);
+        if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
+            refuse_after_consultation(
+                &stack,
+                agent,
+                description,
+                &model,
+                &verdict,
+                confidence,
+                fallback,
+                "duplicate",
+            )?;
+            return Err(standing_claim_error(agent));
+        }
+        if data.waits.len() >= QUEUE_BOUND {
+            let mut line = RoutingLine::new(agent, description, model.clone());
+            line.verdict = verdict.clone();
+            line.confidence = confidence;
+            line.fallback = fallback;
+            line.refusal = Some("queue full".to_string());
+            line.append(&stack)?;
+            return Err(queue_full_error());
+        }
+        if free_run(&data, settled.draw()).is_some() {
+            let mut line = RoutingLine::new(agent, description, model);
+            line.verdict = verdict;
+            line.confidence = confidence;
+            line.fallback = fallback;
+            line.allocated = Some(settled.name().to_string());
+            let record = allocate_locked(AllocParts {
+                stack: &stack,
+                agent,
+                draw: settled.draw(),
+                data,
+                lock: &lock,
+                git,
+                saver,
+                routing: Some(&line),
+                expired,
+                instant,
+            })?;
+            return Ok(ClaimOutcome::Claim(record));
+        }
+        (data.waits.clone(), free_runs(&data))
+    };
+    let request = scoring_request(
+        settled.name(),
+        settled.draw(),
+        &snapshot.0,
+        &snapshot.1,
+        wait_for,
+        Some(description),
+    );
+    let outcome = settle_score(transport, &request);
+    let lock = locked(&stack)?;
+    let mut data = match load_registry(&stack) {
+        Ok(data) => data,
+        Err(exc) => {
+            refuse_after_consultation(
+                &stack,
+                agent,
+                description,
+                &model,
+                &verdict,
+                confidence,
+                fallback,
+                "corrupt",
+            )?;
+            return Err(exc);
+        }
+    };
+    if let Err(exc) = verify_own_repo(git, &stack) {
+        refuse_after_consultation(
+            &stack,
+            agent,
+            description,
+            &model,
+            &verdict,
+            confidence,
+            fallback,
+            "repo",
+        )?;
+        return Err(exc);
+    }
+    let instant = now_stamp();
+    let expired = sweep_expired(&mut data, &instant);
+    if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
+        refuse_after_consultation(
+            &stack,
+            agent,
+            description,
+            &model,
+            &verdict,
+            confidence,
+            fallback,
+            "duplicate",
+        )?;
+        return Err(standing_claim_error(agent));
+    }
+    if data.waits.len() >= QUEUE_BOUND {
+        let mut line = RoutingLine::new(agent, description, model.clone());
+        line.verdict = verdict.clone();
+        line.confidence = confidence;
+        line.fallback = fallback;
+        line.refusal = Some("queue full".to_string());
+        line.append(&stack)?;
+        return Err(queue_full_error());
+    }
+    if free_run(&data, settled.draw()).is_some() {
+        let mut line = RoutingLine::new(agent, description, model);
+        line.verdict = verdict;
+        line.confidence = confidence;
+        line.fallback = fallback;
+        line.allocated = Some(settled.name().to_string());
+        let record = allocate_locked(AllocParts {
+            stack: &stack,
+            agent,
+            draw: settled.draw(),
+            data,
+            lock: &lock,
+            git,
+            saver,
+            routing: Some(&line),
+            expired,
+            instant,
+        })?;
+        return Ok(ClaimOutcome::Claim(record));
+    }
+    let wait = Wait {
+        agent: agent.to_string(),
+        profile: settled.name().to_string(),
+        recorded_at: instant.clone(),
+        wait_for,
+        score: outcome.score,
+        confidence: outcome.confidence,
+        model: outcome.model,
+        fallback: outcome.fallback.to_string(),
+    };
+    let mut line = QueueLine::for_wait(&instant, "queued", &wait);
+    line.request_sha256 = Some(sha256_hex(request.as_bytes()));
+    line.request_bytes = Some(request.len());
+    line.append(&stack)?;
+    append_leavings(&stack, &instant, "expired", &expired, None)?;
+    let mut routing_line = RoutingLine::new(agent, description, model);
+    routing_line.verdict = verdict;
+    routing_line.confidence = confidence;
+    routing_line.fallback = fallback;
+    routing_line.refusal = Some("queued".to_string());
+    routing_line.append(&stack)?;
+    data.waits.push(wait.clone());
+    lock.verify_current()?;
+    saver(&stack, &data)?;
+    Ok(ClaimOutcome::Wait(wait))
 }
 
 #[cfg(test)]
@@ -2691,5 +4311,30 @@ mod tests {
             listing.stdout
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_micros_reads_every_shape_the_validator_accepts() {
+        let whole = stamp_micros("2026-11-02T10:00:00Z").unwrap();
+        for shape in [
+            "2026-11-02T10:00:00+00:00",
+            "2026-11-02T10:00:00.000Z",
+            "2026-11-02T10:00Z",
+            "2026-11-02T10:00",
+            "2026-11-02T10",
+            "2026-11-02T12:00+02",
+            "2026-11-02T12:00:00+02:00",
+            "2026-11-02T12:00:30+02:00:30",
+            "2026-11-02T05:00-05:00",
+            "2026-11-02T05:00:00-0500",
+            "20261102T10:00:00Z",
+        ] {
+            assert!(is_valid_timestamp(shape), "{shape}");
+            assert_eq!(stamp_micros(shape), Some(whole), "{shape}");
+        }
+        assert_eq!(
+            stamp_micros("2026-11-02"),
+            Some(days_from_civil(2026, 11, 2) as i128 * 86_400_000_000)
+        );
     }
 }

@@ -3,7 +3,9 @@
 //! One stack per directory, four commands. Init creates the stack,
 //! claim allocates, list shows who holds what, and release returns
 //! everything. A claim is plain, or profiled under a declared
-//! profile, or routed by a job description a judge settles.
+//! profile, or routed by a job description a judge settles, and any
+//! claim may wait where its draw does not stand free. List may
+//! print the queue of standing waits instead of the claims.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -12,8 +14,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::{
-    claim, claim_profile, claim_routed, init_stack, list_claims, profile_named, release,
-    resolve_path, JudgeTransport, Record, Result, DEFAULT_PORT_START, DEFAULT_RANGE_COUNT,
+    claim, claim_profile, claim_profile_waiting, claim_routed, claim_routed_waiting, claim_waiting,
+    init_stack, list_claims, list_waits, profile_named, release, resolve_path, ClaimOutcome,
+    JudgeTransport, Record, ReleaseOutcome, Result, Wait, DEFAULT_PORT_START, DEFAULT_RANGE_COUNT,
     DEFAULT_RANGE_SIZE, JUDGE_TIMEOUT_SECONDS,
 };
 
@@ -38,8 +41,18 @@ claim options:
   --default-profile NAME   the profile a routed claim lands on when the
                            consultation does not decide, required
                            beside --describe
-  --judge-command PROGRAM  the one program a routed claim consults,
-                           named beside --describe
+  --judge-command PROGRAM  the one program a claim consults, named
+                           beside --describe for the routing question
+                           or beside --wait for the scoring question
+  --wait                   record a wait in the queue where the draw
+                           does not stand free instead of refusing,
+                           creating nothing and taking no port span
+  --wait-for SECONDS       bound the wait by a positive number of
+                           seconds, named beside --wait
+
+list options:
+  --queue                  print the standing waits in offer order
+                           instead of the claims table
 
 A judge command is spawned with no arguments. It receives the request
 document as one line on its standard input and answers with the reply
@@ -47,7 +60,10 @@ document on its standard output, inside a deadline of 30 seconds. A
 judge command that cannot be started, or whose request cannot be
 written, or that answers nothing usable, or that runs past the
 deadline leaves the claim on its declared default, and the routing
-log records the landing.
+log records the landing. The same program answers the scoring
+question of a waiting claim, from a request document that names that
+question, and a waiting claim the judge cannot score records its
+wait with no score.
 ";
 
 struct Args {
@@ -61,6 +77,9 @@ struct Args {
     default_profile: Option<String>,
     profile: Option<String>,
     judge_command: Option<String>,
+    wait: bool,
+    wait_for: Option<i128>,
+    queue: bool,
 }
 
 enum Parsed {
@@ -123,12 +142,25 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
     let mut default_profile: Option<String> = None;
     let mut profile: Option<String> = None;
     let mut judge_command: Option<String> = None;
+    let mut wait = false;
+    let mut wait_for: Option<i128> = None;
+    let mut queue = false;
     let mut index = 1;
     while index < tokens.len() {
         let token = &tokens[index];
         if token == "-h" || token == "--help" {
             let _ = write!(out, "{HELP}");
             return Ok(Parsed::Exit(0));
+        }
+        if token == "--wait" && command == "claim" {
+            wait = true;
+            index += 1;
+            continue;
+        }
+        if token == "--queue" && command == "list" {
+            queue = true;
+            index += 1;
+            continue;
         }
         let (option, inline_value) = match token.split_once('=') {
             Some((name, value)) if name.starts_with("--") => {
@@ -142,7 +174,7 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
         ) && (option == "--stack" || command == "init")
             || matches!(
                 option.as_str(),
-                "--describe" | "--default-profile" | "--profile" | "--judge-command"
+                "--describe" | "--default-profile" | "--profile" | "--judge-command" | "--wait-for"
             ) && command == "claim";
         if known_option {
             let value = match inline_value {
@@ -194,6 +226,27 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
                 "--default-profile" => default_profile = Some(value),
                 "--profile" => profile = Some(value),
                 "--judge-command" => judge_command = Some(value),
+                "--wait-for" => {
+                    wait_for = Some(match parse_int(&value) {
+                        Some(number) if number > 0 && i64::try_from(number).is_ok() => number,
+                        Some(number) if number > 0 => {
+                            return Err(format!(
+                                "argument --wait-for: a wait bound cannot stand past {} seconds, not '{value}'",
+                                i64::MAX
+                            ))
+                        }
+                        Some(_) => {
+                            return Err(format!(
+                                "argument --wait-for: a wait bound is a positive number of seconds, not '{value}'"
+                            ))
+                        }
+                        None => {
+                            return Err(format!(
+                                "argument --wait-for: invalid int value: '{value}'"
+                            ))
+                        }
+                    })
+                }
                 _ => unreachable!(),
             }
             index += 1;
@@ -228,10 +281,13 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
                 "argument --default-profile: a routed claim takes --describe beside it".to_string(),
             );
         }
-        if describe.is_none() && judge_command.is_some() {
+        if describe.is_none() && !wait && judge_command.is_some() {
             return Err(
                 "argument --judge-command: a routed claim takes --describe beside it".to_string(),
             );
+        }
+        if wait_for.is_some() && !wait {
+            return Err("argument --wait-for: a wait bound takes --wait beside it".to_string());
         }
         if let Some(description) = &describe {
             if default_profile.is_none() {
@@ -255,6 +311,9 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
         default_profile,
         profile,
         judge_command,
+        wait,
+        wait_for,
+        queue,
     })))
 }
 
@@ -374,35 +433,79 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
         .map_err(|_| format!("the reply of the judge command {program} is not text"))
 }
 
+/// The wait bound a parsed claim carries, in the seconds the
+/// library takes. The parser refuses a bound past the largest
+/// the library names, so no bound reaching here can fail the
+/// conversion.
+fn wait_bound(parsed: &Args) -> Option<i64> {
+    parsed
+        .wait_for
+        .map(|value| i64::try_from(value).unwrap_or_else(|_| unreachable!()))
+}
+
 /// Run one claim of whichever shape its options name, a plain claim
 /// by default, a profiled claim under --profile with no
 /// consultation, and a routed claim under --describe through the
-/// judge command beside it or through no transport at all.
-fn claim_from_args(stack: &Path, parsed: &Args) -> Result<Record> {
+/// judge command beside it or through no transport at all. A claim
+/// carrying --wait takes the waiting shape of its kind, allocating
+/// exactly as without the option where its draw stands free and
+/// recording a wait where it does not.
+fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<()> {
     let agent = parsed.agent.as_deref().unwrap();
+    let transport = parsed
+        .judge_command
+        .as_ref()
+        .map(|program| SubprocessTransport {
+            program: program.clone(),
+        });
+    let transport_ref = transport
+        .as_ref()
+        .map(|transport| transport as &dyn JudgeTransport);
     if let Some(name) = &parsed.profile {
         let profile = profile_named(name)?;
-        return claim_profile(stack, agent, profile);
+        if parsed.wait {
+            let outcome =
+                claim_profile_waiting(stack, agent, profile, wait_bound(parsed), transport_ref)?;
+            print_outcome(out, &outcome);
+            return Ok(());
+        }
+        let record = claim_profile(stack, agent, profile)?;
+        print_claim(out, &record);
+        return Ok(());
     }
     if let Some(description) = &parsed.describe {
         let default = profile_named(parsed.default_profile.as_deref().unwrap())?;
-        let transport = parsed
-            .judge_command
-            .as_ref()
-            .map(|program| SubprocessTransport {
-                program: program.clone(),
-            });
-        return claim_routed(
-            stack,
-            agent,
-            description,
-            default,
-            transport
-                .as_ref()
-                .map(|transport| transport as &dyn JudgeTransport),
-        );
+        if parsed.wait {
+            let outcome = claim_routed_waiting(
+                stack,
+                agent,
+                description,
+                default,
+                transport_ref,
+                wait_bound(parsed),
+            )?;
+            print_outcome(out, &outcome);
+            return Ok(());
+        }
+        let record = claim_routed(stack, agent, description, default, transport_ref)?;
+        print_claim(out, &record);
+        return Ok(());
     }
-    claim(stack, agent)
+    if parsed.wait {
+        let outcome = claim_waiting(stack, agent, wait_bound(parsed), transport_ref)?;
+        print_outcome(out, &outcome);
+        return Ok(());
+    }
+    let record = claim(stack, agent)?;
+    print_claim(out, &record);
+    Ok(())
+}
+
+fn print_outcome(out: &mut dyn Write, outcome: &ClaimOutcome) {
+    match outcome {
+        ClaimOutcome::Claim(record) => print_claim(out, record),
+        ClaimOutcome::Wait(wait) => print_wait(out, wait),
+    }
 }
 
 fn print_claim(out: &mut dyn Write, record: &Record) {
@@ -414,18 +517,37 @@ fn print_claim(out: &mut dyn Write, record: &Record) {
     let _ = writeln!(out, "env file {}", record.env_file);
 }
 
+/// Print a claim that waited. The claim holds no branch and no
+/// worktree and no ports, so the print names the wait and the
+/// settled profile and the score the consultation returned or
+/// the fallback class that left the wait scoreless.
+fn print_wait(out: &mut dyn Write, wait: &Wait) {
+    let _ = writeln!(out, "waiting {}", wait.agent);
+    let _ = writeln!(out, "profile {}", wait.profile);
+    match (wait.score, wait.confidence) {
+        (Some(score), Some(confidence)) => {
+            let _ = writeln!(out, "score {score}");
+            let _ = writeln!(out, "confidence {confidence}");
+        }
+        _ => {
+            let _ = writeln!(out, "score none");
+            let _ = writeln!(out, "fallback {}", wait.fallback);
+        }
+    }
+    if let Some(bound) = wait.wait_for {
+        let _ = writeln!(out, "wait bound {bound} seconds");
+    }
+}
+
 fn print_table(out: &mut dyn Write, records: &[Record]) {
-    let header: [String; 5] = [
-        "AGENT".to_string(),
-        "BRANCH".to_string(),
-        "PORTS".to_string(),
-        "DATABASE".to_string(),
-        "WORKTREE".to_string(),
-    ];
-    let rows: Vec<[String; 5]> = records
+    let header: Vec<String> = ["AGENT", "BRANCH", "PORTS", "DATABASE", "WORKTREE"]
+        .iter()
+        .map(|cell| cell.to_string())
+        .collect();
+    let rows: Vec<Vec<String>> = records
         .iter()
         .map(|record| {
-            [
+            vec![
                 record.agent.clone(),
                 record.branch.clone(),
                 format!("{}-{}", record.port_start, record.port_end),
@@ -434,13 +556,46 @@ fn print_table(out: &mut dyn Write, records: &[Record]) {
             ]
         })
         .collect();
+    print_grid(out, &header, &rows);
+}
+
+/// Print the standing waits in offer order, the queue table of
+/// obligation SY-24, carrying the agent and the settled profile
+/// and the score or the word none and the instant the wait was
+/// recorded.
+fn print_queue_table(out: &mut dyn Write, waits: &[Wait]) {
+    let header: Vec<String> = ["AGENT", "PROFILE", "SCORE", "RECORDED"]
+        .iter()
+        .map(|cell| cell.to_string())
+        .collect();
+    let rows: Vec<Vec<String>> = waits
+        .iter()
+        .map(|wait| {
+            vec![
+                wait.agent.clone(),
+                wait.profile.clone(),
+                match wait.score {
+                    Some(score) => score.to_string(),
+                    None => "none".to_string(),
+                },
+                wait.recorded_at.clone(),
+            ]
+        })
+        .collect();
+    print_grid(out, &header, &rows);
+}
+
+/// Render one table in the shape the claims table landed, each
+/// column as wide as its widest cell and the columns joined by
+/// two spaces.
+fn print_grid(out: &mut dyn Write, header: &[String], rows: &[Vec<String>]) {
     let mut widths: Vec<usize> = header.iter().map(|cell| cell.chars().count()).collect();
-    for row in &rows {
+    for row in rows {
         for (index, cell) in row.iter().enumerate() {
             widths[index] = widths[index].max(cell.chars().count());
         }
     }
-    let render = |cells: &[String; 5]| -> String {
+    let render = |cells: &[String]| -> String {
         cells
             .iter()
             .enumerate()
@@ -451,8 +606,8 @@ fn print_table(out: &mut dyn Write, records: &[Record]) {
             .collect::<Vec<_>>()
             .join("  ")
     };
-    let _ = writeln!(out, "{}", render(&header));
-    for row in &rows {
+    let _ = writeln!(out, "{}", render(header));
+    for row in rows {
         let _ = writeln!(out, "{}", render(row));
     }
 }
@@ -486,20 +641,34 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 pool.range_count, pool.range_size, pool.start
             );
         }),
-        "claim" => claim_from_args(&stack, &parsed).map(|record| {
-            print_claim(out, &record);
-        }),
-        "list" => list_claims(&stack).map(|records| {
-            print_table(out, &records);
-        }),
-        "release" => release(&stack, parsed.agent.as_deref().unwrap()).map(|record| {
-            let _ = writeln!(out, "released {}", record.agent);
-            let _ = writeln!(
-                out,
-                "ports {}-{} returned",
-                record.port_start, record.port_end
-            );
-        }),
+        "claim" => claim_from_args(&stack, &parsed, out),
+        "list" => {
+            if parsed.queue {
+                list_waits(&stack).map(|waits| {
+                    print_queue_table(out, &waits);
+                })
+            } else {
+                list_claims(&stack).map(|records| {
+                    print_table(out, &records);
+                })
+            }
+        }
+        "release" => {
+            release(&stack, parsed.agent.as_deref().unwrap()).map(|outcome| match outcome {
+                ReleaseOutcome::Claim(record) => {
+                    let _ = writeln!(out, "released {}", record.agent);
+                    let _ = writeln!(
+                        out,
+                        "ports {}-{} returned",
+                        record.port_start, record.port_end
+                    );
+                }
+                ReleaseOutcome::Wait(wait) => {
+                    let _ = writeln!(out, "released {}", wait.agent);
+                    let _ = writeln!(out, "wait cancelled");
+                }
+            })
+        }
         _ => unreachable!(),
     };
     match result {

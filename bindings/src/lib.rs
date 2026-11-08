@@ -20,7 +20,7 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict};
 
-use switchyard_core::{Error, Record};
+use switchyard_core::{ClaimOutcome, Error, Record, ReleaseOutcome, Wait};
 
 create_exception!(switchyard, SwitchyardError, pyo3::exceptions::PyException);
 create_exception!(switchyard, RefusalError, SwitchyardError);
@@ -53,6 +53,55 @@ fn record_dict(py: Python<'_>, record: &Record) -> PyResult<Py<PyDict>> {
     dict.set_item("env_file", &record.env_file)?;
     dict.set_item("claimed_at", &record.claimed_at)?;
     Ok(dict.unbind())
+}
+
+/// Translate one recorded wait into a plain dictionary carrying
+/// every field the wait record of obligation SY-18 carries.
+fn wait_dict(py: Python<'_>, wait: &Wait) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("agent", &wait.agent)?;
+    dict.set_item("profile", &wait.profile)?;
+    dict.set_item("recorded_at", &wait.recorded_at)?;
+    dict.set_item("wait_for", wait.wait_for)?;
+    dict.set_item("score", wait.score)?;
+    dict.set_item("confidence", wait.confidence)?;
+    dict.set_item("model", &wait.model)?;
+    dict.set_item("fallback", &wait.fallback)?;
+    Ok(dict.unbind())
+}
+
+/// Translate the outcome of a waiting claim into the dictionary
+/// of the record it produced, the claim record where it
+/// allocated and the wait record where it waited, under
+/// obligation SY-24.
+fn outcome_dict(py: Python<'_>, outcome: &ClaimOutcome) -> PyResult<Py<PyDict>> {
+    match outcome {
+        ClaimOutcome::Claim(record) => record_dict(py, record),
+        ClaimOutcome::Wait(wait) => wait_dict(py, wait),
+    }
+}
+
+/// Resolve the wait bound of a waiting claim.
+///
+/// A boolean is refused outright with a TypeError naming the
+/// argument, the way a pool argument is refused, and a bound
+/// named without the wait option is refused the way the command
+/// line refuses it, because a bound is meaningful only beside a
+/// claim that waits. The bound itself stands unset by default,
+/// and its positivity is the library's refusal to make.
+fn wait_bound(wait: bool, wait_for: Option<&Bound<'_, PyAny>>) -> PyResult<Option<i64>> {
+    match wait_for {
+        None => Ok(None),
+        Some(value) if value.is_instance_of::<PyBool>() => Err(PyTypeError::new_err(
+            "wait_for must be an integer, not a boolean",
+        )),
+        Some(value) => {
+            if !wait {
+                return Err(RefusalError::new_err("wait_for stands only beside wait"));
+            }
+            Ok(Some(value.extract::<i64>()?))
+        }
+    }
 }
 
 /// Resolve one pool argument of init.
@@ -114,31 +163,84 @@ fn init(
 }
 
 /// Allocate a worktree, a port range, a database, and an env file
-/// for one agent in the stack at the given path.
+/// for one agent in the stack at the given path. With the wait
+/// option standing, the claim waits exactly as a command line
+/// claim with --wait waits and returns the wait record where it
+/// waited, and the transport callable is consulted for the
+/// scoring question only where the claim waits.
 #[pyfunction]
-fn claim(py: Python<'_>, stack: PathBuf, agent: &str) -> PyResult<Py<PyDict>> {
-    let record = py
-        .detach(|| switchyard_core::claim(&stack, agent))
+#[pyo3(signature = (stack, agent, wait = false, wait_for = None, transport = None))]
+fn claim(
+    py: Python<'_>,
+    stack: PathBuf,
+    agent: &str,
+    wait: bool,
+    wait_for: Option<Bound<'_, PyAny>>,
+    transport: Option<Py<PyAny>>,
+) -> PyResult<Py<PyDict>> {
+    let bound = wait_bound(wait, wait_for.as_ref())?;
+    if !wait {
+        let record = py
+            .detach(|| switchyard_core::claim(&stack, agent))
+            .map_err(to_py_error)?;
+        return record_dict(py, &record);
+    }
+    let transport = transport.map(|callable| CallableTransport { callable });
+    let outcome = py
+        .detach(|| {
+            switchyard_core::claim_waiting(
+                &stack,
+                agent,
+                bound,
+                transport
+                    .as_ref()
+                    .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
+            )
+        })
         .map_err(to_py_error)?;
-    record_dict(py, &record)
+    outcome_dict(py, &outcome)
 }
 
 /// Allocate a claim under a named declared profile, with no
 /// consultation at all, by the same path a plain claim takes with
 /// the draw of the profile. An unknown profile name is refused
-/// with the message the command line prints for it.
+/// with the message the command line prints for it. With the wait
+/// option standing, the claim waits exactly as a command line
+/// claim with --wait waits.
 #[pyfunction]
+#[pyo3(signature = (stack, agent, profile, wait = false, wait_for = None, transport = None))]
 fn claim_profile(
     py: Python<'_>,
     stack: PathBuf,
     agent: &str,
     profile: &str,
+    wait: bool,
+    wait_for: Option<Bound<'_, PyAny>>,
+    transport: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyDict>> {
+    let bound = wait_bound(wait, wait_for.as_ref())?;
     let profile = switchyard_core::profile_named(profile).map_err(to_py_error)?;
-    let record = py
-        .detach(|| switchyard_core::claim_profile(&stack, agent, profile))
+    if !wait {
+        let record = py
+            .detach(|| switchyard_core::claim_profile(&stack, agent, profile))
+            .map_err(to_py_error)?;
+        return record_dict(py, &record);
+    }
+    let transport = transport.map(|callable| CallableTransport { callable });
+    let outcome = py
+        .detach(|| {
+            switchyard_core::claim_profile_waiting(
+                &stack,
+                agent,
+                profile,
+                bound,
+                transport
+                    .as_ref()
+                    .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
+            )
+        })
         .map_err(to_py_error)?;
-    record_dict(py, &record)
+    outcome_dict(py, &outcome)
 }
 
 /// The binding side of the transport seam, a Python callable
@@ -173,9 +275,13 @@ impl switchyard_core::JudgeTransport for CallableTransport {
 /// behind the library seam, and leaving it out configures no
 /// transport at all, so the claim lands on its declared default
 /// under the no transport class exactly as a routed claim from the
-/// command line with no judge command does.
+/// command line with no judge command does. With the wait option
+/// standing, the claim waits exactly as a command line claim with
+/// --wait waits, and the same callable answers the scoring
+/// question beside the routing question.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (stack, agent, description, default_profile, transport = None))]
+#[pyo3(signature = (stack, agent, description, default_profile, transport = None, wait = false, wait_for = None))]
 fn claim_routed(
     py: Python<'_>,
     stack: PathBuf,
@@ -183,9 +289,29 @@ fn claim_routed(
     description: &str,
     default_profile: &str,
     transport: Option<Py<PyAny>>,
+    wait: bool,
+    wait_for: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyDict>> {
+    let bound = wait_bound(wait, wait_for.as_ref())?;
     let default = switchyard_core::profile_named(default_profile).map_err(to_py_error)?;
     let transport = transport.map(|callable| CallableTransport { callable });
+    if wait {
+        let outcome = py
+            .detach(|| {
+                switchyard_core::claim_routed_waiting(
+                    &stack,
+                    agent,
+                    description,
+                    default,
+                    transport
+                        .as_ref()
+                        .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
+                    bound,
+                )
+            })
+            .map_err(to_py_error)?;
+        return outcome_dict(py, &outcome);
+    }
     let record = py
         .detach(|| {
             switchyard_core::claim_routed(
@@ -203,13 +329,18 @@ fn claim_routed(
 }
 
 /// Return every resource the agent holds in the stack at the
-/// given path and remove its record.
+/// given path and remove its record. Where the agent holds only
+/// a wait, the release cancels the wait and returns the wait
+/// record, under obligation SY-22.
 #[pyfunction]
 fn release(py: Python<'_>, stack: PathBuf, agent: &str) -> PyResult<Py<PyDict>> {
-    let record = py
+    let outcome = py
         .detach(|| switchyard_core::release(&stack, agent))
         .map_err(to_py_error)?;
-    record_dict(py, &record)
+    match &outcome {
+        ReleaseOutcome::Claim(record) => record_dict(py, record),
+        ReleaseOutcome::Wait(wait) => wait_dict(py, wait),
+    }
 }
 
 /// List the recorded claims of the stack at the given path,
@@ -223,6 +354,17 @@ fn list_claims(py: Python<'_>, stack: PathBuf) -> PyResult<Vec<Py<PyDict>>> {
         .iter()
         .map(|record| record_dict(py, record))
         .collect()
+}
+
+/// List the standing waits of the stack at the given path in
+/// offer order, as plain dictionaries carrying the fields of
+/// obligation SY-18, under obligation SY-24.
+#[pyfunction(name = "queue")]
+fn queue(py: Python<'_>, stack: PathBuf) -> PyResult<Vec<Py<PyDict>>> {
+    let waits = py
+        .detach(|| switchyard_core::list_waits(&stack))
+        .map_err(to_py_error)?;
+    waits.iter().map(|wait| wait_dict(py, wait)).collect()
 }
 
 #[pymodule]
@@ -244,5 +386,6 @@ fn _switchyard(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(claim_routed, m)?)?;
     m.add_function(wrap_pyfunction!(release, m)?)?;
     m.add_function(wrap_pyfunction!(list_claims, m)?)?;
+    m.add_function(wrap_pyfunction!(queue, m)?)?;
     Ok(())
 }
