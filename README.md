@@ -1,6 +1,6 @@
 # switchyard
 
-Switchyard furnishes isolated workspaces for parallel agents, each a worktree on its own branch with its own port range, database, and env file, and it routes claims by job description and queues the claims that must wait.
+Switchyard furnishes isolated workspaces for parallel agents, each a worktree on its own branch with its own port range, database name, and env file, and it routes claims by job description and queues the claims that must wait.
 
 Switchyard is a worktree and port orchestrator carried by a Rust library with a command line and a thin Python binding. One stack directory holds a git repository, the worktrees, and one registry file that records the port pool and every standing claim and wait. A claim creates the worktree and the branch, draws the port ranges, derives the database name, and writes the env file in one operation under one file lock, and a release returns everything and furnishes any waiting claim the freed ranges can serve.
 
