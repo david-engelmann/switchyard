@@ -1460,7 +1460,15 @@ pub fn is_valid_timestamp(text: &str) -> bool {
             return false;
         }
         let offset_hour = (rest[0] - b'0') as u32 * 10 + (rest[1] - b'0') as u32;
-        return offset_hour <= 23;
+        let pair = |first: u8, second: u8| (first - b'0') as u32 * 10 + (second - b'0') as u32;
+        let (offset_minute, offset_second) = match rest.len() {
+            2 => (0, 0),
+            4 => (pair(rest[2], rest[3]), 0),
+            5 => (pair(rest[3], rest[4]), 0),
+            6 => (pair(rest[2], rest[3]), pair(rest[4], rest[5])),
+            _ => (pair(rest[3], rest[4]), pair(rest[6], rest[7])),
+        };
+        return offset_hour <= 23 && offset_minute <= 59 && offset_second <= 59;
     }
     false
 }

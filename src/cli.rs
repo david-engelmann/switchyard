@@ -228,7 +228,13 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
                 "--judge-command" => judge_command = Some(value),
                 "--wait-for" => {
                     wait_for = Some(match parse_int(&value) {
-                        Some(number) if number > 0 => number,
+                        Some(number) if number > 0 && i64::try_from(number).is_ok() => number,
+                        Some(number) if number > 0 => {
+                            return Err(format!(
+                                "argument --wait-for: a wait bound cannot stand past {} seconds, not '{value}'",
+                                i64::MAX
+                            ))
+                        }
                         Some(_) => {
                             return Err(format!(
                                 "argument --wait-for: a wait bound is a positive number of seconds, not '{value}'"
@@ -428,12 +434,13 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
 }
 
 /// The wait bound a parsed claim carries, in the seconds the
-/// library takes, where a bound past every machine size stands
-/// at the largest the library names.
+/// library takes. The parser refuses a bound past the largest
+/// the library names, so no bound reaching here can fail the
+/// conversion.
 fn wait_bound(parsed: &Args) -> Option<i64> {
     parsed
         .wait_for
-        .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+        .map(|value| i64::try_from(value).unwrap_or_else(|_| unreachable!()))
 }
 
 /// Run one claim of whichever shape its options name, a plain claim

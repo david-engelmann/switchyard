@@ -1625,3 +1625,86 @@ fn a_routed_waiting_claim_that_allocates_spends_no_scoring_consultation() {
     assert_eq!(lines[0]["allocated"], "standard");
     assert!(!stack.join(QUEUE_LOG_NAME).exists());
 }
+
+// The repair pins of the checkpoint review round. Each one
+// fails against head eb892357 as the reviews read it and
+// passes against the repaired code, and each is staged from
+// the shapes the reviews named.
+
+#[test]
+fn a_wait_recorded_with_an_offset_minute_or_second_past_59_is_refused_at_load() {
+    for (tag, stamp) in [
+        ("offset-minute-extended", "2026-11-02T10:00:00+05:99"),
+        ("offset-second-extended", "2026-11-02T10:00:00+05:00:99"),
+        ("offset-minute-basic", "2026-11-02T10:00:00+0599"),
+        ("offset-second-basic", "2026-11-02T10:00:00+050099"),
+    ] {
+        let stack = default_stack(tag);
+        inject_waits(&stack, &[staged_wait("waiter", "plain", None)]);
+        rewrite_recorded_at(&stack, "waiter", stamp);
+        match load_registry(&stack) {
+            Ok(_) => panic!("{tag}: a wait recorded at {stamp} loaded as sound"),
+            Err(error) => assert!(
+                error.message().contains("not a timestamp"),
+                "{tag}: {}",
+                error.message()
+            ),
+        }
+    }
+    // The same shapes inside their ranges load as sound, so the
+    // refusal above names the range and not the shape.
+    for (tag, stamp) in [
+        ("offset-in-range-extended", "2026-11-02T10:00:00+05:59"),
+        ("offset-in-range-basic", "2026-11-02T10:00:00+050059"),
+    ] {
+        let stack = default_stack(tag);
+        inject_waits(&stack, &[staged_wait("waiter", "plain", None)]);
+        rewrite_recorded_at(&stack, "waiter", stamp);
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(data.waits.len(), 1, "{tag}");
+        assert_eq!(data.waits[0].recorded_at, stamp, "{tag}");
+    }
+}
+
+#[test]
+fn a_wait_bound_past_the_largest_the_library_names_is_refused_at_the_parser() {
+    let stack = cli_stack("cli-bound-past-largest", 1);
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, _) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
+    assert_eq!(code, 0);
+    // A bound past the largest the library records refuses at
+    // exit 2 instead of standing recorded at a clamped value,
+    // however the caller wrote it.
+    for bound in [
+        "9223372036854775808",
+        "18446744073709551616",
+        "99999999999999999999999999999999999999999999",
+    ] {
+        let (code, _, err) = run_cli(&[
+            "claim",
+            "--stack",
+            &stack_arg,
+            "waiter",
+            "--wait",
+            "--wait-for",
+            bound,
+        ]);
+        assert_eq!(code, 2, "{bound}: {err}");
+        assert!(err.contains("--wait-for"), "{bound}: {err}");
+    }
+    // The largest itself still records exactly as named.
+    let (code, out, err) = run_cli(&[
+        "claim",
+        "--stack",
+        &stack_arg,
+        "waiter",
+        "--wait",
+        "--wait-for",
+        "9223372036854775807",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("waiting waiter"), "{out}");
+    let data = load_registry(&stack).unwrap();
+    assert_eq!(data.waits.len(), 1);
+    assert_eq!(data.waits[0].wait_for, Some(9223372036854775807));
+}
