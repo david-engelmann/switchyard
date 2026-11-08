@@ -712,29 +712,36 @@ fn two_waiting_claims_for_one_draw_allocate_and_wait_in_arrival_order() {
 /// A transport that takes the free ranges with plain claims
 /// while the scoring consultation of a routed claim stands open,
 /// so the third phase finds the settled draw gone.
-struct TakeRangesOnScoreTransport {
+struct TakeRangesOnRouteTransport {
     stack: PathBuf,
     fired: RefCell<bool>,
 }
 
-impl JudgeTransport for TakeRangesOnScoreTransport {
+impl JudgeTransport for TakeRangesOnRouteTransport {
     fn consult(&self, request: &str) -> Result<String, String> {
         if request.contains("\"profile\"") {
+            if !*self.fired.borrow() {
+                *self.fired.borrow_mut() = true;
+                claim(&self.stack, "racer-one").map_err(|error| error.message().to_string())?;
+                claim(&self.stack, "racer-two").map_err(|error| error.message().to_string())?;
+            }
             return Ok(verdict_body("standard", 0.9));
-        }
-        if !*self.fired.borrow() {
-            *self.fired.borrow_mut() = true;
-            claim(&self.stack, "racer-one").map_err(|error| error.message().to_string())?;
-            claim(&self.stack, "racer-two").map_err(|error| error.message().to_string())?;
         }
         Ok(score_body("4", 0.8))
     }
 }
 
+// Repair record for the PR 10 review round. A routed waiting claim now
+// makes its allocation check under the lock as soon as routing settles
+// and before any scoring consultation, so the race this pin stages is
+// staged on the routing consultation, the one that now precedes the
+// check. Every assertion below stands exactly as it stood before the
+// repair, when the race was staged on the scoring consultation.
+
 #[test]
-fn a_routed_waiting_claim_whose_settled_draw_is_taken_during_scoring_waits_with_its_score() {
+fn a_routed_waiting_claim_whose_settled_draw_is_taken_during_routing_waits_with_its_score() {
     let stack = stack_with("envelope-raced", 20000, 10, 2);
-    let transport = TakeRangesOnScoreTransport {
+    let transport = TakeRangesOnRouteTransport {
         stack: stack.clone(),
         fired: RefCell::new(false),
     };
@@ -1454,4 +1461,167 @@ fn a_judge_descendant_holding_the_pipe_open_cannot_stretch_the_consultation() {
     assert_eq!(data.waits.len(), 1);
     assert_eq!(data.waits[0].fallback, "transport");
     assert_eq!(data.waits[0].score, None);
+}
+
+// The repair pins of the PR 10 review round. Each one fails
+// against the code the review read and passes against the
+// repaired code, and each is staged from the shapes the review
+// named.
+
+#[test]
+fn a_bounded_wait_recorded_without_seconds_still_expires() {
+    for (tag, stamp) in [
+        ("expiry-no-seconds-offset", "2020-01-01T00:00+00:00"),
+        ("expiry-no-seconds-naive", "2020-01-01T00:00"),
+        ("expiry-hour-alone", "2020-01-01T00"),
+    ] {
+        let stack = default_stack(tag);
+        fill_pool(&stack);
+        waited(claim_waiting(&stack, "waiter", Some(60), None).unwrap());
+        let mut entry = staged_wait("waiter", "plain", None);
+        entry["wait_for"] = serde_json::json!(60);
+        inject_waits(&stack, &[entry]);
+        rewrite_recorded_at(&stack, "waiter", stamp);
+        waited(claim_waiting(&stack, "sweeper", None, None).unwrap());
+        let data = load_registry(&stack).unwrap();
+        assert!(
+            data.waits.iter().all(|wait| wait.agent != "waiter"),
+            "{tag}: the wait recorded at {stamp} never expired"
+        );
+        let queue_log = read_queue_log(&stack);
+        let expired: Vec<&serde_json::Value> = queue_log
+            .iter()
+            .filter(|line| line["kind"] == "expired" && line["agent"] == "waiter")
+            .collect::<Vec<_>>();
+        assert_eq!(expired.len(), 1, "{tag}");
+    }
+}
+
+#[test]
+fn a_wait_whose_furnishing_fails_is_skipped_and_the_release_still_serves() {
+    let stack = stack_with("offer-blocked", 20000, 10, 1);
+    claim(&stack, "holder").unwrap();
+    // A residual branch standing in the name the blocked wait
+    // would take, the leavings of a claim that died before its
+    // save, so the offer to that wait can never be furnished.
+    let repo = stack.join("repo");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "branch",
+            "switchyard/blocked",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    inject_waits(
+        &stack,
+        &[
+            staged_wait("blocked", "plain", None),
+            staged_wait("leaner", "plain", None),
+        ],
+    );
+    let outcome = release(&stack, "holder").unwrap();
+    assert!(matches!(outcome, ReleaseOutcome::Claim(_)));
+    let data = load_registry(&stack).unwrap();
+    assert!(!data.claims.contains_key("holder"));
+    assert!(data.claims.contains_key("leaner"));
+    assert_eq!(data.waits.len(), 1);
+    assert_eq!(data.waits[0].agent, "blocked");
+    assert!(stack.join("worktrees/leaner").exists());
+    let lines = read_queue_log(&stack);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["kind"] == "furnished" && line["agent"] == "leaner"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_release_that_fails_after_an_offer_rolls_the_offer_back() {
+    let stack = stack_with("offer-rollback", 20000, 10, 1);
+    claim(&stack, "holder").unwrap();
+    inject_waits(&stack, &[staged_wait("leaner", "plain", None)]);
+    // The queue log path stands as a directory, so the leavings
+    // append after the offer is furnished fails, and the release
+    // must undo the offer rather than leave its worktree and
+    // branch standing with no registry record behind them.
+    std::fs::create_dir(stack.join(QUEUE_LOG_NAME)).unwrap();
+    release(&stack, "holder").expect_err("the leavings append cannot write to a directory");
+    assert!(!stack.join("worktrees/leaner").exists());
+    let repo = stack.join("repo");
+    let listed = Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "branch",
+            "--list",
+            "switchyard/leaner",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+        "the rolled back offer left its branch standing"
+    );
+    let data = load_registry(&stack).unwrap();
+    assert!(data.claims.contains_key("holder"));
+    assert_eq!(data.waits.len(), 1);
+    std::fs::remove_dir(stack.join(QUEUE_LOG_NAME)).unwrap();
+    release(&stack, "holder").unwrap();
+    let data = load_registry(&stack).unwrap();
+    assert!(data.claims.contains_key("leaner"));
+    assert!(data.waits.is_empty());
+}
+
+/// A transport that answers the routing question with a verdict
+/// and the scoring question with a score, recording the order
+/// the consultations arrived in.
+struct RoutedCountingTransport {
+    kinds: RefCell<Vec<&'static str>>,
+}
+
+impl JudgeTransport for RoutedCountingTransport {
+    fn consult(&self, request: &str) -> Result<String, String> {
+        if request.contains("\"profile\"") {
+            self.kinds.borrow_mut().push("routing");
+            Ok(verdict_body("standard", 0.9))
+        } else {
+            self.kinds.borrow_mut().push("scoring");
+            Ok(score_body("5", 0.9))
+        }
+    }
+}
+
+#[test]
+fn a_routed_waiting_claim_that_allocates_spends_no_scoring_consultation() {
+    let stack = default_stack("routed-allocates-unscored");
+    let transport = RoutedCountingTransport {
+        kinds: RefCell::new(Vec::new()),
+    };
+    let record = claimed(
+        claim_routed_waiting(
+            &stack,
+            "routed",
+            "Run the web app and its API while I fix the checkout flow.",
+            Profile::Lean,
+            Some(&transport),
+            None,
+        )
+        .unwrap(),
+    );
+    assert_eq!((record.port_start, record.port_end), (20000, 20019));
+    assert_eq!(*transport.kinds.borrow(), vec!["routing"]);
+    let data = load_registry(&stack).unwrap();
+    assert!(data.waits.is_empty());
+    let lines = read_routing_log(&stack);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["allocated"], "standard");
+    assert!(!stack.join(QUEUE_LOG_NAME).exists());
 }
