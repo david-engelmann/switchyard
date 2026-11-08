@@ -68,16 +68,14 @@ fn free_slot_indices(free_runs: &[i64]) -> Vec<i64> {
     let mut layout: Vec<bool> = Vec::new();
     let mut remaining_taken = taken_total;
     for (index, run) in free_runs.iter().enumerate() {
-        for _ in 0..*run {
-            layout.push(true);
-        }
+        layout.resize(layout.len() + (*run).max(0) as usize, true);
         if index + 1 < free_runs.len() {
             layout.push(false);
             remaining_taken -= 1;
         }
     }
-    for _ in 0..remaining_taken {
-        layout.push(false);
+    if remaining_taken > 0 {
+        layout.resize(layout.len() + remaining_taken as usize, false);
     }
     layout
         .iter()
