@@ -1,14 +1,14 @@
 # Switchyard roadmap
 
-Switchyard furnishes the box. It gives every parallel agent its own branch, port range, database, and env file with one command, and it stands at 3 of 100 closed rounds, with claim and list and release landed in Round 1 over one registry file. The deterministic core deepens first. The wait queue, declared allocation profiles, and everything in the decision model section below enter only behind that core, each in its own round under the same review discipline as Round 1. The routing slice landed in PR 8 and Round 3 closed with it.
+Switchyard furnishes the box. It gives every parallel agent its own branch, port range, database, and env file with one command, and it stands at 4 of 100 closed rounds, with claim and list and release landed in Round 1 over one registry file. The deterministic core deepens first. The wait queue, declared allocation profiles, and everything in the decision model section below enter only behind that core, each in its own round under the same review discipline as Round 1. The routing slice landed in PR 8 and Round 3 closed with it. The wait queue landed in PR 10 and Round 4 closed with it.
 
 ## Decision models
 
 Judgment enters switchyard at exactly two edges, and nowhere else.
 
-An intent level request is the first edge. A claim today is fully specified by its caller. A later slice lets an agent describe the job in prose instead, and a decision model maps that description to one of the declared allocation profiles. The model returns a choice among the profiles the repo declares, and the deterministic layer validates the choice and allocates exactly as it does today.
+An intent level request is the first edge. A claim today is fully specified by its caller. A routed claim lets an agent describe the job in prose instead, and a decision model maps that description to one of the declared allocation profiles. The model returns a choice among the profiles the repo declares, and the deterministic layer validates the choice and allocates exactly as it does today.
 
-Contention is the second edge. When the port pool is exhausted, a later slice adds a wait queue, and released ranges become the scarce resource. The model scores each waiting request, and the deterministic queue orders by that score rather than by arrival alone. A score is advice to an ordering rule, never an allocation.
+Contention is the second edge. When the port pool is exhausted, the wait queue holds the claims whose draw does not stand free, and released ranges become the scarce resource. The model scores each waiting request, and the deterministic queue orders by that score rather than by arrival alone. A score is advice to an ordering rule, never an allocation.
 
 The model is Typesafe Jev, reached only through the program's Typesafe connector route, which is a System One decision model returning a typed choice or a score with a calibrated confidence and per label probabilities. The OpenAI decision model is the named comparison point. The same recorded vignettes are scored by both models in evaluation, and wiring the comparison model waits on a route and a budget set at program level.
 
