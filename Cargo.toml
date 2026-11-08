@@ -7,7 +7,7 @@ resolver = "2"
 name = "switchyard"
 version = "0.1.0"
 edition = "2021"
-description = "A worktree and port orchestrator that gives every parallel agent its own branch, port range, database, and env file with one command"
+description = "Switchyard furnishes isolated workspaces for parallel agents, each a worktree on its own branch with its own port range, database, and env file, and it routes claims by job description and queues the claims that must wait."
 license = "MIT"
 
 [lib]
