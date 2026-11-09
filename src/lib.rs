@@ -4411,4 +4411,164 @@ mod tests {
             Some(days_from_civil(2026, 11, 2) as i128 * 86_400_000_000)
         );
     }
+
+    /// A registry save staged to fail, for the queue log bound
+    /// pins below. The appends of SY-23 stand before the publish,
+    /// so a claim driven with this saver leaves its queue lines
+    /// standing for state that was never published.
+    fn failing_saver(_stack: &Path, _data: &Registry) -> Result<()> {
+        Err(Error::plain("the save is staged to fail in this test"))
+    }
+
+    fn read_queue_lines(stack: &Path) -> Vec<serde_json::Value> {
+        let text = fs::read_to_string(stack.join(QUEUE_LOG_NAME)).unwrap();
+        text.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn unit_stack(tag: &str) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("switchyard-unit-test-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        init_stack(&stack, 20000, 10, 2).unwrap();
+        (dir, stack)
+    }
+
+    /// The bound the Round 5 amendment records beside SY-23,
+    /// first half. A publish that fails after its appends leaves
+    /// the queued line standing, and the leftover line changes no
+    /// later outcome, and where the wait later joins in truth and
+    /// leaves, its leaving line recovers the digest of its own
+    /// genuine joining line and never the leftover's.
+    #[test]
+    fn a_leftover_queued_line_yields_to_the_genuine_joining_line() {
+        let (dir, stack) = unit_stack("leftover-queued");
+        claim(&stack, "holder-0").unwrap();
+        claim(&stack, "holder-1").unwrap();
+        let error = claim_waiting_with(&stack, "w1", None, None, &ProcessGit, &failing_saver)
+            .expect_err("the staged save must fail after the append");
+        assert!(
+            error.message().contains("staged to fail"),
+            "{}",
+            error.message()
+        );
+        let data = load_registry(&stack).unwrap();
+        assert!(data.waits.is_empty());
+        let lines = read_queue_lines(&stack);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["kind"], "queued");
+        assert_eq!(lines[0]["agent"], "w1");
+        let leftover_digest = lines[0]["request_sha256"].as_str().unwrap().to_string();
+        assert_eq!(
+            lines[0]["request_bytes"],
+            serde_json::json!(scoring_request("plain", 1, &[], &[], None, None).len())
+        );
+        // Stand a roomy wait, so the vignette of the genuine
+        // attempt counts a standing wait the leftover attempt
+        // never saw, and free one range behind it.
+        let freed = claim_profile_waiting(&stack, "w0", Profile::Roomy, None, None).unwrap();
+        assert!(matches!(freed, ClaimOutcome::Wait(_)));
+        release(&stack, "holder-1").unwrap();
+        let before = load_registry(&stack).unwrap();
+        let genuine_request =
+            scoring_request("plain", 1, &before.waits, &free_runs(&before), None, None);
+        let genuine_digest = sha256_hex(genuine_request.as_bytes());
+        assert_ne!(genuine_digest, leftover_digest);
+        let waited = claim_waiting(&stack, "w1", None, None).unwrap();
+        assert!(matches!(waited, ClaimOutcome::Wait(_)));
+        release(&stack, "holder-0").unwrap();
+        let lines = read_queue_lines(&stack);
+        let furnished: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "furnished" && line["agent"] == "w1")
+            .collect();
+        assert_eq!(furnished.len(), 1);
+        assert_eq!(
+            furnished[0]["request_sha256"],
+            serde_json::json!(genuine_digest)
+        );
+        let data = load_registry(&stack).unwrap();
+        assert!(data.claims.contains_key("w1"));
+        assert_eq!(data.waits.len(), 1);
+        assert_eq!(data.waits[0].agent, "w0");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The bound the Round 5 amendment records beside SY-23,
+    /// second half. A leftover leaving line, appended by an act
+    /// whose publish then failed, for a wait that still stands,
+    /// removes that wait's digest from the recovery of SY-23, so
+    /// the genuine leaving line of that wait carries its digest
+    /// fields as null rather than as a digest it did not
+    /// recover, and no outcome of any act changes for it.
+    #[test]
+    fn a_leftover_leaving_line_costs_the_genuine_leaving_line_its_digest() {
+        let (dir, stack) = unit_stack("leftover-leaving");
+        claim(&stack, "holder-0").unwrap();
+        claim(&stack, "holder-1").unwrap();
+        let waited = claim_waiting(&stack, "w1", Some(60), None).unwrap();
+        assert!(matches!(waited, ClaimOutcome::Wait(_)));
+        let lines = read_queue_lines(&stack);
+        assert_eq!(lines.len(), 1);
+        let digest = lines[0]["request_sha256"].as_str().unwrap().to_string();
+        // Move the wait's recorded instant behind its bound, so
+        // the next act sweeps it as expired.
+        let path = stack.join(REGISTRY_NAME);
+        let text = fs::read_to_string(&path).unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        document["waits"][0]["recorded_at"] = "2026-11-02T00:00:00+00:00".into();
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&document).unwrap() + "\n",
+        )
+        .unwrap();
+        // An act whose sweep appends the expired line and whose
+        // publish then fails, leaving the line standing for a
+        // wait the registry still holds.
+        let error = claim_waiting_with(&stack, "w2", None, None, &ProcessGit, &failing_saver)
+            .expect_err("the staged save must fail after the appends");
+        assert!(
+            error.message().contains("staged to fail"),
+            "{}",
+            error.message()
+        );
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(data.waits.len(), 1);
+        assert_eq!(data.waits[0].agent, "w1");
+        let lines = read_queue_lines(&stack);
+        let leftover: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "expired" && line["agent"] == "w1")
+            .collect();
+        assert_eq!(leftover.len(), 1);
+        assert_eq!(leftover[0]["request_sha256"], serde_json::json!(digest));
+        // The genuine leaving, in a later release. The second
+        // wait was never published, so it stands nowhere, and a
+        // fresh claim by its agent takes the freed range at
+        // once, which is the outcome the leftover lines were
+        // never going to change.
+        let outcome = release(&stack, "holder-0").unwrap();
+        assert!(matches!(outcome, ReleaseOutcome::Claim(_)));
+        let data = load_registry(&stack).unwrap();
+        assert!(!data.claims.contains_key("holder-0"));
+        assert!(data.waits.is_empty());
+        let record = claim(&stack, "w2").unwrap();
+        assert_eq!((record.port_start, record.port_end), (20000, 20009));
+        let lines = read_queue_lines(&stack);
+        let expired: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "expired" && line["agent"] == "w1")
+            .collect();
+        assert_eq!(expired.len(), 2);
+        assert_eq!(
+            expired[1]["request_sha256"],
+            serde_json::Value::Null,
+            "{expired:?}"
+        );
+        assert_eq!(expired[1]["request_bytes"], serde_json::Value::Null);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

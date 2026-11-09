@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use switchyard::{
     claim, claim_profile, claim_profile_waiting, claim_routed_waiting, claim_waiting, init_stack,
-    list_waits, load_registry, release, scoring_request, sha256_hex, ClaimOutcome,
+    list_waits, load_registry, release, release_report, scoring_request, sha256_hex, ClaimOutcome,
     FixtureTransport, JudgeTransport, Profile, ReleaseOutcome, Wait, QUEUE_LOG_NAME, REGISTRY_NAME,
     ROUTING_LOG_NAME,
 };
@@ -1707,4 +1707,107 @@ fn a_wait_bound_past_the_largest_the_library_names_is_refused_at_the_parser() {
     let data = load_registry(&stack).unwrap();
     assert_eq!(data.waits.len(), 1);
     assert_eq!(data.waits[0].wait_for, Some(9223372036854775807));
+}
+
+// The furnishing failure trace of obligation SY-25. The staging
+// of the blocked wait is the standing skip pin's staging, a
+// residual branch standing in the name the wait would take, so
+// the offer to it can never be furnished.
+
+fn plant_blocking_branch(stack: &Path) {
+    let repo = stack.join("repo");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "branch",
+            "switchyard/blocked",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_furnishing_failure_is_reported_beside_the_release_outcome() {
+    let stack = stack_with("offer-traced", 20000, 10, 1);
+    claim(&stack, "holder").unwrap();
+    plant_blocking_branch(&stack);
+    inject_waits(
+        &stack,
+        &[
+            staged_wait("blocked", "plain", None),
+            staged_wait("leaner", "plain", None),
+        ],
+    );
+    let report = release_report(&stack, "holder").unwrap();
+    assert!(matches!(report.outcome, ReleaseOutcome::Claim(_)));
+    assert_eq!(report.furnishing_failures.len(), 1);
+    assert_eq!(report.furnishing_failures[0].agent, "blocked");
+    assert!(!report.furnishing_failures[0].message.is_empty());
+    let data = load_registry(&stack).unwrap();
+    assert!(data.claims.contains_key("leaner"));
+    assert_eq!(data.waits.len(), 1);
+    assert_eq!(data.waits[0].agent, "blocked");
+}
+
+#[test]
+fn a_wait_skipped_for_its_draw_carries_no_furnishing_failure() {
+    let stack = stack_with("offer-untraced", 20000, 10, 2);
+    claim(&stack, "holder").unwrap();
+    inject_waits(
+        &stack,
+        &[
+            staged_wait("big", "roomy", None),
+            staged_wait("small", "plain", None),
+        ],
+    );
+    let report = release_report(&stack, "holder").unwrap();
+    assert!(matches!(report.outcome, ReleaseOutcome::Claim(_)));
+    assert!(
+        report.furnishing_failures.is_empty(),
+        "{:?}",
+        report.furnishing_failures
+    );
+    let data = load_registry(&stack).unwrap();
+    assert!(data.claims.contains_key("small"));
+    assert_eq!(data.waits.len(), 1);
+    assert_eq!(data.waits[0].agent, "big");
+}
+
+#[test]
+fn a_release_that_cancels_a_wait_reports_no_furnishing_failure() {
+    let stack = stack_with("offer-cancel-untraced", 20000, 10, 1);
+    inject_waits(&stack, &[staged_wait("waiter", "plain", None)]);
+    let report = release_report(&stack, "waiter").unwrap();
+    assert!(matches!(report.outcome, ReleaseOutcome::Wait(_)));
+    assert!(report.furnishing_failures.is_empty());
+}
+
+#[test]
+fn the_release_command_prints_each_furnishing_failure_on_its_error_output() {
+    let stack = cli_stack("cli-traced", 1);
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, err) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
+    assert_eq!(code, 0, "{err}");
+    plant_blocking_branch(&stack);
+    inject_waits(
+        &stack,
+        &[
+            staged_wait("blocked", "plain", None),
+            staged_wait("leaner", "plain", None),
+        ],
+    );
+    let (code, out, err) = run_cli(&["release", "--stack", &stack_arg, "holder"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("released holder"), "{out}");
+    assert!(
+        err.contains("the wait of agent blocked was skipped, furnishing it failed"),
+        "{err}"
+    );
+    assert!(!err.contains("leaner"), "{err}");
 }
