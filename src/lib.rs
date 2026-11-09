@@ -4468,10 +4468,10 @@ mod tests {
         );
         // Stand a roomy wait, so the vignette of the genuine
         // attempt counts a standing wait the leftover attempt
-        // never saw, and free one range behind it.
+        // never saw. The pool stays full, so the genuine
+        // attempt waits as well, on its own request bytes.
         let freed = claim_profile_waiting(&stack, "w0", Profile::Roomy, None, None).unwrap();
         assert!(matches!(freed, ClaimOutcome::Wait(_)));
-        release(&stack, "holder-1").unwrap();
         let before = load_registry(&stack).unwrap();
         let genuine_request =
             scoring_request("plain", 1, &before.waits, &free_runs(&before), None, None);
