@@ -211,7 +211,7 @@ What is not built. Claims do not expire. A claim stands until its agent is relea
 
 The contract lives in CONTRACT.md and carries the setup obligations S1 to S5 and the Round 1 feature obligations SY-1 to SY-10 and the Round 3 routing amendment adding obligations SY-11 to SY-16 and the Round 4 wait queue amendment adding obligations SY-17 to SY-24. The registry document and the routing and queue logs are contract surfaces specified there, and the registry shape the retired Python implementation wrote is carried in tests as fixtures the Rust suite reads. The Rust test suite carries 153 root tests across every operation and the Python binding smoke test carries 11, and both suites pass on the current head with the binding built the way CI builds it.
 
-Closed perfection rounds are 4 of 100. A round closes only when its full cycle of work and audit and review and red team and approval has run. The program began as a seed commit whose state is independently verifiable against e7e7d53dcd4d41fe5b46d0c51f1808872ff133fb.
+Closed perfection rounds are 5 of 100. A round closes only when its full cycle of work and audit and review and red team and approval has run. The program began as a seed commit whose state is independently verifiable against e7e7d53dcd4d41fe5b46d0c51f1808872ff133fb.
 
 ## License
 
