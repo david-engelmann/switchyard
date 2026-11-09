@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     claim, claim_profile, claim_profile_waiting, claim_routed, claim_routed_waiting, claim_waiting,
-    init_stack, list_claims, list_waits, profile_named, release, resolve_path, ClaimOutcome,
+    init_stack, list_claims, list_waits, profile_named, release_report, resolve_path, ClaimOutcome,
     JudgeTransport, Record, ReleaseOutcome, Result, Wait, DEFAULT_PORT_START, DEFAULT_RANGE_COUNT,
     DEFAULT_RANGE_SIZE, JUDGE_TIMEOUT_SECONDS,
 };
@@ -653,8 +653,8 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 })
             }
         }
-        "release" => {
-            release(&stack, parsed.agent.as_deref().unwrap()).map(|outcome| match outcome {
+        "release" => release_report(&stack, parsed.agent.as_deref().unwrap()).map(|report| {
+            match report.outcome {
                 ReleaseOutcome::Claim(record) => {
                     let _ = writeln!(out, "released {}", record.agent);
                     let _ = writeln!(
@@ -667,8 +667,15 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                     let _ = writeln!(out, "released {}", wait.agent);
                     let _ = writeln!(out, "wait cancelled");
                 }
-            })
-        }
+            }
+            for failure in &report.furnishing_failures {
+                let _ = writeln!(
+                    err,
+                    "note: the wait of agent {} was skipped, furnishing it failed, {}",
+                    failure.agent, failure.message
+                );
+            }
+        }),
         _ => unreachable!(),
     };
     match result {

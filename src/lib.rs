@@ -2330,10 +2330,28 @@ pub enum ReleaseOutcome {
     Wait(Wait),
 }
 
+/// One wait a release skipped because furnishing it failed,
+/// with the failure the furnishing returned after it rolled
+/// itself back, under obligation SY-25. A wait skipped because
+/// its draw did not stand free is not one of these, because
+/// SY-21 names that skip in the offer rule itself, and the trace
+/// of SY-25 exists to separate the two skips.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FurnishingFailure {
+    pub agent: String,
+    pub message: String,
+}
+
 /// What serving the standing waits in a release returns, the
 /// waits furnished in offer order and the port span each
-/// furnished claim took, keyed by agent.
-type OfferOutcome = (Vec<Wait>, BTreeMap<String, (i64, i64)>, Vec<Furnished>);
+/// furnished claim took, keyed by agent, and the furnishing
+/// failures the offers met, in offer order.
+type OfferOutcome = (
+    Vec<Wait>,
+    BTreeMap<String, (i64, i64)>,
+    Vec<Furnished>,
+    Vec<FurnishingFailure>,
+);
 
 /// Serve the standing waits of a release whose claim's removal
 /// already stands computed in the registry, in offer order, under
@@ -2344,12 +2362,15 @@ type OfferOutcome = (Vec<Wait>, BTreeMap<String, (i64, i64)>, Vec<Furnished>);
 /// and does not block the waits behind it. A wait whose
 /// furnishing itself fails is skipped the same way, the
 /// furnishing having rolled itself back, so one unfurnishable
-/// wait can never wedge the release or the queue behind it.
-/// Returns the waits furnished, in offer order, with the span
-/// each furnished claim took and the furnishings themselves, for
-/// the caller's rollback if a later step of the release fails,
-/// and the registry carries every furnishing at once, for the
-/// caller's one publish.
+/// wait can never wedge the release or the queue behind it, and
+/// the failure is returned beside the furnishings under SY-25,
+/// naming the agent and the failure the furnishing returned, so
+/// the skip stands told from a skip for a draw that did not
+/// stand free. Returns the waits furnished, in offer order, with
+/// the span each furnished claim took and the furnishings
+/// themselves, for the caller's rollback if a later step of the
+/// release fails, and the registry carries every furnishing at
+/// once, for the caller's one publish.
 fn serve_offers(
     data: &mut Registry,
     stack: &Path,
@@ -2359,6 +2380,7 @@ fn serve_offers(
     let mut furnished: Vec<Wait> = Vec::new();
     let mut offers: Vec<Furnished> = Vec::new();
     let mut spans: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut failures: Vec<FurnishingFailure> = Vec::new();
     for wait in offer_order(&data.waits) {
         let draw = settled_draw(&wait.profile);
         if free_run(data, draw).is_none() {
@@ -2366,7 +2388,13 @@ fn serve_offers(
         }
         let done = match furnish_claim(data, stack, &wait.agent, draw, instant, git) {
             Ok(done) => done,
-            Err(_) => continue,
+            Err(exc) => {
+                failures.push(FurnishingFailure {
+                    agent: wait.agent.clone(),
+                    message: exc.message().to_string(),
+                });
+                continue;
+            }
         };
         spans.insert(
             wait.agent.clone(),
@@ -2380,7 +2408,7 @@ fn serve_offers(
         data.waits
             .retain(|wait| !done.contains(wait.agent.as_str()));
     }
-    Ok((furnished, spans, offers))
+    Ok((furnished, spans, offers, failures))
 }
 
 /// Roll back every offer a release furnished, when a step after
@@ -2423,6 +2451,33 @@ pub fn release(stack: &Path, agent: &str) -> Result<ReleaseOutcome> {
 }
 
 fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<ReleaseOutcome> {
+    Ok(release_report_with(stack, agent, git)?.outcome)
+}
+
+/// What a release did, with the furnishing failures its offers
+/// met standing beside the outcome, under obligation SY-25. A
+/// release that met no furnishing failure carries an empty list,
+/// and a release that cancelled a wait carries an empty list,
+/// because a cancellation makes no offers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReleaseReport {
+    /// The outcome the plain release returns.
+    pub outcome: ReleaseOutcome,
+    /// The waits the offers skipped because furnishing them
+    /// failed, in offer order.
+    pub furnishing_failures: Vec<FurnishingFailure>,
+}
+
+/// Return every resource a claim holds as release does, and
+/// report the furnishing failures its offers met beside the
+/// outcome, for callers that print them. The release performed
+/// is the one release performs, and this entry point adds no
+/// behaviour of its own.
+pub fn release_report(stack: &Path, agent: &str) -> Result<ReleaseReport> {
+    release_report_with(stack, agent, &ProcessGit)
+}
+
+fn release_report_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<ReleaseReport> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     let repo = stack.join(REPO_NAME);
@@ -2447,7 +2502,7 @@ fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<Releas
             git_checked(git, &repo, &["branch", "-D", &record.branch])?;
         }
         data.claims.remove(agent);
-        let (furnished, spans, offers) = serve_offers(&mut data, &stack, &instant, git)?;
+        let (furnished, spans, offers, failures) = serve_offers(&mut data, &stack, &instant, git)?;
         let published = (|| -> Result<()> {
             append_leavings(&stack, &instant, "expired", &expired, None)?;
             append_leavings(&stack, &instant, "furnished", &furnished, Some(&spans))?;
@@ -2458,7 +2513,10 @@ fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<Releas
         if let Err(exc) = published {
             return Err(rollback_offers(git, &stack, &offers, exc));
         }
-        return Ok(ReleaseOutcome::Claim(record));
+        return Ok(ReleaseReport {
+            outcome: ReleaseOutcome::Claim(record),
+            furnishing_failures: failures,
+        });
     }
     if let Some(wait) = data.waits.iter().find(|wait| wait.agent == agent).cloned() {
         data.waits.retain(|standing| standing.agent != agent);
@@ -2472,7 +2530,10 @@ fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<Releas
         )?;
         lock.verify_current()?;
         save_registry(&stack, &data)?;
-        return Ok(ReleaseOutcome::Wait(wait));
+        return Ok(ReleaseReport {
+            outcome: ReleaseOutcome::Wait(wait),
+            furnishing_failures: Vec::new(),
+        });
     }
     Err(Error::plain(format!(
         "agent {agent} holds no claim in this stack"
@@ -3798,6 +3859,134 @@ fn claim_waiting_core(
     Ok(ClaimOutcome::Wait(wait))
 }
 
+/// The registry as one under-lock phase of the routed waiting
+/// envelope leaves it where the settled draw did not stand free,
+/// carried out of the phase under its lock, with the instant of
+/// the phase and the waits its sweep expired, for the caller to
+/// build its scoring request from or to record its wait into.
+struct RoutedStanding {
+    lock: Locked,
+    data: Registry,
+    instant: String,
+    expired: Vec<Wait>,
+}
+
+/// The settled outcome of one under-lock phase of the routed
+/// waiting envelope, the claim where the phase allocated and
+/// the standing registry where it did not.
+enum RoutedPhase {
+    Allocated(Record),
+    Standing(RoutedStanding),
+}
+
+/// One under-lock phase of the routed waiting envelope of
+/// SY-19, the one phase both under-lock phases of
+/// claim_routed_waiting_with run, the allocation recheck after
+/// the routing consultation and the third phase after the
+/// scoring consultation. The phase takes the lock and loads the
+/// registry and verifies the stack repository and sweeps
+/// expired waits and makes the duplicate check and the queue
+/// bound check and the allocation check, in the landed order,
+/// and every refusal appends its routing line before it
+/// returns, under SY-15. Where the settled draw stands free the
+/// phase allocates from that point exactly as the same claim
+/// allocates without the wait option and returns the claim, and
+/// where it does not the phase returns the standing registry.
+#[allow(clippy::too_many_arguments)]
+fn routed_waiting_phase(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    settled: Profile,
+    model: &Option<String>,
+    verdict: &Option<String>,
+    confidence: Option<f64>,
+    fallback: Fallback,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<RoutedPhase> {
+    let lock = locked(stack)?;
+    let mut data = match load_registry(stack) {
+        Ok(data) => data,
+        Err(exc) => {
+            refuse_after_consultation(
+                stack,
+                agent,
+                description,
+                model,
+                verdict,
+                confidence,
+                fallback,
+                "corrupt",
+            )?;
+            return Err(exc);
+        }
+    };
+    if let Err(exc) = verify_own_repo(git, stack) {
+        refuse_after_consultation(
+            stack,
+            agent,
+            description,
+            model,
+            verdict,
+            confidence,
+            fallback,
+            "repo",
+        )?;
+        return Err(exc);
+    }
+    let instant = now_stamp();
+    let expired = sweep_expired(&mut data, &instant);
+    if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
+        refuse_after_consultation(
+            stack,
+            agent,
+            description,
+            model,
+            verdict,
+            confidence,
+            fallback,
+            "duplicate",
+        )?;
+        return Err(standing_claim_error(agent));
+    }
+    if data.waits.len() >= QUEUE_BOUND {
+        let mut line = RoutingLine::new(agent, description, model.clone());
+        line.verdict = verdict.clone();
+        line.confidence = confidence;
+        line.fallback = fallback;
+        line.refusal = Some("queue full".to_string());
+        line.append(stack)?;
+        return Err(queue_full_error());
+    }
+    if free_run(&data, settled.draw()).is_some() {
+        let mut line = RoutingLine::new(agent, description, model.clone());
+        line.verdict = verdict.clone();
+        line.confidence = confidence;
+        line.fallback = fallback;
+        line.allocated = Some(settled.name().to_string());
+        let record = allocate_locked(AllocParts {
+            stack,
+            agent,
+            draw: settled.draw(),
+            data,
+            lock: &lock,
+            git,
+            saver,
+            routing: Some(&line),
+            expired,
+            instant,
+        })?;
+        return Ok(RoutedPhase::Allocated(record));
+    }
+    Ok(RoutedPhase::Standing(RoutedStanding {
+        lock,
+        data,
+        instant,
+        expired,
+    }))
+}
+
 /// Allocate a routed claim that waits where its settled draw
 /// does not stand free, under the waiting envelope of obligation
 /// SY-19. A routed claim refused in the first phase because no
@@ -3871,82 +4060,20 @@ fn claim_routed_waiting_with(
     // that does not wait, exactly as SY-17 and SY-20 stand. The
     // snapshot the scoring request is built from is taken here,
     // from the registry as it stands at this check.
-    let snapshot = {
-        let lock = locked(&stack)?;
-        let mut data = match load_registry(&stack) {
-            Ok(data) => data,
-            Err(exc) => {
-                refuse_after_consultation(
-                    &stack,
-                    agent,
-                    description,
-                    &model,
-                    &verdict,
-                    confidence,
-                    fallback,
-                    "corrupt",
-                )?;
-                return Err(exc);
-            }
-        };
-        if let Err(exc) = verify_own_repo(git, &stack) {
-            refuse_after_consultation(
-                &stack,
-                agent,
-                description,
-                &model,
-                &verdict,
-                confidence,
-                fallback,
-                "repo",
-            )?;
-            return Err(exc);
-        }
-        let instant = now_stamp();
-        let expired = sweep_expired(&mut data, &instant);
-        if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
-            refuse_after_consultation(
-                &stack,
-                agent,
-                description,
-                &model,
-                &verdict,
-                confidence,
-                fallback,
-                "duplicate",
-            )?;
-            return Err(standing_claim_error(agent));
-        }
-        if data.waits.len() >= QUEUE_BOUND {
-            let mut line = RoutingLine::new(agent, description, model.clone());
-            line.verdict = verdict.clone();
-            line.confidence = confidence;
-            line.fallback = fallback;
-            line.refusal = Some("queue full".to_string());
-            line.append(&stack)?;
-            return Err(queue_full_error());
-        }
-        if free_run(&data, settled.draw()).is_some() {
-            let mut line = RoutingLine::new(agent, description, model);
-            line.verdict = verdict;
-            line.confidence = confidence;
-            line.fallback = fallback;
-            line.allocated = Some(settled.name().to_string());
-            let record = allocate_locked(AllocParts {
-                stack: &stack,
-                agent,
-                draw: settled.draw(),
-                data,
-                lock: &lock,
-                git,
-                saver,
-                routing: Some(&line),
-                expired,
-                instant,
-            })?;
-            return Ok(ClaimOutcome::Claim(record));
-        }
-        (data.waits.clone(), free_runs(&data))
+    let snapshot = match routed_waiting_phase(
+        &stack,
+        agent,
+        description,
+        settled,
+        &model,
+        &verdict,
+        confidence,
+        fallback,
+        git,
+        saver,
+    )? {
+        RoutedPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
+        RoutedPhase::Standing(standing) => (standing.data.waits.clone(), free_runs(&standing.data)),
     };
     let request = scoring_request(
         settled.name(),
@@ -3957,80 +4084,27 @@ fn claim_routed_waiting_with(
         Some(description),
     );
     let outcome = settle_score(transport, &request);
-    let lock = locked(&stack)?;
-    let mut data = match load_registry(&stack) {
-        Ok(data) => data,
-        Err(exc) => {
-            refuse_after_consultation(
-                &stack,
-                agent,
-                description,
-                &model,
-                &verdict,
-                confidence,
-                fallback,
-                "corrupt",
-            )?;
-            return Err(exc);
-        }
+    let standing = match routed_waiting_phase(
+        &stack,
+        agent,
+        description,
+        settled,
+        &model,
+        &verdict,
+        confidence,
+        fallback,
+        git,
+        saver,
+    )? {
+        RoutedPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
+        RoutedPhase::Standing(standing) => standing,
     };
-    if let Err(exc) = verify_own_repo(git, &stack) {
-        refuse_after_consultation(
-            &stack,
-            agent,
-            description,
-            &model,
-            &verdict,
-            confidence,
-            fallback,
-            "repo",
-        )?;
-        return Err(exc);
-    }
-    let instant = now_stamp();
-    let expired = sweep_expired(&mut data, &instant);
-    if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
-        refuse_after_consultation(
-            &stack,
-            agent,
-            description,
-            &model,
-            &verdict,
-            confidence,
-            fallback,
-            "duplicate",
-        )?;
-        return Err(standing_claim_error(agent));
-    }
-    if data.waits.len() >= QUEUE_BOUND {
-        let mut line = RoutingLine::new(agent, description, model.clone());
-        line.verdict = verdict.clone();
-        line.confidence = confidence;
-        line.fallback = fallback;
-        line.refusal = Some("queue full".to_string());
-        line.append(&stack)?;
-        return Err(queue_full_error());
-    }
-    if free_run(&data, settled.draw()).is_some() {
-        let mut line = RoutingLine::new(agent, description, model);
-        line.verdict = verdict;
-        line.confidence = confidence;
-        line.fallback = fallback;
-        line.allocated = Some(settled.name().to_string());
-        let record = allocate_locked(AllocParts {
-            stack: &stack,
-            agent,
-            draw: settled.draw(),
-            data,
-            lock: &lock,
-            git,
-            saver,
-            routing: Some(&line),
-            expired,
-            instant,
-        })?;
-        return Ok(ClaimOutcome::Claim(record));
-    }
+    let RoutedStanding {
+        lock,
+        mut data,
+        instant,
+        expired,
+    } = standing;
     let wait = Wait {
         agent: agent.to_string(),
         profile: settled.name().to_string(),
