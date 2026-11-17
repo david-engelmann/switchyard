@@ -618,7 +618,7 @@ fn print_table(out: &mut dyn Write, records: &[Record]) -> std::io::Result<()> {
             ]
         })
         .collect();
-    print_grid(out, &header, &rows);
+    print_grid(out, &header, &rows)
 }
 
 /// Print the standing waits in offer order, the queue table of
@@ -644,7 +644,7 @@ fn print_queue_table(out: &mut dyn Write, waits: &[Wait]) -> std::io::Result<()>
             ]
         })
         .collect();
-    print_grid(out, &header, &rows);
+    print_grid(out, &header, &rows)
 }
 
 /// Render one table in the shape the claims table landed, each
