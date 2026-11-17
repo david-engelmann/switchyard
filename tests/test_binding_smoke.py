@@ -384,6 +384,6 @@ def test_a_waiting_profiled_claim_through_the_binding(tmp_path):
     switchyard.release(stack, "holder")
     claims = switchyard.list(stack)
     assert [claim["agent"] for claim in claims] == ["waiter"]
-    assert (claims[0]["first"], claims[0]["last"]) == (20000, 20019)
+    assert (claims[0]["port_start"], claims[0]["port_end"]) == (20000, 20019)
     queue = switchyard.queue(stack)
     assert [entry["agent"] for entry in queue] == ["scored"]
