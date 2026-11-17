@@ -34,6 +34,16 @@ commands:
   list     print who holds what, derived only from the registry
   release  return every resource an agent holds
 
+stack option:
+  --stack PATH             the stack root the command works on,
+                           required beside every command
+
+init options:
+  --port-start PORT        the first port of the pool, 20000 by
+                           default
+  --range-size COUNT       the ports in one range, 10 by default
+  --range-count COUNT      the ranges in the pool, 16 by default
+
 claim options:
   --profile NAME           allocate under a declared profile, one of
                            lean, standard, or roomy, with no consultation
@@ -284,7 +294,8 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
         }
         if describe.is_none() && !wait && judge_command.is_some() {
             return Err(
-                "argument --judge-command: a routed claim takes --describe beside it".to_string(),
+                "argument --judge-command: a judge command takes --describe or --wait beside it"
+                    .to_string(),
             );
         }
         if wait_for.is_some() && !wait {

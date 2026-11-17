@@ -1274,6 +1274,22 @@ fn a_failed_env_file_write_is_a_clean_error_and_rolls_back() {
 // The module entry point
 
 #[test]
+fn the_help_text_names_the_stack_option_and_the_init_options() {
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+        .args(["--help"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    for named in ["--stack", "--port-start", "--range-size", "--range-count"] {
+        assert!(
+            stdout.contains(named),
+            "the help text does not name {named}"
+        );
+    }
+}
+
+#[test]
 fn the_module_entry_point_lists_a_live_claim() {
     let stack = stack_fixture();
     claim_ok(&stack, "alpha");
