@@ -123,9 +123,8 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| PathBuf::from("."));
     match scan(&root) {
         Ok((em_count, en_count, hits)) => {
-            let output = format!(
-                "{hits}em dash U+2014 count {em_count}\nen dash U+2013 count {en_count}\n"
-            );
+            let output =
+                format!("{hits}em dash U+2014 count {em_count}\nen dash U+2013 count {en_count}\n");
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
             if let Err(err) = lock.write_all(output.as_bytes()) {

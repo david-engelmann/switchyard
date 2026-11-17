@@ -425,8 +425,5 @@ fn codepoint_scan_reports_a_failed_output_write_at_exit_2() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("cannot write the scan output"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("cannot write the scan output"), "{stderr}");
 }
