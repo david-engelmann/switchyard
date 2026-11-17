@@ -167,7 +167,10 @@ fn init(
 /// option standing, the claim waits exactly as a command line
 /// claim with --wait waits and returns the wait record where it
 /// waited, and the transport callable is consulted for the
-/// scoring question only where the claim waits.
+/// scoring question only where the claim waits. A transport
+/// supplied beside a claim that does not wait is refused by
+/// name, mirroring the command line's refusal of a judge command
+/// beside a claim that neither describes nor waits.
 #[pyfunction]
 #[pyo3(signature = (stack, agent, wait = false, wait_for = None, transport = None))]
 fn claim(
@@ -179,6 +182,9 @@ fn claim(
     transport: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyDict>> {
     let bound = wait_bound(wait, wait_for.as_ref())?;
+    if !wait && transport.is_some() {
+        return Err(RefusalError::new_err("transport stands only beside wait"));
+    }
     if !wait {
         let record = py
             .detach(|| switchyard_core::claim(&stack, agent))
@@ -206,7 +212,8 @@ fn claim(
 /// the draw of the profile. An unknown profile name is refused
 /// with the message the command line prints for it. With the wait
 /// option standing, the claim waits exactly as a command line
-/// claim with --wait waits.
+/// claim with --wait waits. A transport supplied beside a claim
+/// that does not wait is refused by name, as in claim.
 #[pyfunction]
 #[pyo3(signature = (stack, agent, profile, wait = false, wait_for = None, transport = None))]
 fn claim_profile(
@@ -219,6 +226,9 @@ fn claim_profile(
     transport: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyDict>> {
     let bound = wait_bound(wait, wait_for.as_ref())?;
+    if !wait && transport.is_some() {
+        return Err(RefusalError::new_err("transport stands only beside wait"));
+    }
     let profile = switchyard_core::profile_named(profile).map_err(to_py_error)?;
     if !wait {
         let record = py
