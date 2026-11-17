@@ -4779,10 +4779,7 @@ mod tests {
         );
         let zeros = format!("2026-11-02T10:00:00.{}Z", "0".repeat(50));
         assert!(is_valid_timestamp(&zeros));
-        assert_eq!(
-            stamp_micros(&zeros),
-            stamp_micros("2026-11-02T10:00:00Z")
-        );
+        assert_eq!(stamp_micros(&zeros), stamp_micros("2026-11-02T10:00:00Z"));
         let wait = Wait {
             agent: "waiter".to_string(),
             profile: "plain".to_string(),
