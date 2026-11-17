@@ -1250,7 +1250,19 @@ fn stamp_micros(text: &str) -> Option<i128> {
             if !byte.is_ascii_digit() {
                 break;
             }
-            value = value * 10 + (byte - b'0') as i128;
+            // Only the first six digits are accumulated, and
+            // the rest are counted and passed over. The standing
+            // division of the whole accumulation by
+            // 10^(digits - 6) yields exactly those six digits,
+            // because the remainder is smaller than the divisor,
+            // so the truncated value is the same number; and
+            // accumulating every digit overflows the i128 on a
+            // long enough fraction, 39 digits of nines being
+            // enough, in a panic under the test profile and in
+            // silence under release (SY-A41).
+            if at - start < 6 {
+                value = value * 10 + (byte - b'0') as i128;
+            }
             at += 1;
         }
         let digits = (at - start) as u32;
@@ -1260,7 +1272,7 @@ fn stamp_micros(text: &str) -> Option<i128> {
         micros = if digits <= 6 {
             value * 10_i128.pow(6 - digits)
         } else {
-            value / 10_i128.pow(digits - 6)
+            value
         };
     }
     let mut offset_seconds: i128 = 0;
@@ -4747,6 +4759,39 @@ mod tests {
     /// standing for state that was never published.
     fn failing_saver(_stack: &Path, _data: &Registry) -> Result<()> {
         Err(Error::plain("the save is staged to fail in this test"))
+    }
+
+    /// The long fraction of SY-A41. A fraction past six digits
+    /// computes the micros of its first six digits, exactly as
+    /// the standing division computed them, and a fraction far
+    /// past the width an i128 accumulation holds computes them
+    /// too, where the standing accumulation overflowed. The
+    /// grammar stands unchanged, so the validator still accepts
+    /// the shape, and the expiry comparison answers by the
+    /// truncated instant.
+    #[test]
+    fn stamp_micros_truncates_a_long_fraction_without_overflow() {
+        let nines = format!("2026-11-02T10:00:00.{}Z", "9".repeat(50));
+        assert!(is_valid_timestamp(&nines));
+        assert_eq!(
+            stamp_micros(&nines),
+            stamp_micros("2026-11-02T10:00:00.999999Z")
+        );
+        let zeros = format!("2026-11-02T10:00:00.{}Z", "0".repeat(50));
+        assert!(is_valid_timestamp(&zeros));
+        assert_eq!(stamp_micros(&zeros), stamp_micros("2026-11-02T10:00:00Z"));
+        let wait = Wait {
+            agent: "waiter".to_string(),
+            profile: "plain".to_string(),
+            recorded_at: nines,
+            wait_for: Some(1),
+            score: None,
+            confidence: None,
+            model: None,
+            fallback: "none".to_string(),
+        };
+        assert!(!wait_expired(&wait, "2026-11-02T10:00:01Z"));
+        assert!(wait_expired(&wait, "2026-11-02T10:00:02Z"));
     }
 
     fn read_queue_lines(stack: &Path) -> Vec<serde_json::Value> {
