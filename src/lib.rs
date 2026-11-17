@@ -2385,11 +2385,11 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
     } = parts;
     let furnished = furnish_claim(&mut data, stack, agent, draw, &instant, git)?;
     let attempt = (|| -> Result<()> {
-        lock.verify_current()?;
         append_leavings(stack, &instant, "expired", &expired, None)?;
         if let Some(line) = routing {
             line.append(stack)?;
         }
+        lock.verify_current()?;
         saver(stack, &data)?;
         Ok(())
     })();
