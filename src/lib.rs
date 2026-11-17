@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1556,6 +1557,27 @@ impl GitRunner for ProcessGit {
     }
 }
 
+/// Stop a spawned child and every process in its group.
+///
+/// The subprocesses this crate spawns, git here and the judge
+/// command in the CLI, are made leaders of a new process group
+/// at the spawn, so the group takes the child's own pid and the
+/// negative of that pid addresses the whole group. A timeout
+/// that killed only the child would leave its descendants
+/// standing orphaned, holding the pipes and whatever else they
+/// took, past the operation that spawned them. The direct kill
+/// stands behind the group signal for the case where the group
+/// is already gone.
+pub(crate) fn kill_process_group(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    // The child leads its process group by construction, so the
+    // negated pid names the group and nothing outside it.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
 fn run_git(
     repo: &Path,
     args: &[&str],
@@ -1564,6 +1586,8 @@ fn run_git(
 ) -> Result<GitOutput> {
     let joined = args.join(" ");
     let mut command = Command::new("git");
+    // The child leads a new process group, so the timeout below
+    // can stop the whole group and not only git itself.
     command
         .arg("-C")
         .arg(repo)
@@ -1571,7 +1595,8 @@ fn run_git(
         .env_clear()
         .envs(env.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = command
         .spawn()
         .map_err(|exc| Error::plain(format!("git {joined} could not be started, {exc}")))?;
@@ -1593,7 +1618,7 @@ fn run_git(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_process_group(&mut child);
                     let _ = child.wait();
                     // The reader threads end detached on this
                     // path. A grandchild of git can hold the
@@ -4220,6 +4245,60 @@ mod tests {
             error.message().contains("did not finish within 1 seconds"),
             "{}",
             error.message()
+        );
+    }
+
+    #[test]
+    fn a_git_call_that_times_out_stops_the_descendants_too() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-slow-git-descendant",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake_bin = dir.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let heartbeat = dir.join("heartbeat");
+        // The fake git backgrounds a loop that appends to a
+        // heartbeat file five times a second, and then waits, so
+        // the timeout stops git while its descendant stands. A
+        // kill of git alone leaves the loop appending, and this
+        // test fails against it; the group kill stops the loop,
+        // and the heartbeat stands still.
+        let staged_git = fake_bin.join("git.staged");
+        fs::write(
+            &staged_git,
+            format!(
+                "#!/bin/sh\nwhile true; do echo tick >> {}; sleep 0.2; done &\nwait\n",
+                heartbeat.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staged_git, fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_git = fake_bin.join("git");
+        fs::rename(&staged_git, &fake_git).unwrap();
+        let real_git = dir.join("repo");
+        fs::create_dir_all(&real_git).unwrap();
+        let env = vec![(
+            "PATH".to_string(),
+            format!("{}:/usr/bin:/bin", fake_bin.display()),
+        )];
+        let result = run_git(&real_git, &["status"], &env, Duration::from_secs(1));
+        let error = result.expect_err("the sleeping git must time out");
+        assert!(
+            error.message().contains("did not finish within 1 seconds"),
+            "{}",
+            error.message()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let settled = fs::metadata(&heartbeat).unwrap().len();
+        std::thread::sleep(Duration::from_millis(1500));
+        let later = fs::metadata(&heartbeat).unwrap().len();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            settled, later,
+            "the descendant of the timed out git kept running"
         );
     }
 

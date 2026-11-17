@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -343,11 +344,22 @@ impl JudgeTransport for SubprocessTransport {
 }
 
 fn run_judge_command(program: &str, request: &str) -> std::result::Result<String, String> {
-    let deadline = Instant::now() + Duration::from_secs(JUDGE_TIMEOUT_SECONDS);
+    run_judge_command_within(program, request, Duration::from_secs(JUDGE_TIMEOUT_SECONDS))
+}
+
+fn run_judge_command_within(
+    program: &str,
+    request: &str,
+    timeout: Duration,
+) -> std::result::Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    // The child leads a new process group, so the deadline below
+    // can stop the whole group and not only the judge itself.
     let mut child = Command::new(program)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|exc| format!("the judge command {program} could not be started, {exc}"))?;
     let mut stdin = child.stdin.take().unwrap();
@@ -372,10 +384,11 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    crate::kill_process_group(&mut child);
                     let _ = child.wait();
                     return Err(format!(
-                        "the judge command {program} did not finish inside the deadline of {JUDGE_TIMEOUT_SECONDS} seconds"
+                        "the judge command {program} did not finish inside the deadline of {} seconds",
+                        timeout.as_secs()
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -397,6 +410,10 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
     // wait on that descendant without limit, so a collection that
     // runs out of the time that stands is the deadline expiring,
     // judged exactly as the command running past it is judged.
+    // Judged the same way means stopped the same way too: a
+    // collection that times out stops the process group before
+    // it returns, so the descendant holding the pipe does not
+    // survive the operation that disowned it.
     let remaining = deadline.saturating_duration_since(Instant::now());
     match writer_in.recv_timeout(remaining) {
         Ok(Ok(())) => {}
@@ -406,8 +423,10 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
             ));
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            crate::kill_process_group(&mut child);
             return Err(format!(
-                "the judge command {program} did not finish inside the deadline of {JUDGE_TIMEOUT_SECONDS} seconds"
+                "the judge command {program} did not finish inside the deadline of {} seconds",
+                timeout.as_secs()
             ));
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -418,8 +437,10 @@ fn run_judge_command(program: &str, request: &str) -> std::result::Result<String
     let (read, bytes) = match reader_in.recv_timeout(remaining) {
         Ok(carried) => carried,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            crate::kill_process_group(&mut child);
             return Err(format!(
-                "the judge command {program} did not finish inside the deadline of {JUDGE_TIMEOUT_SECONDS} seconds"
+                "the judge command {program} did not finish inside the deadline of {} seconds",
+                timeout.as_secs()
             ));
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -695,4 +716,110 @@ pub fn main() -> i32 {
     let _ = out.flush();
     let _ = err.flush();
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_judge_that_times_out_takes_its_descendants_with_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-cli-test-{}-judge-descendant",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let heartbeat = dir.join("heartbeat");
+        // The judge backgrounds a loop that appends to a
+        // heartbeat file five times a second, and then sleeps in
+        // the foreground, so the deadline stops the judge while
+        // its descendant stands. A kill of the judge alone leaves
+        // the loop appending, and this test fails against it; the
+        // group kill stops the loop, and the heartbeat stands
+        // still. The script is staged under a temporary name and
+        // renamed into place, the way the library's tests stage
+        // their fake git, so the spawn can never race the writer
+        // still holding the file open.
+        let staged = dir.join("judge.staged");
+        std::fs::write(
+            &staged,
+            format!(
+                "#!/bin/sh\nwhile true; do echo tick >> {}; sleep 0.2; done &\nsleep 30\n",
+                heartbeat.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = dir.join("judge.sh");
+        std::fs::rename(&staged, &program).unwrap();
+        let result =
+            run_judge_command_within(&program.to_string_lossy(), "{}", Duration::from_secs(1));
+        let error = result.expect_err("the sleeping judge must pass its deadline");
+        assert!(
+            error.contains("did not finish inside the deadline of 1 seconds"),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let settled = std::fs::metadata(&heartbeat).unwrap().len();
+        std::thread::sleep(Duration::from_millis(1500));
+        let later = std::fs::metadata(&heartbeat).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            settled, later,
+            "the descendant of the timed out judge kept running"
+        );
+    }
+
+    #[test]
+    fn a_judge_that_exits_early_leaves_no_descendant_on_the_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-cli-test-{}-judge-early-exit",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let heartbeat = dir.join("heartbeat");
+        // The judge backgrounds a loop that appends to a
+        // heartbeat file five times a second, and then exits at
+        // once with success. The loop inherits the reply pipe
+        // and holds it open past the judge's own exit, so the
+        // reply collection runs out of the deadline even though
+        // the judge answered in time. A collection timeout that
+        // only returned the error would leave the loop standing
+        // on the pipe, and the heartbeat would keep growing;
+        // the group stop at the collection deadline stops it.
+        // The script is staged and renamed into place, as the
+        // test above stages its own.
+        let staged = dir.join("judge.staged");
+        std::fs::write(
+            &staged,
+            format!(
+                "#!/bin/sh\nwhile true; do echo tick >> {}; sleep 0.2; done &\nexit 0\n",
+                heartbeat.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = dir.join("judge.sh");
+        std::fs::rename(&staged, &program).unwrap();
+        let result =
+            run_judge_command_within(&program.to_string_lossy(), "{}", Duration::from_secs(1));
+        let error = result.expect_err("the held reply pipe must pass the collection deadline");
+        assert!(
+            error.contains("did not finish inside the deadline of 1 seconds"),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let settled = std::fs::metadata(&heartbeat).unwrap().len();
+        std::thread::sleep(Duration::from_millis(1500));
+        let later = std::fs::metadata(&heartbeat).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            settled, later,
+            "the descendant of the exited judge kept running"
+        );
+    }
 }
