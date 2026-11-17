@@ -1185,6 +1185,7 @@ fn a_wait_stands_short_of_its_bound_and_is_swept_at_and_past_it() {
                 .collect::<Vec<_>>();
             assert_eq!(expired.len(), 1, "{tag}");
             assert_eq!(expired[0]["agent"], "waiter", "{tag}");
+            assert_eq!(queue_log_field_set(expired[0]), QUEUE_LOG_FIELDS, "{tag}");
         }
     }
 }
@@ -1228,6 +1229,7 @@ fn release_cancels_a_standing_wait_and_a_second_release_refuses() {
     assert_eq!(lines[1]["kind"], "cancelled");
     assert_eq!(lines[1]["agent"], "waiter");
     assert_eq!(lines[1]["ports"], serde_json::Value::Null);
+    assert_eq!(queue_log_field_set(&lines[1]), QUEUE_LOG_FIELDS);
     let error = release(&stack, "waiter").expect_err("an agent holding nothing refuses");
     assert!(
         error
