@@ -1781,23 +1781,6 @@ fn init_stack_with(
     let worktrees = stack.join(WORKTREES_NAME);
     let lock_path = stack.join(LOCK_NAME);
     let registry = stack.join(REGISTRY_NAME);
-    if repo.exists() || repo.symlink_metadata().is_ok() {
-        return Err(Error::plain(format!(
-            "init refuses the stack at {} because {} already exists, \
-             and the stack root must not already hold a repo path \
-             that init did not create, so nothing was changed",
-            stack.display(),
-            repo.display()
-        )));
-    }
-    if (worktrees.exists() || worktrees.symlink_metadata().is_ok()) && !worktrees.is_dir() {
-        return Err(Error::plain(format!(
-            "init refuses the stack at {} because {} already exists \
-             and is not a directory, so nothing was changed",
-            stack.display(),
-            worktrees.display()
-        )));
-    }
     let watched: Vec<PathBuf> = vec![
         registry,
         lock_path.clone(),
@@ -1854,6 +1837,37 @@ fn init_stack_with(
                 stack.display()
             )));
         }
+    }
+    // The shape refusals stand behind the claim, so a racing
+    // init meets the claim first and refuses there, and only an
+    // init holding the claim reaches these checks. A refusal
+    // here drops the claim again before it returns, and the
+    // root with it where this call created it, so the refusal's
+    // word that nothing was changed stays literal.
+    let drop_claim = || {
+        let _ = fs::remove_file(&lock_path);
+        if !stack_preexisting {
+            let _ = fs::remove_dir(&stack);
+        }
+    };
+    if repo.exists() || repo.symlink_metadata().is_ok() {
+        drop_claim();
+        return Err(Error::plain(format!(
+            "init refuses the stack at {} because {} already exists, \
+             and the stack root must not already hold a repo path \
+             that init did not create, so nothing was changed",
+            stack.display(),
+            repo.display()
+        )));
+    }
+    if (worktrees.exists() || worktrees.symlink_metadata().is_ok()) && !worktrees.is_dir() {
+        drop_claim();
+        return Err(Error::plain(format!(
+            "init refuses the stack at {} because {} already exists \
+             and is not a directory, so nothing was changed",
+            stack.display(),
+            worktrees.display()
+        )));
     }
     let attempt = (|| -> Result<Pool> {
         fs::create_dir_all(&worktrees).map_err(|exc| Error::Io(exc.to_string()))?;
@@ -4522,10 +4536,15 @@ mod tests {
             error.message()
         );
         // The nested init met the outer init's claim and refused
-        // there. Before the claim it ran to completion inside
-        // the outer init's attempt, and the outer rollback then
-        // removed the stack it had built; this refusal is the
-        // assertion that fails against that behaviour.
+        // there. Before the claim stood, the nested init in this
+        // staging refused at the repo path check instead, with a
+        // message naming that path, because the outer attempt
+        // has already created the repo path when the seam fires;
+        // and a second init that started before the first one
+        // created anything completed, and the first init's
+        // rollback then removed the stack it had built. The
+        // assertion on the claim's own message fails against
+        // the code before the claim.
         let nested_error = git
             .nested
             .borrow()
