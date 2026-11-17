@@ -1068,6 +1068,18 @@ fn agent_names_with_newlines_are_rejected_and_change_nothing() {
 }
 
 #[test]
+fn agent_names_with_c1_controls_are_quoted_escaped_in_the_refusal() {
+    let stack = stack_fixture();
+    let before = snapshot(&stack);
+    let (code, _, err) = run_cli(&["claim", "al\u{85}pha", "--stack", &stack.to_string_lossy()]);
+    assert_ne!(code, 0);
+    assert!(err.contains("invalid agent name"), "{err}");
+    assert!(err.contains("\\x85"), "{err}");
+    assert!(!err.contains('\u{85}'), "{err}");
+    assert_eq!(snapshot(&stack), before);
+}
+
+#[test]
 fn a_claim_ignores_git_location_variables_from_the_caller() {
     let base = temp_dir("git-env");
     let stack = init_stack_dir(&base, &[]);
