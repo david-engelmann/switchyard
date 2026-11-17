@@ -1809,6 +1809,52 @@ fn init_stack_with(
         .iter()
         .map(|path| path.exists() || path.symlink_metadata().is_ok())
         .collect();
+    // Claim the stack before the attempt creates anything in
+    // it. The claim is the lock file itself, created with
+    // create_new, so exactly one of two racing inits holds it
+    // and the other refuses here, before it has created
+    // anything a rollback of its own could remove, let alone
+    // the winner's stack. A finished stack carries the lock
+    // file already, so a won claim leaves no marker behind,
+    // and a failed attempt removes the claim with the rest of
+    // what it created, because the snapshot above predates the
+    // claim and names the lock path among the created.
+    let stack_preexisting = preexisting[4];
+    fs::create_dir_all(&stack).map_err(|exc| {
+        Error::plain(format!(
+            "the stack at {} cannot be created, {exc}",
+            stack.display()
+        ))
+    })?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(_) => {}
+        Err(exc) if exc.kind() == io::ErrorKind::AlreadyExists => {
+            if stack.join(REGISTRY_NAME).is_file() {
+                return Err(Error::plain(format!(
+                    "stack at {} is already initialised",
+                    stack.display()
+                )));
+            }
+            return Err(Error::plain(format!(
+                "init of the stack at {} refuses because another init of the \
+                 same stack is in progress, so nothing was changed",
+                stack.display()
+            )));
+        }
+        Err(exc) => {
+            if !stack_preexisting {
+                let _ = fs::remove_dir(&stack);
+            }
+            return Err(Error::plain(format!(
+                "the stack at {} cannot be created, {exc}",
+                stack.display()
+            )));
+        }
+    }
     let attempt = (|| -> Result<Pool> {
         fs::create_dir_all(&worktrees).map_err(|exc| Error::Io(exc.to_string()))?;
         fs::create_dir_all(&repo).map_err(|exc| Error::Io(exc.to_string()))?;
@@ -4384,6 +4430,121 @@ mod tests {
             "{}",
             listing.stdout
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_init_beside_a_standing_claim_refuses_and_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-init-claim",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        fs::create_dir_all(&stack).unwrap();
+        // A root holding only a lock file is the shape a racing
+        // or crashed init leaves at the claim: the lock file
+        // stands and no registry does. Before the claim, an init
+        // here succeeded and built the stack around the standing
+        // file; against the claim it must refuse and change
+        // nothing.
+        fs::write(stack.join(LOCK_NAME), "").unwrap();
+        let error = init_stack(&stack, 20000, 10, 16)
+            .expect_err("an init beside a standing claim must refuse");
+        assert!(
+            error
+                .message()
+                .contains("another init of the same stack is in progress"),
+            "{}",
+            error.message()
+        );
+        assert!(stack.join(LOCK_NAME).is_file());
+        assert!(!stack.join(REGISTRY_NAME).exists());
+        let names: Vec<String> = fs::read_dir(&stack)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![LOCK_NAME.to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A git seam staging the init race of finding SY-A2. On the
+    /// outer init's first git call it runs a second init of the
+    /// same stack, and the outer init's commit call is staged to
+    /// fail, so the outer init rolls back after the second init
+    /// has run its course.
+    struct RacingInitGit {
+        stack: PathBuf,
+        fired: std::cell::Cell<bool>,
+        nested: std::cell::RefCell<Option<std::result::Result<(), String>>>,
+    }
+
+    impl GitRunner for RacingInitGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if !self.fired.get() && args.first() == Some(&"init") {
+                self.fired.set(true);
+                let nested = init_stack_with(&self.stack, 20000, 10, 16, &ProcessGit)
+                    .map(|_| ())
+                    .map_err(|error| error.message().to_string());
+                *self.nested.borrow_mut() = Some(nested);
+            }
+            if args.first() == Some(&"commit") {
+                return Ok(GitOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: "the commit is staged to fail".to_string(),
+                });
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    #[test]
+    fn an_init_racing_another_init_is_refused_at_the_claim() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-init-race",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        let git = RacingInitGit {
+            stack: stack.clone(),
+            fired: std::cell::Cell::new(false),
+            nested: std::cell::RefCell::new(None),
+        };
+        let error = init_stack_with(&stack, 20000, 10, 16, &git)
+            .expect_err("the staged commit failure must fail the outer init");
+        assert!(
+            error.message().contains("the commit is staged to fail"),
+            "{}",
+            error.message()
+        );
+        // The nested init met the outer init's claim and refused
+        // there. Before the claim it ran to completion inside
+        // the outer init's attempt, and the outer rollback then
+        // removed the stack it had built; this refusal is the
+        // assertion that fails against that behaviour.
+        let nested_error = git
+            .nested
+            .borrow()
+            .as_ref()
+            .expect("the nested init ran")
+            .as_ref()
+            .expect_err("the nested init must refuse at the claim")
+            .clone();
+        assert!(
+            nested_error.contains("another init of the same stack is in progress"),
+            "{nested_error}"
+        );
+        // The outer init's rollback removed its claim with the
+        // rest of what it made, so the root is gone and a fresh
+        // init succeeds on the ground the race ran over.
+        assert!(!stack.exists(), "the failed init left the root standing");
+        init_stack(&stack, 20000, 10, 16).unwrap();
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(data.port_pool.start, 20000);
         let _ = fs::remove_dir_all(&dir);
     }
 
