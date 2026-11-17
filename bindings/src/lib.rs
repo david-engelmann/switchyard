@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 
 use pyo3::create_exception;
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyOverflowError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict};
 
@@ -81,6 +81,24 @@ fn outcome_dict(py: Python<'_>, outcome: &ClaimOutcome) -> PyResult<Py<PyDict>> 
     }
 }
 
+/// Map the failure of an integer extraction to the refusal the
+/// binding owes where the failure is the value's width.
+///
+/// Pyo3 raises a bare OverflowError for a Python integer outside
+/// the width the argument must fit, and that error is not a
+/// SwitchyardError and carries no refusal text, so left unmapped
+/// it escapes the promise this file's header makes. Where the
+/// failure is the width, the refusal names the argument and the
+/// width it must fit. Every other extraction failure passes
+/// through as it stands.
+fn extraction_refusal(error: PyErr, py: Python<'_>, name: &str, width: u32) -> PyErr {
+    if error.is_instance_of::<PyOverflowError>(py) {
+        RefusalError::new_err(format!("{name} must fit in a {width}-bit integer"))
+    } else {
+        error
+    }
+}
+
 /// Resolve the wait bound of a waiting claim.
 ///
 /// A boolean is refused outright with a TypeError naming the
@@ -88,7 +106,9 @@ fn outcome_dict(py: Python<'_>, outcome: &ClaimOutcome) -> PyResult<Py<PyDict>> 
 /// named without the wait option is refused the way the command
 /// line refuses it, because a bound is meaningful only beside a
 /// claim that waits. The bound itself stands unset by default,
-/// and its positivity is the library's refusal to make.
+/// and its positivity is the library's refusal to make. A bound
+/// too wide for the count of seconds it names is refused by name
+/// through the extraction mapping above.
 fn wait_bound(wait: bool, wait_for: Option<&Bound<'_, PyAny>>) -> PyResult<Option<i64>> {
     match wait_for {
         None => Ok(None),
@@ -99,7 +119,10 @@ fn wait_bound(wait: bool, wait_for: Option<&Bound<'_, PyAny>>) -> PyResult<Optio
             if !wait {
                 return Err(RefusalError::new_err("wait_for stands only beside wait"));
             }
-            Ok(Some(value.extract::<i64>()?))
+            let bound = value
+                .extract::<i64>()
+                .map_err(|error| extraction_refusal(error, value.py(), "wait_for", 64))?;
+            Ok(Some(bound))
         }
     }
 }
@@ -112,14 +135,18 @@ fn wait_bound(wait: bool, wait_for: Option<&Bound<'_, PyAny>>) -> PyResult<Optio
 /// own defaults. A boolean is refused outright with a TypeError
 /// naming the argument, because Python spells True and False as
 /// the integers 1 and 0 and a pool argument is never meant as a
-/// truth value.
+/// truth value. An integer too wide for the argument is refused
+/// by name through the extraction mapping, naming the argument
+/// and the width it must fit.
 fn pool_argument(value: Option<&Bound<'_, PyAny>>, name: &str, default: i64) -> PyResult<i128> {
     match value {
         None => Ok(i128::from(default)),
         Some(value) if value.is_instance_of::<PyBool>() => Err(PyTypeError::new_err(format!(
             "{name} must be an integer, not a boolean"
         ))),
-        Some(value) => value.extract::<i128>(),
+        Some(value) => value
+            .extract::<i128>()
+            .map_err(|error| extraction_refusal(error, value.py(), name, 128)),
     }
 }
 
