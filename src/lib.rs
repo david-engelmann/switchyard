@@ -2100,8 +2100,8 @@ pub fn rollback_claim(
         }
     }
     if !branch_preexisted {
-        if let Ok(listed) = git.result(repo, &["branch", "--list", branch]) {
-            if listed.code == 0 && !listed.stdout.trim().is_empty() {
+        match git.result(repo, &["branch", "--list", branch]) {
+            Ok(listed) if listed.code == 0 && !listed.stdout.trim().is_empty() => {
                 match git.result(repo, &["branch", "-D", branch]) {
                     Ok(result) if result.code == 0 => {}
                     Ok(result) => problems.push(format!(
@@ -2114,6 +2114,15 @@ pub fn rollback_claim(
                     )),
                 }
             }
+            Ok(listed) if listed.code == 0 => {}
+            Ok(listed) => problems.push(format!(
+                "the branch {branch} could not be checked, {}",
+                git_detail(&listed)
+            )),
+            Err(exc) => problems.push(format!(
+                "the branch {branch} could not be checked, {}",
+                exc.message()
+            )),
         }
     }
     problems
@@ -4429,6 +4438,76 @@ mod tests {
         assert_eq!(
             settled, later,
             "the descendant of the timed out git kept running"
+        );
+    }
+
+    struct ErroringListGit;
+
+    impl GitRunner for ErroringListGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
+                return Err(Error::plain("the branch listing is broken in this test"));
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    struct FailingListGit;
+
+    impl GitRunner for FailingListGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
+                return Ok(GitOutput {
+                    code: 128,
+                    stdout: String::new(),
+                    stderr: "the branch listing is broken in this test".to_string(),
+                });
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    #[test]
+    fn a_rollback_whose_branch_probe_errors_reports_the_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-rollback-probe-error",
+            std::process::id()
+        ));
+        let problems = rollback_claim(
+            &ErroringListGit,
+            &dir,
+            &dir.join("worktree"),
+            "switchyard/alpha",
+            false,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("switchyard/alpha"), "{problems:?}");
+        assert!(problems[0].contains("could not be checked"), "{problems:?}");
+        assert!(
+            problems[0].contains("the branch listing is broken in this test"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_rollback_whose_branch_probe_fails_reports_the_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-rollback-probe-failure",
+            std::process::id()
+        ));
+        let problems = rollback_claim(
+            &FailingListGit,
+            &dir,
+            &dir.join("worktree"),
+            "switchyard/alpha",
+            false,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("switchyard/alpha"), "{problems:?}");
+        assert!(problems[0].contains("could not be checked"), "{problems:?}");
+        assert!(
+            problems[0].contains("the branch listing is broken in this test"),
+            "{problems:?}"
         );
     }
 
