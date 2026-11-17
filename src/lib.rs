@@ -13,7 +13,7 @@ pub mod cli;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -3183,6 +3183,10 @@ impl QueueLine {
     }
 }
 
+/// The width of one chunk of the backwards scan of the queue
+/// log, in bytes.
+const QUEUE_SCAN_CHUNK: u64 = 64 * 1024;
+
 /// The digest and byte count each standing wait's joining line
 /// recorded in the queue log, keyed by agent, best effort. A
 /// leaving line carries the digest of the exact scoring request
@@ -3194,40 +3198,105 @@ impl QueueLine {
 /// it, and where the log or the joining line does not stand the
 /// leaving line carries the digest fields as null rather than a
 /// fabricated digest.
-fn queued_digests(stack: &Path) -> BTreeMap<String, (String, usize)> {
+///
+/// The recovery scans the log backwards in chunks and decides
+/// only the agents the caller names, stopping as soon as each
+/// of them stands decided, so its cost runs with the distance
+/// back to the furthest joining line of a leaving wait and not
+/// with the size of the log. Scanning backwards settles the same
+/// outcomes a forward scan settled, because the nearest line to
+/// the end that can decide an agent is the last line a forward
+/// scan would have let stand for it. The scan reads bytes rather
+/// than a string, and a line carrying invalid UTF-8 is skipped
+/// where a whole string read would have failed closed to an
+/// empty map; the difference reaches only the digest fields of
+/// a leaving line, which decide nothing, and the library's own
+/// writer never produces such a line.
+fn queued_digests(stack: &Path, wanted: &BTreeSet<&str>) -> BTreeMap<String, (String, usize)> {
     let mut digests: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    if wanted.is_empty() {
+        return digests;
+    }
     let path = stack.join(QUEUE_LOG_NAME);
-    let Ok(raw) = fs::read_to_string(&path) else {
+    let Ok(mut file) = fs::File::open(&path) else {
         return digests;
     };
-    for text in raw.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-            continue;
+    let Ok(metadata) = file.metadata() else {
+        return digests;
+    };
+    let mut decided: BTreeSet<String> = BTreeSet::new();
+    let mut position = metadata.len();
+    let mut head: Vec<u8> = Vec::new();
+    while position > 0 && decided.len() < wanted.len() {
+        let start = position.saturating_sub(QUEUE_SCAN_CHUNK);
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return digests;
+        }
+        let mut region = vec![0_u8; (position - start) as usize];
+        if file.read_exact(&mut region).is_err() {
+            return digests;
+        }
+        region.extend_from_slice(&head);
+        position = start;
+        let mut lines: Vec<&[u8]> = region.split(|byte| *byte == b'\n').collect();
+        head = if position == 0 {
+            Vec::new()
+        } else {
+            lines.remove(0).to_vec()
         };
-        let agent = value.get("agent").and_then(|field| field.as_str());
-        match value.get("kind").and_then(|field| field.as_str()) {
-            Some("queued") => {
-                let digest = value
-                    .get("request_sha256")
-                    .and_then(|field| field.as_str())
-                    .map(str::to_string);
-                let bytes = value
-                    .get("request_bytes")
-                    .and_then(|field| field.as_u64())
-                    .map(|count| count as usize);
-                if let (Some(agent), Some(digest), Some(bytes)) = (agent, digest, bytes) {
-                    digests.insert(agent.to_string(), (digest, bytes));
-                }
+        for line in lines.iter().rev() {
+            if decided.len() == wanted.len() {
+                break;
             }
-            Some(_) => {
-                if let Some(agent) = agent {
-                    digests.remove(agent);
-                }
-            }
-            None => {}
+            decide_queue_line(line, wanted, &mut decided, &mut digests);
         }
     }
     digests
+}
+
+/// Decide one named agent's digest pair from one queue log
+/// line, where the scan reads the log backwards and the line is
+/// the nearest to the end that can decide the agent. A queued
+/// line carrying both the digest and the byte count decides
+/// with that pair, a line of any other kind decides that the
+/// pair stands gone, and a queued line missing either field, a
+/// line with no kind, and a line that does not parse decide
+/// nothing, each the outcome the forward scan settled.
+fn decide_queue_line(
+    line: &[u8],
+    wanted: &BTreeSet<&str>,
+    decided: &mut BTreeSet<String>,
+    digests: &mut BTreeMap<String, (String, usize)>,
+) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return;
+    };
+    let Some(agent) = value.get("agent").and_then(|field| field.as_str()) else {
+        return;
+    };
+    if !wanted.contains(agent) || decided.contains(agent) {
+        return;
+    }
+    match value.get("kind").and_then(|field| field.as_str()) {
+        Some("queued") => {
+            let digest = value
+                .get("request_sha256")
+                .and_then(|field| field.as_str())
+                .map(str::to_string);
+            let bytes = value
+                .get("request_bytes")
+                .and_then(|field| field.as_u64())
+                .map(|count| count as usize);
+            if let (Some(digest), Some(bytes)) = (digest, bytes) {
+                digests.insert(agent.to_string(), (digest, bytes));
+                decided.insert(agent.to_string());
+            }
+        }
+        Some(_) => {
+            decided.insert(agent.to_string());
+        }
+        None => {}
+    }
 }
 
 /// Append the leaving lines of one locked act to the queue log,
@@ -3244,7 +3313,8 @@ fn append_leavings(
     if waits.is_empty() {
         return Ok(());
     }
-    let digests = queued_digests(stack);
+    let wanted: BTreeSet<&str> = waits.iter().map(|wait| wait.agent.as_str()).collect();
+    let digests = queued_digests(stack, &wanted);
     for wait in waits {
         let mut line = QueueLine::for_wait(at, kind, wait);
         if let Some((digest, bytes)) = digests.get(&wait.agent) {
@@ -4828,6 +4898,72 @@ mod tests {
             "{expired:?}"
         );
         assert_eq!(expired[1]["request_bytes"], serde_json::Value::Null);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The digest recovery of SY-A6 decides from the end of the
+    /// log. A queued line carrying no byte count decides nothing,
+    /// a torn final line decides nothing, and a leaving line
+    /// standing nearer the end than the joining line settles the
+    /// pair as gone, each the outcome the forward scan settled.
+    #[test]
+    fn the_digest_recovery_decides_from_the_end_of_the_log() {
+        let (dir, stack) = unit_stack("digest-reverse");
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!(
+            "{{\"agent\":\"w2\",\"kind\":\"queued\",\"request_sha256\":\"{}\",\"request_bytes\":5}}",
+            "f".repeat(64)
+        ));
+        lines.push(
+            "{\"agent\":\"w2\",\"kind\":\"expired\",\"request_sha256\":null,\"request_bytes\":null}"
+                .to_string(),
+        );
+        lines.push(format!(
+            "{{\"agent\":\"w1\",\"kind\":\"queued\",\"request_sha256\":\"{}\",\"request_bytes\":111}}",
+            "a".repeat(64)
+        ));
+        for index in 0..50 {
+            lines.push(format!(
+                "{{\"agent\":\"other-{index}\",\"kind\":\"queued\",\"request_sha256\":\"{}\",\"request_bytes\":222}}",
+                "b".repeat(64)
+            ));
+        }
+        lines
+            .push("{\"agent\":\"w1\",\"kind\":\"queued\",\"request_sha256\":\"cccc\"}".to_string());
+        let mut text = lines.join("\n");
+        text.push('\n');
+        text.push_str("{\"agent\":\"w1\",\"kind\":\"que");
+        fs::write(stack.join(QUEUE_LOG_NAME), text).unwrap();
+        let wanted: BTreeSet<&str> = ["w1", "w2"].into_iter().collect();
+        let digests = queued_digests(&stack, &wanted);
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests["w1"], ("a".repeat(64), 111));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The digest recovery crosses chunk boundaries: a joining
+    /// line standing at the head of a log longer than one scan
+    /// chunk still decides its agent, with more than a chunk of
+    /// later lines for other agents standing behind it.
+    #[test]
+    fn the_digest_recovery_crosses_chunk_boundaries() {
+        let (dir, stack) = unit_stack("digest-chunks");
+        let mut text = format!(
+            "{{\"agent\":\"w1\",\"kind\":\"queued\",\"request_sha256\":\"{}\",\"request_bytes\":7}}\n",
+            "d".repeat(64)
+        );
+        let filler = format!(
+            "{{\"agent\":\"filler\",\"kind\":\"queued\",\"request_sha256\":\"{}\",\"request_bytes\":1}}\n",
+            "e".repeat(64)
+        );
+        while text.len() < 70_000 {
+            text.push_str(&filler);
+        }
+        fs::write(stack.join(QUEUE_LOG_NAME), text).unwrap();
+        let wanted: BTreeSet<&str> = ["w1"].into_iter().collect();
+        let digests = queued_digests(&stack, &wanted);
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests["w1"], ("d".repeat(64), 7));
         let _ = fs::remove_dir_all(&dir);
     }
 }
