@@ -3957,7 +3957,7 @@ fn claim_waiting_core(
         WaitingPhase::Standing(standing) => standing,
     };
     let wait = record_wait(
-        &stack, standing, agent, settled, wait_for, &request, outcome, None,
+        &stack, standing, agent, settled, wait_for, &request, outcome, None, saver,
     )?;
     Ok(ClaimOutcome::Wait(wait))
 }
@@ -4130,6 +4130,7 @@ fn record_wait(
     request: &str,
     outcome: ScoreOutcome,
     queued_line: Option<RoutingLine>,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<Wait> {
     let WaitingStanding {
         lock,
@@ -4275,6 +4276,7 @@ fn claim_routed_waiting_with(
         &request,
         outcome,
         Some(routing_line),
+        saver,
     )?;
     Ok(ClaimOutcome::Wait(wait))
 }
