@@ -299,6 +299,23 @@ def test_a_routed_waiting_claim_through_a_callable_transport(tmp_path):
     assert line["allocated"] is None
 
 
+def test_a_transport_beside_a_claim_that_does_not_wait_is_refused(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    def judge(request):
+        return "{}"
+
+    with pytest.raises(switchyard.RefusalError) as caught:
+        switchyard.claim(stack, "alpha", transport=judge)
+    assert "transport" in str(caught.value)
+
+    with pytest.raises(switchyard.RefusalError):
+        switchyard.claim_profile(stack, "alpha", "lean", transport=judge)
+
+    assert switchyard.list(stack) == []
+
+
 def test_the_wait_bound_refusals_of_the_binding(tmp_path):
     stack = str(tmp_path / "stack")
     switchyard.init(stack)
