@@ -352,3 +352,38 @@ def test_an_oversized_wait_bound_is_a_named_refusal(tmp_path):
     assert "wait_for" in str(caught.value)
     assert "64-bit" in str(caught.value)
     assert switchyard.list(stack) == []
+
+def test_a_waiting_profiled_claim_through_the_binding(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack, range_count=2)
+    switchyard.claim(stack, "holder")
+    wait = switchyard.claim_profile(stack, "waiter", "standard", wait=True, wait_for=120)
+    assert wait["agent"] == "waiter"
+    assert wait["profile"] == "standard"
+    assert wait["wait_for"] == 120
+    assert wait["score"] is None
+    assert wait["confidence"] is None
+    assert wait["model"] is None
+    assert wait["fallback"] == "no transport"
+    assert wait["recorded_at"]
+    queue = switchyard.queue(stack)
+    assert [entry["agent"] for entry in queue] == ["waiter"]
+    assert queue[0]["profile"] == "standard"
+
+    def judge(description):
+        return _score_body("7", 0.8)
+
+    scored = switchyard.claim_profile(
+        stack, "scored", "roomy", wait=True, transport=judge
+    )
+    assert scored["profile"] == "roomy"
+    assert scored["score"] == 7
+    assert scored["confidence"] == 0.8
+    assert scored["fallback"] == "none"
+    assert scored["model"] == "jev-1.13.0"
+    switchyard.release(stack, "holder")
+    claims = switchyard.list(stack)
+    assert [claim["agent"] for claim in claims] == ["waiter"]
+    assert (claims[0]["first"], claims[0]["last"]) == (20000, 20019)
+    queue = switchyard.queue(stack)
+    assert [entry["agent"] for entry in queue] == ["scored"]
