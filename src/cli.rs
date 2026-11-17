@@ -410,6 +410,10 @@ fn run_judge_command_within(
     // wait on that descendant without limit, so a collection that
     // runs out of the time that stands is the deadline expiring,
     // judged exactly as the command running past it is judged.
+    // Judged the same way means stopped the same way too: a
+    // collection that times out stops the process group before
+    // it returns, so the descendant holding the pipe does not
+    // survive the operation that disowned it.
     let remaining = deadline.saturating_duration_since(Instant::now());
     match writer_in.recv_timeout(remaining) {
         Ok(Ok(())) => {}
@@ -419,6 +423,7 @@ fn run_judge_command_within(
             ));
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            crate::kill_process_group(&mut child);
             return Err(format!(
                 "the judge command {program} did not finish inside the deadline of {} seconds",
                 timeout.as_secs()
@@ -432,6 +437,7 @@ fn run_judge_command_within(
     let (read, bytes) = match reader_in.recv_timeout(remaining) {
         Ok(carried) => carried,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            crate::kill_process_group(&mut child);
             return Err(format!(
                 "the judge command {program} did not finish inside the deadline of {} seconds",
                 timeout.as_secs()
@@ -763,6 +769,57 @@ mod tests {
         assert_eq!(
             settled, later,
             "the descendant of the timed out judge kept running"
+        );
+    }
+
+    #[test]
+    fn a_judge_that_exits_early_leaves_no_descendant_on_the_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-cli-test-{}-judge-early-exit",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let heartbeat = dir.join("heartbeat");
+        // The judge backgrounds a loop that appends to a
+        // heartbeat file five times a second, and then exits at
+        // once with success. The loop inherits the reply pipe
+        // and holds it open past the judge's own exit, so the
+        // reply collection runs out of the deadline even though
+        // the judge answered in time. A collection timeout that
+        // only returned the error would leave the loop standing
+        // on the pipe, and the heartbeat would keep growing;
+        // the group stop at the collection deadline stops it.
+        // The script is staged and renamed into place, as the
+        // test above stages its own.
+        let staged = dir.join("judge.staged");
+        std::fs::write(
+            &staged,
+            format!(
+                "#!/bin/sh\nwhile true; do echo tick >> {}; sleep 0.2; done &\nexit 0\n",
+                heartbeat.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = dir.join("judge.sh");
+        std::fs::rename(&staged, &program).unwrap();
+        let result =
+            run_judge_command_within(&program.to_string_lossy(), "{}", Duration::from_secs(1));
+        let error = result.expect_err("the held reply pipe must pass the collection deadline");
+        assert!(
+            error.contains("did not finish inside the deadline of 1 seconds"),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let settled = std::fs::metadata(&heartbeat).unwrap().len();
+        std::thread::sleep(Duration::from_millis(1500));
+        let later = std::fs::metadata(&heartbeat).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            settled, later,
+            "the descendant of the exited judge kept running"
         );
     }
 }
