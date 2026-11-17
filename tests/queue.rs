@@ -150,7 +150,12 @@ fn rewrite_recorded_at(stack: &Path, agent: &str, stamp: &str) {
     .unwrap();
 }
 
-fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+fn snapshot_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+    // Directories stand recorded as entries of their own, the
+    // shape the snapshot of tests/switchyard.rs keeps, so a
+    // change that creates only an empty directory stands
+    // visible to the changes nothing comparisons this map
+    // feeds. A files only walk passed such a change unseen.
     let mut snapshot = BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -163,9 +168,10 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
                 .to_string_lossy()
                 .into_owned();
             if path.is_dir() {
+                snapshot.insert(rel, None);
                 pending.push(path);
             } else {
-                snapshot.insert(rel, std::fs::read(&path).unwrap());
+                snapshot.insert(rel, Some(std::fs::read(&path).unwrap()));
             }
         }
     }
@@ -1437,9 +1443,16 @@ fn a_judge_descendant_holding_the_pipe_open_cannot_stretch_the_consultation() {
     let stack_arg = stack.to_string_lossy().into_owned();
     let (code, _, _) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
     assert_eq!(code, 0);
-    let judge = temp_dir("cli-deadline-judge").join("judge.sh");
-    std::fs::write(&judge, "#!/bin/sh\nsleep 90 &\ncat > /dev/null\nexit 0\n").unwrap();
-    std::fs::set_permissions(&judge, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The judge is staged under a temporary name and renamed
+    // into place, the shape the in crate pins stage their
+    // executables in, so the spawn can never take the file
+    // while the writer still holds it open.
+    let judge_dir = temp_dir("cli-deadline-judge");
+    let staged = judge_dir.join("judge.staged");
+    std::fs::write(&staged, "#!/bin/sh\nsleep 90 &\ncat > /dev/null\nexit 0\n").unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let judge = judge_dir.join("judge.sh");
+    std::fs::rename(&staged, &judge).unwrap();
     let started = std::time::Instant::now();
     let (code, out, err) = run_cli(&[
         "claim",
