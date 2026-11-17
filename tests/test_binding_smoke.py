@@ -331,3 +331,24 @@ def test_the_wait_bound_refusals_of_the_binding(tmp_path):
     with pytest.raises(switchyard.RefusalError) as bound:
         switchyard.claim(stack, "waiter", wait=True, wait_for=0)
     assert "positive" in str(bound.value)
+
+
+def test_an_oversized_pool_argument_is_a_named_refusal(tmp_path):
+    stack = str(tmp_path / "stack")
+
+    with pytest.raises(switchyard.RefusalError) as caught:
+        switchyard.init(stack, port_start=10**40)
+    assert "port_start" in str(caught.value)
+    assert "128-bit" in str(caught.value)
+    assert not (tmp_path / "stack").exists()
+
+
+def test_an_oversized_wait_bound_is_a_named_refusal(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    with pytest.raises(switchyard.RefusalError) as caught:
+        switchyard.claim(stack, "waiter", wait=True, wait_for=10**40)
+    assert "wait_for" in str(caught.value)
+    assert "64-bit" in str(caught.value)
+    assert switchyard.list(stack) == []
