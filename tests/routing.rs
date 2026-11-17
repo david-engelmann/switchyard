@@ -916,6 +916,28 @@ fn the_routing_option_shapes_refuse_at_the_parser() {
 }
 
 #[test]
+fn a_judge_command_beside_no_describe_and_no_wait_names_the_rule_it_breaks() {
+    let stack = cli_stack("cli-judge-rule");
+    let stack = stack.to_str().unwrap();
+    let (code, _, stderr) = run_cli(&[
+        "claim",
+        "alpha",
+        "--stack",
+        stack,
+        "--profile",
+        "lean",
+        "--judge-command",
+        "/bin/true",
+    ]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("a judge command takes --describe or --wait beside it"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("routed"), "{stderr}");
+}
+
+#[test]
 fn a_routed_claim_from_the_command_line_with_no_judge_command() {
     let stack = cli_stack("cli-routed-none");
     let stack_arg = stack.to_str().unwrap();
