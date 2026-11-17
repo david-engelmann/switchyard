@@ -2,11 +2,15 @@
 //!
 //! A stack is a plain directory. Inside it live a git repository, a
 //! worktrees directory, a lock file, and one registry file that
-//! records the port pool and every live claim. The registry is the
-//! only record, and every mutating command holds an exclusive flock
-//! lock on the lock file across the whole read and check and modify
-//! and write of the registry, so racing processes cannot both take
-//! the same agent name or overlapping port ranges.
+//! records the port pool and every live claim and every standing
+//! wait. Routed claims append to a routing log in the root, and
+//! waits and their leavings append to a queue log in the root,
+//! and no command reads either log to decide anything. The
+//! registry is the only record, and every mutating command holds
+//! an exclusive flock lock on the lock file across the whole read
+//! and check and modify and write of the registry, so racing
+//! processes cannot both take the same agent name or overlapping
+//! port ranges.
 
 pub mod cli;
 
