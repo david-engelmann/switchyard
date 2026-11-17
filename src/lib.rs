@@ -4446,9 +4446,7 @@ mod tests {
     impl GitRunner for ErroringListGit {
         fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
             if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
-                return Err(Error::plain(
-                    "the branch listing is broken in this test",
-                ));
+                return Err(Error::plain("the branch listing is broken in this test"));
             }
             ProcessGit.result(repo, args)
         }
