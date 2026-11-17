@@ -23,6 +23,7 @@
 //! binary suffixes, and a file that does not decode as UTF-8 fails
 //! the scan loudly instead of passing unseen.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -89,11 +90,12 @@ fn collect(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), ScanError> {
     Ok(())
 }
 
-fn scan(root: &Path) -> Result<(usize, usize), ScanError> {
+fn scan(root: &Path) -> Result<(usize, usize, String), ScanError> {
     let mut files = Vec::new();
     collect(root, &mut files)?;
     let mut em_count = 0;
     let mut en_count = 0;
+    let mut hits = String::new();
     for path in &files {
         let bytes = std::fs::read(path)
             .map_err(|err| ScanError(format!("cannot read {}, {err}", path.display())))?;
@@ -103,12 +105,15 @@ fn scan(root: &Path) -> Result<(usize, usize), ScanError> {
         let file_em = text.matches(EM_DASH).count();
         let file_en = text.matches(EN_DASH).count();
         if file_em > 0 || file_en > 0 {
-            println!("{}: em dash {file_em}, en dash {file_en}", path.display());
+            hits.push_str(&format!(
+                "{}: em dash {file_em}, en dash {file_en}\n",
+                path.display()
+            ));
         }
         em_count += file_em;
         en_count += file_en;
     }
-    Ok((em_count, en_count))
+    Ok((em_count, en_count, hits))
 }
 
 fn main() -> ExitCode {
@@ -117,9 +122,15 @@ fn main() -> ExitCode {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     match scan(&root) {
-        Ok((em_count, en_count)) => {
-            println!("em dash U+2014 count {em_count}");
-            println!("en dash U+2013 count {en_count}");
+        Ok((em_count, en_count, hits)) => {
+            let output =
+                format!("{hits}em dash U+2014 count {em_count}\nen dash U+2013 count {en_count}\n");
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            if let Err(err) = lock.write_all(output.as_bytes()) {
+                report_scan_error(&format!("cannot write the scan output, {err}"));
+                return ExitCode::from(2);
+            }
             if em_count > 0 || en_count > 0 {
                 ExitCode::from(1)
             } else {
@@ -127,8 +138,18 @@ fn main() -> ExitCode {
             }
         }
         Err(ScanError(message)) => {
-            eprintln!("scan error, {message}");
+            report_scan_error(&message);
             ExitCode::from(2)
         }
     }
+}
+
+/// Write one scan error line to a locked stderr, fallibly: the
+/// error stream can itself be the stream that failed, and a
+/// failed report of the failure changes nothing the caller can
+/// still act on (SY-A42).
+fn report_scan_error(message: &str) {
+    let stderr = std::io::stderr();
+    let mut lock = stderr.lock();
+    let _ = lock.write_all(format!("scan error, {message}\n").as_bytes());
 }
