@@ -17,7 +17,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -1569,13 +1570,113 @@ impl GitRunner for ProcessGit {
 /// stands behind the group signal for the case where the group
 /// is already gone.
 pub(crate) fn kill_process_group(child: &mut std::process::Child) {
-    let pid = child.id() as libc::pid_t;
+    kill_group(child.id());
+    let _ = child.kill();
+}
+
+/// Stop every process in the group led by the child of the given
+/// pid, where no handle on the child itself stands. The reply
+/// collection deadlines of the judge runner stop a group whose
+/// child already stands reaped, where only the pid remains to
+/// name the group.
+pub(crate) fn kill_group(pid: u32) {
+    let pid = pid as libc::pid_t;
     // The child leads its process group by construction, so the
     // negated pid names the group and nothing outside it.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
-    let _ = child.kill();
+}
+
+/// The process group of the one subprocess this process stands
+/// inside, git or a judge command, or zero where none stands.
+///
+/// The runners record their child here as its wait begins and
+/// clear the record as the wait completes, and the command
+/// line's signal handlers read it to forward an operator's
+/// interrupt or a supervisor's termination to the child's
+/// group, because a spawned child leads its own group and the
+/// terminal's signal never reaches it. One child stands at a
+/// time in every caller this crate serves, the command line
+/// running one operation after another, so one record serves,
+/// and a record is cleared only by the spawn that wrote it, so a
+/// nested spawn cannot clear the record of the spawn that
+/// contains it. An embedding process installs no handler, and
+/// the record stands inert there.
+static ACTIVE_CHILD_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// Record the group of a child whose wait is beginning, for the
+/// signal forwarding the command line installs.
+pub(crate) fn note_child_spawned(pid: u32) {
+    ACTIVE_CHILD_GROUP.store(pid as i32, Ordering::SeqCst);
+}
+
+/// Clear the record of a child whose wait completed, where the
+/// record still names that child.
+pub(crate) fn note_child_finished(pid: u32) {
+    let _ = ACTIVE_CHILD_GROUP.compare_exchange(pid as i32, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// The recorded group of the standing child, or zero where none
+/// stands. The command line's signal handlers read this.
+pub(crate) fn active_child_group() -> i32 {
+    ACTIVE_CHILD_GROUP.load(Ordering::SeqCst)
+}
+
+/// How a wait on a spawned child ended, as the waiter thread
+/// that owns the child reports it.
+pub(crate) enum ChildWait {
+    /// The child exited, and its status stands.
+    Exited(std::process::ExitStatus),
+    /// The wait itself failed. The waiter stopped the child's
+    /// group before reporting, so no path out of a runner leaves
+    /// a spawned child standing.
+    Failed(io::Error),
+    /// The deadline passed with the child still standing. The
+    /// caller stopped the group before returning this.
+    TimedOut,
+}
+
+/// Wait for a spawned child against a deadline without polling.
+///
+/// A waiter thread owns the child and waits blocking, reporting
+/// the exit or the wait failure over a channel, and the caller
+/// takes the report against the deadline, so a finished child is
+/// reported as it finishes rather than at the next poll. On a
+/// timeout the caller stops the group and then collects the
+/// waiter, whose own wait returns once the group stops, so the
+/// child stands reaped on every path. The child stands recorded
+/// in the forwarding registry from the start of the wait until
+/// the wait completes.
+pub(crate) fn await_child(child: std::process::Child, timeout: Duration) -> ChildWait {
+    let pid = child.id();
+    note_child_spawned(pid);
+    let (out, inside) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let mut child = child;
+        let report = match child.wait() {
+            Ok(status) => ChildWait::Exited(status),
+            Err(exc) => {
+                kill_process_group(&mut child);
+                ChildWait::Failed(exc)
+            }
+        };
+        let _ = out.send(report);
+    });
+    let report = match inside.recv_timeout(timeout) {
+        Ok(report) => report,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_group(pid);
+            let _ = inside.recv();
+            ChildWait::TimedOut
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ChildWait::Failed(
+            io::Error::other("the waiter thread ended without reporting"),
+        ),
+    };
+    let _ = waiter.join();
+    note_child_finished(pid);
+    report
 }
 
 fn run_git(
@@ -1612,33 +1713,24 @@ fn run_git(
         let _ = err_pipe.read_to_end(&mut buf);
         buf
     });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    kill_process_group(&mut child);
-                    let _ = child.wait();
-                    // The reader threads end detached on this
-                    // path. A grandchild of git can hold the
-                    // pipes open after git itself is dead, and
-                    // joining here would block past the timeout
-                    // this call was promised to keep.
-                    drop(out_thread);
-                    drop(err_thread);
-                    return Err(Error::plain(format!(
-                        "git {joined} did not finish within {} seconds and was stopped",
-                        timeout.as_secs()
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(exc) => {
-                return Err(Error::plain(format!(
-                    "git {joined} could not be waited on, {exc}"
-                )));
-            }
+    let status = match await_child(child, timeout) {
+        ChildWait::Exited(status) => status,
+        ChildWait::TimedOut => {
+            // The reader threads end detached on this path. A
+            // grandchild of git can hold the pipes open after git
+            // itself is dead, and joining here would block past
+            // the timeout this call was promised to keep.
+            drop(out_thread);
+            drop(err_thread);
+            return Err(Error::plain(format!(
+                "git {joined} did not finish within {} seconds and was stopped",
+                timeout.as_secs()
+            )));
+        }
+        ChildWait::Failed(exc) => {
+            return Err(Error::plain(format!(
+                "git {joined} could not be waited on, {exc}"
+            )));
         }
     };
     let stdout = out_thread.join().unwrap_or_default();
