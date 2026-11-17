@@ -402,3 +402,28 @@ fn codepoint_scan_skips_a_file_with_an_uppercase_binary_suffix() {
     assert!(result.stdout.contains("em dash U+2014 count 0"));
     assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn codepoint_scan_reports_a_failed_output_write_at_exit_2() {
+    use std::process::Stdio;
+    // The scanner writes its whole output through one checked
+    // writer, so a stdout that refuses the write lands the scan
+    // at its stated error exit instead of panicking inside a
+    // print (SY-A42). The drive stages /dev/full as the output,
+    // which answers every write with no space left; before the
+    // repair the count lines went through println! and this
+    // drive died at exit 101.
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .arg(root())
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot write the scan output"), "{stderr}");
+}
