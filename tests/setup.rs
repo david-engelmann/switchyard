@@ -277,6 +277,28 @@ fn codepoint_scan_reports_zero_for_repo_tree() {
     assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
+#[test]
+fn codepoint_scan_with_no_argument_scans_the_current_directory() {
+    // The scanner's module doc names the scan root defaulting
+    // to the current directory among the port's deliberate
+    // differences from the setup scanner, and the workflow scan
+    // step names no root and relies on that default over the
+    // checkout tree. Every other drive of the scanner in this
+    // suite names its root, so the default stands pinned here.
+    // A scanner defaulting to any fixed tree reports zero
+    // counts over the staged tree at exit 0, and one refusing
+    // with no argument exits 2, and this pin fails on both.
+    let dir = temp_dir("no-argument");
+    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(stdout.contains("em dash U+2014 count 1"), "{stdout}");
+}
+
 const CANONICAL_ABOVE_MARKER_SHA256: &str =
     "bb3e2fc1790b13729da3495c3f0902b968577f4e45ceb27e48e90b489f36e1a7";
 
