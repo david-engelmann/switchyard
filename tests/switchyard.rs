@@ -154,6 +154,33 @@ fn init_records_the_pool_and_creates_the_repository() {
     assert_eq!(head.trim(), "main");
 }
 
+/// The checked prints of SY-A33 against a real full device.
+/// A list printed where every write fails with ENOSPC exits 1
+/// and reports the output refusal on its error stream, where
+/// the discarded writes exited 0 over the truncated table.
+#[test]
+fn a_list_printed_to_a_full_device_fails_loudly() {
+    let stack = stack_fixture();
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, err) = run_cli(&["claim", "alpha", "--stack", &stack_arg]);
+    assert_eq!(code, 0, "{err}");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+        .args(["list", "--stack", &stack_arg])
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("the command's output could not be written"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn claim_allocates_everything_and_the_record_matches_the_disk() {
     let stack = stack_fixture();
