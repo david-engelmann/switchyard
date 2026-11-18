@@ -199,9 +199,11 @@ fn init(
 /// scoring question only where the claim waits. A transport
 /// supplied beside a claim that does not wait is refused by
 /// name, mirroring the command line's refusal of a judge command
-/// beside a claim that neither describes nor waits.
+/// beside a claim that neither describes nor waits. The optional
+/// arguments stand keyword-only, as in every claim function of
+/// this binding, so no caller can place one in another's slot.
 #[pyfunction]
-#[pyo3(signature = (stack, agent, wait = false, wait_for = None, transport = None))]
+#[pyo3(signature = (stack, agent, *, wait = false, wait_for = None, transport = None))]
 fn claim(
     py: Python<'_>,
     stack: PathBuf,
@@ -220,18 +222,9 @@ fn claim(
             .map_err(to_py_error)?;
         return record_dict(py, &record);
     }
-    let transport = transport.map(|callable| CallableTransport { callable });
+    let transport = wrapped_transport(transport);
     let outcome = py
-        .detach(|| {
-            switchyard_core::claim_waiting(
-                &stack,
-                agent,
-                bound,
-                transport
-                    .as_ref()
-                    .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
-            )
-        })
+        .detach(|| switchyard_core::claim_waiting(&stack, agent, bound, lent_transport(&transport)))
         .map_err(to_py_error)?;
     outcome_dict(py, &outcome)
 }
@@ -242,9 +235,10 @@ fn claim(
 /// with the message the command line prints for it. With the wait
 /// option standing, the claim waits exactly as a command line
 /// claim with --wait waits. A transport supplied beside a claim
-/// that does not wait is refused by name, as in claim.
+/// that does not wait is refused by name, as in claim. The
+/// optional arguments stand keyword-only, as in claim.
 #[pyfunction]
-#[pyo3(signature = (stack, agent, profile, wait = false, wait_for = None, transport = None))]
+#[pyo3(signature = (stack, agent, profile, *, wait = false, wait_for = None, transport = None))]
 fn claim_profile(
     py: Python<'_>,
     stack: PathBuf,
@@ -265,7 +259,7 @@ fn claim_profile(
             .map_err(to_py_error)?;
         return record_dict(py, &record);
     }
-    let transport = transport.map(|callable| CallableTransport { callable });
+    let transport = wrapped_transport(transport);
     let outcome = py
         .detach(|| {
             switchyard_core::claim_profile_waiting(
@@ -273,9 +267,7 @@ fn claim_profile(
                 agent,
                 profile,
                 bound,
-                transport
-                    .as_ref()
-                    .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
+                lent_transport(&transport),
             )
         })
         .map_err(to_py_error)?;
@@ -309,6 +301,23 @@ impl switchyard_core::JudgeTransport for CallableTransport {
     }
 }
 
+/// Build the transport that stands behind the library seam from
+/// the callable a claim function was handed, the one wrapping
+/// every claim function in this binding uses.
+fn wrapped_transport(transport: Option<Py<PyAny>>) -> Option<CallableTransport> {
+    transport.map(|callable| CallableTransport { callable })
+}
+
+/// Lend a built transport to a library call as the trait object,
+/// the one lending every claim function in this binding uses.
+fn lent_transport(
+    transport: &Option<CallableTransport>,
+) -> Option<&dyn switchyard_core::JudgeTransport> {
+    transport
+        .as_ref()
+        .map(|transport| transport as &dyn switchyard_core::JudgeTransport)
+}
+
 /// Allocate a claim whose profile a model settles from a job
 /// description. The transport argument is a callable standing
 /// behind the library seam, and leaving it out configures no
@@ -317,10 +326,12 @@ impl switchyard_core::JudgeTransport for CallableTransport {
 /// command line with no judge command does. With the wait option
 /// standing, the claim waits exactly as a command line claim with
 /// --wait waits, and the same callable answers the scoring
-/// question beside the routing question.
+/// question beside the routing question. The optional arguments
+/// stand keyword-only, as in every claim function of this
+/// binding, transport included, though it keeps its fifth place.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (stack, agent, description, default_profile, transport = None, wait = false, wait_for = None))]
+#[pyo3(signature = (stack, agent, description, default_profile, *, transport = None, wait = false, wait_for = None))]
 fn claim_routed(
     py: Python<'_>,
     stack: PathBuf,
@@ -333,7 +344,7 @@ fn claim_routed(
 ) -> PyResult<Py<PyDict>> {
     let bound = wait_bound(wait, wait_for.as_ref())?;
     let default = switchyard_core::profile_named(default_profile).map_err(to_py_error)?;
-    let transport = transport.map(|callable| CallableTransport { callable });
+    let transport = wrapped_transport(transport);
     if wait {
         let outcome = py
             .detach(|| {
@@ -342,9 +353,7 @@ fn claim_routed(
                     agent,
                     description,
                     default,
-                    transport
-                        .as_ref()
-                        .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
+                    lent_transport(&transport),
                     bound,
                 )
             })
@@ -358,9 +367,7 @@ fn claim_routed(
                 agent,
                 description,
                 default,
-                transport
-                    .as_ref()
-                    .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
+                lent_transport(&transport),
             )
         })
         .map_err(to_py_error)?;
