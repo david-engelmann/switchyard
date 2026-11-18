@@ -271,11 +271,9 @@ pub struct Wait {
 /// settles on its own word with a draw of one range, the same
 /// size as lean and a different kind.
 fn settled_draw(profile: &str) -> i64 {
-    match profile {
-        "standard" => 2,
-        "roomy" => 4,
-        _ => 1,
-    }
+    Profile::from_name(profile)
+        .map(|profile| profile.draw())
+        .unwrap_or(1)
 }
 
 /// A parsed JSON value that keeps object pairs in document order,
@@ -3939,28 +3937,11 @@ fn claim_waiting_core(
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     validate_wait_bound(wait_for)?;
-    let snapshot = {
-        let (lock, mut data) = claim_prologue(&stack, git)?;
-        let instant = now_stamp();
-        let expired = sweep_expired(&mut data, &instant);
-        refuse_standing_position(&data, agent)?;
-        refuse_queue_full(&data)?;
-        if free_run(&data, draw).is_some() {
-            let record = allocate_locked(AllocParts {
-                stack: &stack,
-                agent,
-                draw,
-                data,
-                lock: &lock,
-                git,
-                saver,
-                routing: None,
-                expired,
-                instant,
-            })?;
-            return Ok(ClaimOutcome::Claim(record));
+    let snapshot = match waiting_phase(&stack, agent, draw, None, git, saver)? {
+        WaitingPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
+        WaitingPhase::Standing(standing) => {
+            (standing.data.waits.clone(), free_runs(&standing.data))
         }
-        (data.waits.clone(), free_runs(&data))
     };
     let request = scoring_request(
         settled,
@@ -3971,31 +3952,195 @@ fn claim_waiting_core(
         description,
     );
     let outcome = settle_score(transport, &request);
-    let lock = locked(&stack)?;
-    let mut data = load_registry(&stack)?;
-    verify_own_repo(git, &stack)?;
+    let standing = match waiting_phase(&stack, agent, draw, None, git, saver)? {
+        WaitingPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
+        WaitingPhase::Standing(standing) => standing,
+    };
+    let wait = record_wait(
+        &stack, standing, agent, settled, wait_for, &request, outcome, None, saver,
+    )?;
+    Ok(ClaimOutcome::Wait(wait))
+}
+
+/// The registry as one under-lock phase of a waiting envelope
+/// leaves it where the settled draw did not stand free, carried
+/// out of the phase under its lock, with the instant of the
+/// phase and the waits its sweep expired, for the caller to
+/// build its scoring request from or to record its wait into.
+struct WaitingStanding {
+    lock: Locked,
+    data: Registry,
+    instant: String,
+    expired: Vec<Wait>,
+}
+
+/// The settled outcome of one under-lock phase of a waiting
+/// envelope, the claim where the phase allocated and the
+/// standing registry where it did not.
+enum WaitingPhase {
+    Allocated(Record),
+    Standing(WaitingStanding),
+}
+
+/// The settled profile and the consultation record a routed
+/// waiting phase carries beside the claim itself, from which
+/// the phase builds the routing line its refusal and allocation
+/// paths append. An unrouted phase carries none, and appends no
+/// line.
+struct RoutedContext<'a> {
+    description: &'a str,
+    settled: Profile,
+    model: &'a Option<String>,
+    verdict: &'a Option<String>,
+    confidence: Option<f64>,
+    fallback: Fallback,
+}
+
+/// One under-lock phase of the waiting envelope of SY-19, the
+/// one phase every under-lock phase of both waiting paths runs:
+/// the unrouted core on both sides of its scoring consultation,
+/// and the routed path as the allocation recheck after the
+/// routing consultation and as the third phase after the scoring
+/// consultation. The phase takes the lock and loads the registry
+/// and verifies the stack repository and sweeps expired waits
+/// and makes the standing check and the queue bound check and
+/// the allocation check, in the landed order. Where the claim
+/// is routed, every refusal appends its routing line before it
+/// returns, under SY-15. Where the settled draw stands free the
+/// phase allocates from that point exactly as the same claim
+/// allocates without the wait option and returns the claim, and
+/// where it does not the phase returns the standing registry.
+#[allow(clippy::too_many_arguments)]
+fn waiting_phase(
+    stack: &Path,
+    agent: &str,
+    draw: i64,
+    routed: Option<&RoutedContext<'_>>,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<WaitingPhase> {
+    let lock = locked(stack)?;
+    let mut data = match load_registry(stack) {
+        Ok(data) => data,
+        Err(exc) => {
+            if let Some(routed) = routed {
+                refuse_after_consultation(
+                    stack,
+                    agent,
+                    routed.description,
+                    routed.model,
+                    routed.verdict,
+                    routed.confidence,
+                    routed.fallback,
+                    "corrupt",
+                )?;
+            }
+            return Err(exc);
+        }
+    };
+    if let Err(exc) = verify_own_repo(git, stack) {
+        if let Some(routed) = routed {
+            refuse_after_consultation(
+                stack,
+                agent,
+                routed.description,
+                routed.model,
+                routed.verdict,
+                routed.confidence,
+                routed.fallback,
+                "repo",
+            )?;
+        }
+        return Err(exc);
+    }
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
-    refuse_standing_position(&data, agent)?;
-    refuse_queue_full(&data)?;
+    if let Err(exc) = refuse_standing_position(&data, agent) {
+        if let Some(routed) = routed {
+            refuse_after_consultation(
+                stack,
+                agent,
+                routed.description,
+                routed.model,
+                routed.verdict,
+                routed.confidence,
+                routed.fallback,
+                "duplicate",
+            )?;
+        }
+        return Err(exc);
+    }
+    if let Err(exc) = refuse_queue_full(&data) {
+        if let Some(routed) = routed {
+            let mut line = RoutingLine::new(agent, routed.description, routed.model.clone());
+            line.verdict = routed.verdict.clone();
+            line.confidence = routed.confidence;
+            line.fallback = routed.fallback;
+            line.refusal = Some("queue full".to_string());
+            line.append(stack)?;
+        }
+        return Err(exc);
+    }
     if free_run(&data, draw).is_some() {
+        let line = routed.map(|routed| {
+            let mut line = RoutingLine::new(agent, routed.description, routed.model.clone());
+            line.verdict = routed.verdict.clone();
+            line.confidence = routed.confidence;
+            line.fallback = routed.fallback;
+            line.allocated = Some(routed.settled.name().to_string());
+            line
+        });
         let record = allocate_locked(AllocParts {
-            stack: &stack,
+            stack,
             agent,
             draw,
             data,
             lock: &lock,
             git,
             saver,
-            routing: None,
+            routing: line.as_ref(),
             expired,
             instant,
         })?;
-        return Ok(ClaimOutcome::Claim(record));
+        return Ok(WaitingPhase::Allocated(record));
     }
+    Ok(WaitingPhase::Standing(WaitingStanding {
+        lock,
+        data,
+        instant,
+        expired,
+    }))
+}
+
+/// Record one wait against the standing registry a waiting
+/// phase left, the tail both waiting paths end in. The wait is
+/// built from the phase's instant and the scoring outcome, its
+/// queue line is appended with the digest of the exact scoring
+/// request, the leavings of the phase's sweep are appended, and
+/// the routed path's queued routing line is appended where one
+/// stands, in the landed order, before the wait is pushed and
+/// the registry published under the phase's lock.
+#[allow(clippy::too_many_arguments)]
+fn record_wait(
+    stack: &Path,
+    standing: WaitingStanding,
+    agent: &str,
+    profile: &str,
+    wait_for: Option<i64>,
+    request: &str,
+    outcome: ScoreOutcome,
+    queued_line: Option<RoutingLine>,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<Wait> {
+    let WaitingStanding {
+        lock,
+        mut data,
+        instant,
+        expired,
+    } = standing;
     let wait = Wait {
         agent: agent.to_string(),
-        profile: settled.to_string(),
+        profile: profile.to_string(),
         recorded_at: instant.clone(),
         wait_for,
         score: outcome.score,
@@ -4006,140 +4151,15 @@ fn claim_waiting_core(
     let mut line = QueueLine::for_wait(&instant, "queued", &wait);
     line.request_sha256 = Some(sha256_hex(request.as_bytes()));
     line.request_bytes = Some(request.len());
-    line.append(&stack)?;
-    append_leavings(&stack, &instant, "expired", &expired, None)?;
+    line.append(stack)?;
+    append_leavings(stack, &instant, "expired", &expired, None)?;
+    if let Some(line) = queued_line {
+        line.append(stack)?;
+    }
     data.waits.push(wait.clone());
     lock.verify_current()?;
-    saver(&stack, &data)?;
-    Ok(ClaimOutcome::Wait(wait))
-}
-
-/// The registry as one under-lock phase of the routed waiting
-/// envelope leaves it where the settled draw did not stand free,
-/// carried out of the phase under its lock, with the instant of
-/// the phase and the waits its sweep expired, for the caller to
-/// build its scoring request from or to record its wait into.
-struct RoutedStanding {
-    lock: Locked,
-    data: Registry,
-    instant: String,
-    expired: Vec<Wait>,
-}
-
-/// The settled outcome of one under-lock phase of the routed
-/// waiting envelope, the claim where the phase allocated and
-/// the standing registry where it did not.
-enum RoutedPhase {
-    Allocated(Record),
-    Standing(RoutedStanding),
-}
-
-/// One under-lock phase of the routed waiting envelope of
-/// SY-19, the one phase both under-lock phases of
-/// claim_routed_waiting_with run, the allocation recheck after
-/// the routing consultation and the third phase after the
-/// scoring consultation. The phase takes the lock and loads the
-/// registry and verifies the stack repository and sweeps
-/// expired waits and makes the duplicate check and the queue
-/// bound check and the allocation check, in the landed order,
-/// and every refusal appends its routing line before it
-/// returns, under SY-15. Where the settled draw stands free the
-/// phase allocates from that point exactly as the same claim
-/// allocates without the wait option and returns the claim, and
-/// where it does not the phase returns the standing registry.
-#[allow(clippy::too_many_arguments)]
-fn routed_waiting_phase(
-    stack: &Path,
-    agent: &str,
-    description: &str,
-    settled: Profile,
-    model: &Option<String>,
-    verdict: &Option<String>,
-    confidence: Option<f64>,
-    fallback: Fallback,
-    git: &dyn GitRunner,
-    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
-) -> Result<RoutedPhase> {
-    let lock = locked(stack)?;
-    let mut data = match load_registry(stack) {
-        Ok(data) => data,
-        Err(exc) => {
-            refuse_after_consultation(
-                stack,
-                agent,
-                description,
-                model,
-                verdict,
-                confidence,
-                fallback,
-                "corrupt",
-            )?;
-            return Err(exc);
-        }
-    };
-    if let Err(exc) = verify_own_repo(git, stack) {
-        refuse_after_consultation(
-            stack,
-            agent,
-            description,
-            model,
-            verdict,
-            confidence,
-            fallback,
-            "repo",
-        )?;
-        return Err(exc);
-    }
-    let instant = now_stamp();
-    let expired = sweep_expired(&mut data, &instant);
-    if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
-        refuse_after_consultation(
-            stack,
-            agent,
-            description,
-            model,
-            verdict,
-            confidence,
-            fallback,
-            "duplicate",
-        )?;
-        return Err(standing_claim_error(agent));
-    }
-    if data.waits.len() >= QUEUE_BOUND {
-        let mut line = RoutingLine::new(agent, description, model.clone());
-        line.verdict = verdict.clone();
-        line.confidence = confidence;
-        line.fallback = fallback;
-        line.refusal = Some("queue full".to_string());
-        line.append(stack)?;
-        return Err(queue_full_error());
-    }
-    if free_run(&data, settled.draw()).is_some() {
-        let mut line = RoutingLine::new(agent, description, model.clone());
-        line.verdict = verdict.clone();
-        line.confidence = confidence;
-        line.fallback = fallback;
-        line.allocated = Some(settled.name().to_string());
-        let record = allocate_locked(AllocParts {
-            stack,
-            agent,
-            draw: settled.draw(),
-            data,
-            lock: &lock,
-            git,
-            saver,
-            routing: Some(&line),
-            expired,
-            instant,
-        })?;
-        return Ok(RoutedPhase::Allocated(record));
-    }
-    Ok(RoutedPhase::Standing(RoutedStanding {
-        lock,
-        data,
-        instant,
-        expired,
-    }))
+    saver(stack, &data)?;
+    Ok(wait)
 }
 
 /// Allocate a routed claim that waits where its settled draw
@@ -4207,6 +4227,14 @@ fn claim_routed_waiting_with(
         Some(profile) => (profile, None, None, Fallback::NoConsultation),
         None => settle(description, default_profile, transport),
     };
+    let routed = RoutedContext {
+        description,
+        settled,
+        model: &model,
+        verdict: &verdict,
+        confidence,
+        fallback,
+    };
     // The allocation check of the envelope, made under the lock
     // again now the routing consultation has settled the draw. A
     // settled draw that stands free allocates from this point
@@ -4215,20 +4243,11 @@ fn claim_routed_waiting_with(
     // that does not wait, exactly as SY-17 and SY-20 stand. The
     // snapshot the scoring request is built from is taken here,
     // from the registry as it stands at this check.
-    let snapshot = match routed_waiting_phase(
-        &stack,
-        agent,
-        description,
-        settled,
-        &model,
-        &verdict,
-        confidence,
-        fallback,
-        git,
-        saver,
-    )? {
-        RoutedPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
-        RoutedPhase::Standing(standing) => (standing.data.waits.clone(), free_runs(&standing.data)),
+    let snapshot = match waiting_phase(&stack, agent, settled.draw(), Some(&routed), git, saver)? {
+        WaitingPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
+        WaitingPhase::Standing(standing) => {
+            (standing.data.waits.clone(), free_runs(&standing.data))
+        }
     };
     let request = scoring_request(
         settled.name(),
@@ -4239,51 +4258,26 @@ fn claim_routed_waiting_with(
         Some(description),
     );
     let outcome = settle_score(transport, &request);
-    let standing = match routed_waiting_phase(
-        &stack,
-        agent,
-        description,
-        settled,
-        &model,
-        &verdict,
-        confidence,
-        fallback,
-        git,
-        saver,
-    )? {
-        RoutedPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
-        RoutedPhase::Standing(standing) => standing,
+    let standing = match waiting_phase(&stack, agent, settled.draw(), Some(&routed), git, saver)? {
+        WaitingPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
+        WaitingPhase::Standing(standing) => standing,
     };
-    let RoutedStanding {
-        lock,
-        mut data,
-        instant,
-        expired,
-    } = standing;
-    let wait = Wait {
-        agent: agent.to_string(),
-        profile: settled.name().to_string(),
-        recorded_at: instant.clone(),
-        wait_for,
-        score: outcome.score,
-        confidence: outcome.confidence,
-        model: outcome.model,
-        fallback: outcome.fallback.to_string(),
-    };
-    let mut line = QueueLine::for_wait(&instant, "queued", &wait);
-    line.request_sha256 = Some(sha256_hex(request.as_bytes()));
-    line.request_bytes = Some(request.len());
-    line.append(&stack)?;
-    append_leavings(&stack, &instant, "expired", &expired, None)?;
     let mut routing_line = RoutingLine::new(agent, description, model);
     routing_line.verdict = verdict;
     routing_line.confidence = confidence;
     routing_line.fallback = fallback;
     routing_line.refusal = Some("queued".to_string());
-    routing_line.append(&stack)?;
-    data.waits.push(wait.clone());
-    lock.verify_current()?;
-    saver(&stack, &data)?;
+    let wait = record_wait(
+        &stack,
+        standing,
+        agent,
+        settled.name(),
+        wait_for,
+        &request,
+        outcome,
+        Some(routing_line),
+        saver,
+    )?;
     Ok(ClaimOutcome::Wait(wait))
 }
 
