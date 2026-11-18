@@ -17,13 +17,13 @@
 //! it runs in. A scan root that does not stand is a scan error at
 //! exit 2, where the setup scanner exited 0 with zero counts. A
 //! file that cannot be read is a clean scan error at exit 2, where
-//! the setup scanner let the failure escape as a traceback at exit
-//! 1. The walk excludes directories by name below the scan root,
-//! so the name of an ancestor of the root can never exclude the
-//! root itself, and every file in the tree is scanned, whatever
-//! its name or suffix, apart from the known binary suffixes, and
-//! a file that does not decode as UTF-8 fails the scan loudly
-//! instead of passing unseen.
+//! the setup scanner let the failure escape as a traceback at
+//! exit 1. The walk excludes directories by name below the scan
+//! root, so the name of an ancestor of the root can never exclude
+//! the root itself, and every file in the tree is scanned,
+//! whatever its name or suffix, apart from the known binary
+//! suffixes, and a file that does not decode as UTF-8 fails the
+//! scan loudly instead of passing unseen.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
