@@ -2532,11 +2532,16 @@ fn rollback_offers(git: &dyn GitRunner, stack: &Path, offers: &[Furnished], exc:
 /// other queue decision, and the release and the sweep and every
 /// offer the release makes publish in the one rename.
 pub fn release(stack: &Path, agent: &str) -> Result<ReleaseOutcome> {
-    release_with(stack, agent, &ProcessGit)
+    release_with(stack, agent, &ProcessGit, &save_registry)
 }
 
-fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<ReleaseOutcome> {
-    Ok(release_report_with(stack, agent, git)?.outcome)
+fn release_with(
+    stack: &Path,
+    agent: &str,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ReleaseOutcome> {
+    Ok(release_report_with(stack, agent, git, saver)?.outcome)
 }
 
 /// What a release did, with the furnishing failures its offers
@@ -2559,10 +2564,15 @@ pub struct ReleaseReport {
 /// is the one release performs, and this entry point adds no
 /// behaviour of its own.
 pub fn release_report(stack: &Path, agent: &str) -> Result<ReleaseReport> {
-    release_report_with(stack, agent, &ProcessGit)
+    release_report_with(stack, agent, &ProcessGit, &save_registry)
 }
 
-fn release_report_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<ReleaseReport> {
+fn release_report_with(
+    stack: &Path,
+    agent: &str,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ReleaseReport> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     let repo = stack.join(REPO_NAME);
@@ -2592,7 +2602,7 @@ fn release_report_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result
             append_leavings(&stack, &instant, "expired", &expired, None)?;
             append_leavings(&stack, &instant, "furnished", &furnished, Some(&spans))?;
             lock.verify_current()?;
-            save_registry(&stack, &data)?;
+            saver(&stack, &data)?;
             Ok(())
         })();
         if let Err(exc) = published {
@@ -2614,7 +2624,7 @@ fn release_report_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result
             None,
         )?;
         lock.verify_current()?;
-        save_registry(&stack, &data)?;
+        saver(&stack, &data)?;
         return Ok(ReleaseReport {
             outcome: ReleaseOutcome::Wait(wait),
             furnishing_failures: Vec::new(),
@@ -4475,6 +4485,73 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("could not be deleted"), "{message}");
+    }
+
+    /// The settlement pin of SY-A5, on the saver seam of
+    /// SY-A35. A release whose publish fails at its save step,
+    /// after the released claim's worktree and branch already
+    /// stand removed, leaves the claim's record standing in the
+    /// registry over the deleted git state, its furnished
+    /// offers rolled back and the wait standing. The retry of
+    /// the same release heals the state whole: it takes the
+    /// missing worktree prune path, skips the missing branch,
+    /// furnishes the wait exactly once, and publishes. The pin
+    /// passes on the behaviour as it stands by design, because
+    /// the behaviour is the settlement's claim, and it fails on
+    /// the plausible wrong repairs, a retry that refuses a
+    /// missing worktree or a missing branch, a release that
+    /// publishes its record removal ahead of its offers, or a
+    /// rollback that leaves a furnished offer standing.
+    #[test]
+    fn a_release_whose_publish_fails_leaves_a_record_the_retry_heals() {
+        let (dir, stack) = unit_stack("release-save-fails");
+        claim(&stack, "holder").unwrap();
+        claim(&stack, "filler").unwrap();
+        let waited = claim_waiting(&stack, "waiter", None, None).unwrap();
+        assert!(matches!(waited, ClaimOutcome::Wait(_)));
+        let error = release_report_with(&stack, "holder", &ProcessGit, &failing_saver)
+            .expect_err("the staged save must fail the release after its offers");
+        assert!(
+            error.message().contains("staged to fail"),
+            "{}",
+            error.message()
+        );
+        let data = load_registry(&stack).unwrap();
+        assert!(data.claims.contains_key("holder"));
+        assert!(data.claims.contains_key("filler"));
+        assert!(!data.claims.contains_key("waiter"));
+        assert_eq!(data.waits.len(), 1);
+        assert_eq!(data.waits[0].agent, "waiter");
+        assert!(!stack.join("worktrees/holder").exists());
+        assert!(!stack.join("worktrees/waiter").exists());
+        let listing = ProcessGit
+            .result(&stack.join(REPO_NAME), &["branch", "--list"])
+            .unwrap();
+        assert!(
+            !listing.stdout.contains("switchyard/holder"),
+            "{}",
+            listing.stdout
+        );
+        assert!(
+            !listing.stdout.contains("switchyard/waiter"),
+            "{}",
+            listing.stdout
+        );
+        match release(&stack, "holder").unwrap() {
+            ReleaseOutcome::Claim(record) => assert_eq!(record.agent, "holder"),
+            ReleaseOutcome::Wait(_) => panic!("the retry must release the claim"),
+        }
+        let data = load_registry(&stack).unwrap();
+        assert!(!data.claims.contains_key("holder"));
+        assert!(data.waits.is_empty());
+        let furnished = data
+            .claims
+            .get("waiter")
+            .expect("the retry furnishes the standing wait");
+        assert_eq!((furnished.port_start, furnished.port_end), (20000, 20009));
+        assert!(stack.join("worktrees/waiter").is_dir());
+        assert!(!stack.join("worktrees/holder").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
