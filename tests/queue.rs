@@ -360,8 +360,8 @@ fn a_waiting_routed_claim_waits_on_the_profile_its_consultation_settled() {
         "routed",
         "Run the web app and its API while I fix the checkout flow.",
         Profile::Lean,
-        Some(&transport),
         None,
+        Some(&transport),
     )
     .unwrap();
     let wait = waited(outcome);
@@ -676,8 +676,8 @@ fn a_queue_filled_during_a_consultation_refuses_queue_full_and_records_it() {
         "routed",
         "Run the web app and its API while I fix the checkout flow.",
         Profile::Lean,
-        Some(&transport),
         None,
+        Some(&transport),
     )
     .expect_err("a queue filled during the consultations refuses as queue full");
     assert!(
@@ -756,8 +756,8 @@ fn a_routed_waiting_claim_whose_settled_draw_is_taken_during_routing_waits_with_
         "waiter",
         "Run the web app and its API while I fix the checkout flow.",
         Profile::Lean,
-        Some(&transport),
         None,
+        Some(&transport),
     )
     .unwrap();
     let wait = waited(outcome);
@@ -1624,8 +1624,8 @@ fn a_routed_waiting_claim_that_allocates_spends_no_scoring_consultation() {
             "routed",
             "Run the web app and its API while I fix the checkout flow.",
             Profile::Lean,
-            Some(&transport),
             None,
+            Some(&transport),
         )
         .unwrap(),
     );

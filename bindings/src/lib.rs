@@ -342,10 +342,10 @@ fn claim_routed(
                     agent,
                     description,
                     default,
+                    bound,
                     transport
                         .as_ref()
                         .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
-                    bound,
                 )
             })
             .map_err(to_py_error)?;

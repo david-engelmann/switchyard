@@ -4158,16 +4158,16 @@ pub fn claim_routed_waiting(
     agent: &str,
     description: &str,
     default_profile: Profile,
-    transport: Option<&dyn JudgeTransport>,
     wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
 ) -> Result<ClaimOutcome> {
     claim_routed_waiting_with(
         stack,
         agent,
         description,
         default_profile,
-        transport,
         wait_for,
+        transport,
         &ProcessGit,
         &save_registry,
     )
@@ -4179,8 +4179,8 @@ fn claim_routed_waiting_with(
     agent: &str,
     description: &str,
     default_profile: Profile,
-    transport: Option<&dyn JudgeTransport>,
     wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ClaimOutcome> {
