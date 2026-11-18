@@ -84,6 +84,30 @@ def test_init_refuses_boolean_pool_arguments(tmp_path):
 
     assert not (tmp_path / "stack").exists()
 
+def test_init_pool_arguments_stand_keyword_only(tmp_path):
+    stack = str(tmp_path / "stack")
+
+    # The pool arguments stand keyword-only, as the optional
+    # arguments of the claim functions do, so a caller cannot
+    # transpose range_size and range_count by position and build
+    # a pool of the wrong shape in silence. This pin fails on
+    # the old signature for the real reason that it accepted
+    # the positional call and built the stack, and its keyword
+    # half names non-default values for all three arguments,
+    # so a build that ignored a keyword value would fail it.
+    with pytest.raises(TypeError):
+        switchyard.init(stack, 20000, 10, 16)
+    assert not (tmp_path / "stack").exists()
+
+    with pytest.raises(TypeError):
+        switchyard.init(stack, 20000)
+    assert not (tmp_path / "stack").exists()
+
+    pool = switchyard.init(
+        stack, port_start=21000, range_size=5, range_count=4
+    )
+    assert pool == {"port_start": 21000, "range_size": 5, "range_count": 4}
+
 
 def test_the_other_refusal_classes_raise_their_own_types(tmp_path):
     stack = str(tmp_path / "stack")
