@@ -296,7 +296,10 @@ fn codepoint_scan_with_no_argument_scans_the_current_directory() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(stdout.contains("em dash U+2014 count 1"), "{stdout}");
+    assert!(
+        stdout.lines().any(|line| line == "em dash U+2014 count 1"),
+        "{stdout}"
+    );
 }
 
 const CANONICAL_ABOVE_MARKER_SHA256: &str =
