@@ -22,8 +22,9 @@
 //! root, so the name of an ancestor of the root can never exclude
 //! the root itself, and every file in the tree is scanned,
 //! whatever its name or suffix, apart from the known binary
-//! suffixes, and a file that does not decode as UTF-8 fails the
-//! scan loudly instead of passing unseen.
+//! suffixes, and the walk follows no directory symlink, and a
+//! file that does not decode as UTF-8 fails the scan loudly
+//! instead of passing unseen.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
