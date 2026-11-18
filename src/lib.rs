@@ -1189,14 +1189,22 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 /// The epoch microseconds a timestamp names, for a timestamp in
-/// the grammar is_valid_timestamp accepts. The registry reader
-/// validates every recorded instant against that grammar before
-/// an expiry comparison reads it, so a value outside the grammar
-/// never reaches this parser from a validated document, and the
+/// the grammar is_valid_timestamp accepts. The parser refuses a
+/// value outside that grammar at its head, by the validator
+/// itself, so the two readers agree by construction. A month or
+/// a day or an hour outside its range, and a shape the grammar
+/// does not carry, return None here rather than an instant the
+/// validator would refuse. The registry reader validates every
+/// recorded instant against that grammar before an expiry
+/// comparison reads it, so a value outside the grammar never
+/// reaches this parser from a validated document, and the
 /// parser reads every shape inside the grammar, the minute and
 /// the second and the offset second standing optional exactly
 /// where the grammar leaves them optional.
 fn stamp_micros(text: &str) -> Option<i128> {
+    if !is_valid_timestamp(text) {
+        return None;
+    }
     let bytes = text.as_bytes();
     let (year, mut at) = take_digits(bytes, 0, 4)?;
     let extended = bytes.get(at) == Some(&b'-');
@@ -4714,6 +4722,30 @@ mod tests {
         let data = load_registry(&stack).unwrap();
         assert_eq!(data.port_pool.start, 20000);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The gate of SY-A3. A shape the validator refuses returns
+    /// None from stamp_micros rather than an instant computed
+    /// past the refusal, one shape for each range the validator
+    /// checks and one for the colonless basic time its grammar
+    /// does not carry. Every shape below computed an instant on
+    /// the code before the gate, so each assertion fails there
+    /// for the real reason.
+    #[test]
+    fn stamp_micros_refuses_every_shape_the_validator_refuses() {
+        for shape in [
+            "2026-13-02T10:00:00Z",
+            "2026-11-32T10:00:00Z",
+            "2026-02-30T10:00:00Z",
+            "2026-11-02T24:00:00Z",
+            "2026-11-02T10:60:00Z",
+            "2026-11-02T10:00:60Z",
+            "2026-11-02T10:00:00+24:00",
+            "20261102T100000",
+        ] {
+            assert!(!is_valid_timestamp(shape), "{shape}");
+            assert_eq!(stamp_micros(shape), None, "{shape}");
+        }
     }
 
     #[test]
