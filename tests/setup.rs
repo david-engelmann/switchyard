@@ -376,6 +376,29 @@ fn codepoint_scan_fails_loudly_on_undecodable_input() {
 }
 
 #[test]
+fn codepoint_scan_refuses_a_root_that_does_not_stand() {
+    // The scanner's module doc names a scan root that does not
+    // stand as a scan error at exit 2, one of its four deliberate
+    // differences from the setup scanner, which exited 0 with
+    // zero counts there. The pin drives the built scanner at a
+    // root that is never created, so it fails on any form that
+    // falls back to a default root and reports zero counts, and
+    // on any form that panics on the missing root at exit 101.
+    let dir = temp_dir("missing-root").join("no-such-root");
+    let result = scan_tree(&dir);
+    assert_eq!(result.status, 2);
+    let root = dir.display().to_string();
+    assert!(
+        result
+            .stderr
+            .lines()
+            .any(|line| line.contains("scan error") && line.contains(&root)),
+        "{}",
+        result.stderr
+    );
+}
+
+#[test]
 fn codepoint_scan_counts_a_dash_in_a_file_with_no_suffix() {
     let dir = temp_dir("no-suffix");
     std::fs::write(dir.join("LICENSE"), "a\u{2014}b").unwrap();
