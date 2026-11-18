@@ -2851,63 +2851,89 @@ enum Consultation {
     Malformed,
 }
 
-/// Classify one reply body. The confidence of a verdict is the
-/// probability of the chosen label read from the probabilities
-/// map, and a confidence field the reply also carries is never
-/// read, because the wire evidence recorded in the Round 3
-/// amendment preamble shows it is a separate measurement.
-fn classify_reply(body: &str) -> Consultation {
+/// The outcome of the reply grammar walk the two classifiers
+/// share, before either maps it onto its own shapes: the reply
+/// stood silent, or it stood malformed, or it chose one of the
+/// labels with the confidence its probabilities carry for it.
+enum ChoiceWalk {
+    Silence,
+    Malformed,
+    Chosen(String, f64),
+}
+
+/// Walk one reply body under the grammar of obligation SY-16,
+/// for the question and the label set the caller names. The
+/// walk returns silence on an empty body and on a document
+/// carrying no answer for the question, and malformed on a
+/// document that does not parse, on a repeated key, on an
+/// answer that is not an object, on a choice outside the label
+/// set, on a probabilities object carrying anything but exactly
+/// the labels, and on a probability outside the range 0 to 1.
+/// The confidence of a choice is the probability of the chosen
+/// label read from the probabilities map, and a confidence field
+/// the reply also carries is never read, because the wire
+/// evidence recorded in the Round 3 amendment preamble shows it
+/// is a separate measurement.
+fn classify_choice(body: &str, question: &str, labels: &[&str]) -> ChoiceWalk {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        return Consultation::Silence;
+        return ChoiceWalk::Silence;
     }
     let data: JVal = match serde_json::from_str(trimmed) {
         Ok(value) => value,
-        Err(_) => return Consultation::Malformed,
+        Err(_) => return ChoiceWalk::Malformed,
     };
     if first_duplicate_key(&data).is_some() {
-        return Consultation::Malformed;
+        return ChoiceWalk::Malformed;
     }
     let entry = match data
         .get("answers")
-        .and_then(|answers| answers.get(ROUTING_QUESTION))
+        .and_then(|answers| answers.get(question))
     {
         Some(entry) => entry,
-        None => return Consultation::Silence,
+        None => return ChoiceWalk::Silence,
     };
     if !matches!(entry, JVal::Obj(_)) {
-        return Consultation::Malformed;
+        return ChoiceWalk::Malformed;
     }
     let choice = match entry.get("choice").and_then(JVal::as_str) {
-        Some(choice) if VERDICT_LABELS.contains(&choice) => choice.to_string(),
-        _ => return Consultation::Malformed,
+        Some(choice) if labels.contains(&choice) => choice.to_string(),
+        _ => return ChoiceWalk::Malformed,
     };
     let probabilities = match entry.get("probabilities") {
-        Some(probabilities @ JVal::Obj(pairs)) if exact_keys(pairs, &VERDICT_LABELS) => {
-            probabilities
-        }
-        _ => return Consultation::Malformed,
+        Some(probabilities @ JVal::Obj(pairs)) if exact_keys(pairs, labels) => probabilities,
+        _ => return ChoiceWalk::Malformed,
     };
-    let mut values = [0.0_f64; 4];
-    for (slot, label) in values.iter_mut().zip(VERDICT_LABELS.iter()) {
+    let mut confidence = 0.0_f64;
+    for label in labels {
         match probabilities.get(label).and_then(jval_f64) {
-            Some(number) if (0.0..=1.0).contains(&number) => *slot = number,
-            _ => return Consultation::Malformed,
+            Some(number) if (0.0..=1.0).contains(&number) => {
+                if *label == choice {
+                    confidence = number;
+                }
+            }
+            _ => return ChoiceWalk::Malformed,
         }
     }
-    let index = VERDICT_LABELS
-        .iter()
-        .position(|label| *label == choice)
-        .unwrap();
-    let confidence = values[index];
-    if choice == "other" {
-        Consultation::Abstention(confidence)
-    } else {
-        let profile = Profile::from_name(&choice).unwrap();
-        if confidence >= LOW_CONFIDENCE_THRESHOLD {
-            Consultation::Verdict(profile, confidence)
-        } else {
-            Consultation::LowConfidence(profile, confidence)
+    ChoiceWalk::Chosen(choice, confidence)
+}
+
+/// Classify one reply body.
+fn classify_reply(body: &str) -> Consultation {
+    match classify_choice(body, ROUTING_QUESTION, &VERDICT_LABELS) {
+        ChoiceWalk::Silence => Consultation::Silence,
+        ChoiceWalk::Malformed => Consultation::Malformed,
+        ChoiceWalk::Chosen(choice, confidence) => {
+            if choice == "other" {
+                Consultation::Abstention(confidence)
+            } else {
+                let profile = Profile::from_name(&choice).unwrap();
+                if confidence >= LOW_CONFIDENCE_THRESHOLD {
+                    Consultation::Verdict(profile, confidence)
+                } else {
+                    Consultation::LowConfidence(profile, confidence)
+                }
+            }
         }
     }
 }
@@ -3496,58 +3522,20 @@ enum ScoreConsultation {
 /// grammar's, one JSON object carrying one answer for the
 /// scoring question, whose choice names one of the eleven
 /// declared labels and whose probabilities carry exactly those
-/// eleven labels each standing in the range 0 to 1. The
-/// confidence of a score is the probability of the chosen label
-/// read from the probabilities map, and a confidence field the
-/// reply also carries is never read.
+/// eleven labels each standing in the range 0 to 1.
 fn classify_score(body: &str) -> ScoreConsultation {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return ScoreConsultation::Silence;
-    }
-    let data: JVal = match serde_json::from_str(trimmed) {
-        Ok(value) => value,
-        Err(_) => return ScoreConsultation::Malformed,
-    };
-    if first_duplicate_key(&data).is_some() {
-        return ScoreConsultation::Malformed;
-    }
-    let entry = match data
-        .get("answers")
-        .and_then(|answers| answers.get(SCORING_QUESTION))
-    {
-        Some(entry) => entry,
-        None => return ScoreConsultation::Silence,
-    };
-    if !matches!(entry, JVal::Obj(_)) {
-        return ScoreConsultation::Malformed;
-    }
-    let choice = match entry.get("choice").and_then(JVal::as_str) {
-        Some(choice) if SCORE_LABELS.contains(&choice) => choice.to_string(),
-        _ => return ScoreConsultation::Malformed,
-    };
-    let probabilities = match entry.get("probabilities") {
-        Some(probabilities @ JVal::Obj(pairs)) if exact_keys(pairs, &SCORE_LABELS) => probabilities,
-        _ => return ScoreConsultation::Malformed,
-    };
-    let mut values = [0.0_f64; 11];
-    for (slot, label) in values.iter_mut().zip(SCORE_LABELS.iter()) {
-        match probabilities.get(label).and_then(jval_f64) {
-            Some(number) if (0.0..=1.0).contains(&number) => *slot = number,
-            _ => return ScoreConsultation::Malformed,
+    match classify_choice(body, SCORING_QUESTION, &SCORE_LABELS) {
+        ChoiceWalk::Silence => ScoreConsultation::Silence,
+        ChoiceWalk::Malformed => ScoreConsultation::Malformed,
+        ChoiceWalk::Chosen(choice, confidence) => {
+            if choice == "other" {
+                ScoreConsultation::Abstention
+            } else if confidence >= LOW_CONFIDENCE_THRESHOLD {
+                ScoreConsultation::Score(choice.parse().unwrap(), confidence)
+            } else {
+                ScoreConsultation::LowConfidence
+            }
         }
-    }
-    let index = SCORE_LABELS
-        .iter()
-        .position(|label| *label == choice)
-        .unwrap();
-    let confidence = values[index];
-    if choice == "other" {
-        ScoreConsultation::Abstention
-    } else if confidence >= LOW_CONFIDENCE_THRESHOLD {
-        ScoreConsultation::Score(choice.parse().unwrap(), confidence)
-    } else {
-        ScoreConsultation::LowConfidence
     }
 }
 
