@@ -4735,6 +4735,17 @@ mod tests {
             assert!(is_valid_timestamp(shape), "{shape}");
             assert_eq!(stamp_micros(shape), Some(whole), "{shape}");
         }
+        // The no separator basic shape the SY-A4 examination
+        // settled: a basic date run into a basic time with no
+        // separator character is refused by both readers, the
+        // validator at its separator step and stamp_micros at
+        // its offset match, so neither computes an instant for
+        // it. The pin passes on the code as it stands by design
+        // and fails on the plausible wrong repairs, a validator
+        // loosened to accept the shape or a reader taught to
+        // compute its instant.
+        assert!(!is_valid_timestamp("20261102100000"));
+        assert_eq!(stamp_micros("20261102100000"), None);
         assert_eq!(
             stamp_micros("2026-11-02"),
             Some(days_from_civil(2026, 11, 2) as i128 * 86_400_000_000)
