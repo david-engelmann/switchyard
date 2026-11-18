@@ -387,8 +387,15 @@ fn codepoint_scan_refuses_a_root_that_does_not_stand() {
     let dir = temp_dir("missing-root").join("no-such-root");
     let result = scan_tree(&dir);
     assert_eq!(result.status, 2);
-    assert!(result.stderr.contains("scan error"), "{}", result.stderr);
-    assert!(result.stderr.contains("no-such-root"), "{}", result.stderr);
+    let root = dir.display().to_string();
+    assert!(
+        result
+            .stderr
+            .lines()
+            .any(|line| line.contains("scan error") && line.contains(&root)),
+        "{}",
+        result.stderr
+    );
 }
 
 #[test]
