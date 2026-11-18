@@ -10,9 +10,10 @@ the plain refusals, NotInitialisedError an uninitialised stack,
 CorruptRegistryError a corrupt registry, and InvalidNameError an
 agent name the library rejects, mirroring the exit classes the
 command line reports. An argument of the wrong shape raises
-TypeError instead, a boolean where an integer stands, a value of
-a wrong type, or a value passed by position for an argument that
-stands keyword-only.
+TypeError instead, a boolean where an integer stands, a value
+passed by position for an argument that stands keyword-only, or
+a value of a wrong type in a pool argument or in a wait bound
+beside a claim that waits.
 """
 
 from ._switchyard import (
