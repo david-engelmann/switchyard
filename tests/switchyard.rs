@@ -1483,6 +1483,26 @@ fn an_init_with_a_50_digit_port_start_is_refused_and_creates_nothing() {
 }
 
 #[test]
+fn an_init_with_a_pool_option_that_is_no_integer_is_refused_by_name() {
+    // The three pool options refuse a value that is no integer
+    // under one wording, each naming its own option. The wording
+    // stands written once in the parser, and this pin holds each
+    // option to it, so a drift in any one statement of the
+    // refusal fails here.
+    for option in ["--port-start", "--range-size", "--range-count"] {
+        let base = temp_dir("not-an-integer");
+        let stack = base.join("stack");
+        let (code, _, err) = run_cli(&["init", "--stack", &stack.to_string_lossy(), option, "ten"]);
+        assert_eq!(code, 2, "{option} gave {err}");
+        assert!(
+            err.contains(&format!("argument {option}: invalid int value: 'ten'")),
+            "{option} gave {err}"
+        );
+        assert!(!stack.exists(), "a refused init leaves no stack behind");
+    }
+}
+
+#[test]
 fn a_registry_whose_pool_product_overflows_reads_corrupt_and_changes_nothing() {
     let stack = stack_fixture();
     let path = stack.join(REGISTRY_NAME);

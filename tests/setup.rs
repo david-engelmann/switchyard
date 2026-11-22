@@ -277,6 +277,31 @@ fn codepoint_scan_reports_zero_for_repo_tree() {
     assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
+#[test]
+fn codepoint_scan_with_no_argument_scans_the_current_directory() {
+    // The scanner's module doc names the scan root defaulting
+    // to the current directory among the port's deliberate
+    // differences from the setup scanner, and the workflow scan
+    // step names no root and relies on that default over the
+    // checkout tree. Every other drive of the scanner in this
+    // suite names its root, so the default stands pinned here.
+    // A scanner defaulting to any fixed tree reports zero
+    // counts over the staged tree at exit 0, and one refusing
+    // with no argument exits 2, and this pin fails on both.
+    let dir = temp_dir("no-argument");
+    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.lines().any(|line| line == "em dash U+2014 count 1"),
+        "{stdout}"
+    );
+}
+
 const CANONICAL_ABOVE_MARKER_SHA256: &str =
     "bb3e2fc1790b13729da3495c3f0902b968577f4e45ceb27e48e90b489f36e1a7";
 
@@ -316,6 +341,7 @@ fn codepoint_scan_counts_an_em_dash() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
     assert!(result.stdout.contains("note.md"));
 }
 
@@ -326,6 +352,7 @@ fn codepoint_scan_counts_an_en_dash() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("en dash U+2013 count 1"));
+    assert!(result.stdout.contains("em dash U+2014 count 0"));
 }
 
 #[test]
@@ -336,6 +363,7 @@ fn codepoint_scan_scans_a_root_under_an_excluded_ancestor() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -348,6 +376,7 @@ fn codepoint_scan_skips_excluded_dirs_below_the_root() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 0);
     assert!(result.stdout.contains("em dash U+2014 count 0"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -376,12 +405,36 @@ fn codepoint_scan_fails_loudly_on_undecodable_input() {
 }
 
 #[test]
+fn codepoint_scan_refuses_a_root_that_does_not_stand() {
+    // The scanner's module doc names a scan root that does not
+    // stand as a scan error at exit 2, one of its four deliberate
+    // differences from the setup scanner, which exited 0 with
+    // zero counts there. The pin drives the built scanner at a
+    // root that is never created, so it fails on any form that
+    // falls back to a default root and reports zero counts, and
+    // on any form that panics on the missing root at exit 101.
+    let dir = temp_dir("missing-root").join("no-such-root");
+    let result = scan_tree(&dir);
+    assert_eq!(result.status, 2);
+    let root = dir.display().to_string();
+    assert!(
+        result
+            .stderr
+            .lines()
+            .any(|line| line.contains("scan error") && line.contains(&root)),
+        "{}",
+        result.stderr
+    );
+}
+
+#[test]
 fn codepoint_scan_counts_a_dash_in_a_file_with_no_suffix() {
     let dir = temp_dir("no-suffix");
     std::fs::write(dir.join("LICENSE"), "a\u{2014}b").unwrap();
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -391,6 +444,7 @@ fn codepoint_scan_counts_a_dash_in_an_uppercase_suffix_file() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
