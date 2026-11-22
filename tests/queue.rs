@@ -1185,6 +1185,7 @@ fn a_wait_stands_short_of_its_bound_and_is_swept_at_and_past_it() {
                 .collect::<Vec<_>>();
             assert_eq!(expired.len(), 1, "{tag}");
             assert_eq!(expired[0]["agent"], "waiter", "{tag}");
+            assert_eq!(queue_log_field_set(expired[0]), QUEUE_LOG_FIELDS, "{tag}");
         }
     }
 }
@@ -1228,6 +1229,7 @@ fn release_cancels_a_standing_wait_and_a_second_release_refuses() {
     assert_eq!(lines[1]["kind"], "cancelled");
     assert_eq!(lines[1]["agent"], "waiter");
     assert_eq!(lines[1]["ports"], serde_json::Value::Null);
+    assert_eq!(queue_log_field_set(&lines[1]), QUEUE_LOG_FIELDS);
     let error = release(&stack, "waiter").expect_err("an agent holding nothing refuses");
     assert!(
         error
@@ -1823,4 +1825,58 @@ fn the_release_command_prints_each_furnishing_failure_on_its_error_output() {
         "{err}"
     );
     assert!(!err.contains("leaner"), "{err}");
+}
+
+#[test]
+fn the_waiting_print_names_the_score_or_the_fallback_and_the_bound() {
+    use std::os::unix::fs::PermissionsExt;
+    let stack = cli_stack("cli-print", 1);
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, _) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
+    assert_eq!(code, 0);
+    // A stub judge that scores the wait, staged under a
+    // temporary name and renamed into place, the shape the
+    // deadline pin above stages its own judge in.
+    let judge_dir = temp_dir("cli-print-judge");
+    let staged = judge_dir.join("judge.staged");
+    let body = score_body("5", 0.9);
+    std::fs::write(
+        &staged,
+        format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{body}'\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let judge = judge_dir.join("judge.sh");
+    std::fs::rename(&staged, &judge).unwrap();
+    let (code, out, err) = run_cli(&[
+        "claim",
+        "--stack",
+        &stack_arg,
+        "scored",
+        "--wait",
+        "--judge-command",
+        &judge.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("waiting scored"), "{out}");
+    assert!(out.contains("profile plain"), "{out}");
+    assert!(out.contains("score 5"), "{out}");
+    assert!(out.contains("confidence 0.9"), "{out}");
+    assert!(!out.contains("fallback"), "{out}");
+    // A bounded scoreless wait prints the other arm of the
+    // print and the bound line beside it.
+    let (code, out, err) = run_cli(&[
+        "claim",
+        "--stack",
+        &stack_arg,
+        "bounded",
+        "--wait",
+        "--wait-for",
+        "30",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("waiting bounded"), "{out}");
+    assert!(out.contains("score none"), "{out}");
+    assert!(out.contains("fallback no transport"), "{out}");
+    assert!(out.contains("wait bound 30 seconds"), "{out}");
 }
