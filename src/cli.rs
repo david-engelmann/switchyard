@@ -499,8 +499,8 @@ fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<(
                 agent,
                 description,
                 default,
-                transport_ref,
                 wait_bound(parsed),
+                transport_ref,
             )?;
             print_outcome(out, &outcome);
             return Ok(());

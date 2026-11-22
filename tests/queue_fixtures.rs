@@ -266,8 +266,8 @@ fn the_recorded_queue_fixtures_replay_exactly() {
                 agent,
                 description.unwrap(),
                 Profile::from_name(settled).unwrap(),
-                Some(&transport),
                 bound,
+                Some(&transport),
             )
         } else if settled == "plain" {
             claim_waiting(&stack, agent, bound, Some(&transport))
