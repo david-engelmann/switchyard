@@ -1977,16 +1977,25 @@ fn free_run(data: &Registry, ranges: i64) -> Option<(i64, i64)> {
     if ranges < 1 || ranges > pool.range_count {
         return None;
     }
-    let taken: Vec<(i64, i64)> = data
-        .claims
-        .values()
-        .map(|record| (record.port_start, record.port_end))
-        .collect();
-    for index in 0..=(pool.range_count - ranges) {
-        let start = pool.start + index * pool.range_size;
-        let end = start + ranges * pool.range_size - 1;
-        if taken.iter().all(|(low, high)| end < *low || start > *high) {
-            return Some((start, end));
+    let mut taken: BTreeSet<i64> = BTreeSet::new();
+    for record in data.claims.values() {
+        let first = (record.port_start - pool.start) / pool.range_size;
+        let last = (record.port_end - pool.start) / pool.range_size;
+        for index in first..=last {
+            taken.insert(index);
+        }
+    }
+    let mut run: i64 = 0;
+    for index in 0..pool.range_count {
+        if taken.contains(&index) {
+            run = 0;
+        } else {
+            run += 1;
+            if run == ranges {
+                let start = pool.start + (index - ranges + 1) * pool.range_size;
+                let end = start + ranges * pool.range_size - 1;
+                return Some((start, end));
+            }
         }
     }
     None
@@ -5047,6 +5056,44 @@ mod tests {
         let digests = queued_digests(&stack, &wanted);
         assert_eq!(digests.len(), 1);
         assert_eq!(digests["w1"], ("d".repeat(64), 7));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The first fit search of SY-A44 over a fragmented pool.
+    /// Claims stand on slots 0, 2, and 5 of eight, so the free
+    /// runs stand as slot 1 alone, slots 3 and 4, and slots 6
+    /// and 7, and the search answers the first run that reaches
+    /// each draw and refuses the draws no run reaches. The pin
+    /// passes against the search as it stood, the repair being
+    /// behavior identical; its work is to fail against a search
+    /// that returns a later run or a longer run, or one that
+    /// miscounts at the pool's end.
+    #[test]
+    fn free_run_finds_the_first_run_in_a_fragmented_pool() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-free-run",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        init_stack(&stack, 20000, 10, 8).unwrap();
+        for index in 0..6 {
+            claim(&stack, &format!("holder-{index}")).unwrap();
+        }
+        release(&stack, "holder-1").unwrap();
+        release(&stack, "holder-3").unwrap();
+        release(&stack, "holder-4").unwrap();
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(free_run(&data, 1), Some((20010, 20019)));
+        assert_eq!(free_run(&data, 2), Some((20030, 20049)));
+        assert_eq!(free_run(&data, 3), None);
+        assert_eq!(free_run(&data, 8), None);
+        release(&stack, "holder-0").unwrap();
+        release(&stack, "holder-2").unwrap();
+        release(&stack, "holder-5").unwrap();
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(free_run(&data, 8), Some((20000, 20079)));
         let _ = fs::remove_dir_all(&dir);
     }
 }
