@@ -126,9 +126,20 @@ fn flush_step(step_lines: &mut Vec<String>, commands: &mut Vec<String>) {
     step_lines.clear();
 }
 
+/// A job head line of the workflow, a key standing at the two
+/// space indent the jobs of ci.yml are keyed at, so the parser
+/// can tell one job from the next in a file it reads as lines.
+fn is_job_head(line: &str) -> bool {
+    line.starts_with("  ")
+        && !line.starts_with("   ")
+        && line.trim_end().ends_with(':')
+        && !line.trim().starts_with('-')
+}
+
 fn run_commands(ci_text: &str) -> Vec<String> {
     let mut commands = Vec::new();
     let mut step_lines: Vec<String> = Vec::new();
+    let mut in_jobs = false;
     let mut in_steps = false;
     let mut in_test_job = false;
     let mut job_disabled = false;
@@ -137,11 +148,25 @@ fn run_commands(ci_text: &str) -> Vec<String> {
         if stripped.starts_with('#') {
             continue;
         }
-        if stripped == "test:" {
-            in_test_job = true;
+        if stripped == "jobs:" {
+            in_jobs = true;
             continue;
         }
-        if in_test_job && !in_steps && stripped.starts_with("if:") {
+        if in_jobs && is_job_head(line) {
+            // A new job ends the test job's steps. The run
+            // commands of a later job are that job's own and
+            // are never collected as the test job's, because
+            // the gate this parser proves is the one the test
+            // job runs.
+            flush_step(&mut step_lines, &mut commands);
+            in_test_job = stripped == "test:";
+            in_steps = false;
+            continue;
+        }
+        if !in_test_job {
+            continue;
+        }
+        if !in_steps && stripped.starts_with("if:") {
             let value = stripped
                 .split_once(':')
                 .map(|(_, rest)| rest)
@@ -181,6 +206,31 @@ fn ci_runs_the_local_gate_commands() {
     assert!(commands.iter().any(|c| c == SCAN_COMMAND));
     assert!(commands.iter().any(|c| c == FMT_COMMAND));
     assert!(commands.iter().any(|c| c == CLIPPY_COMMAND));
+}
+
+#[test]
+fn ci_gate_parser_does_not_credit_a_later_job_with_a_gate_command() {
+    let ci_text = read(".github/workflows/ci.yml");
+    // Move the scan step out of the test job and stand it at
+    // the end of the file, where it belongs to the binding
+    // job. The parser must still report the gate commands the
+    // test job itself runs and must not report the scan,
+    // because obligation S2 speaks of the gate the workflow's
+    // test job runs, not of a command standing anywhere in
+    // the file.
+    let scan_step = concat!(
+        "      - name: Run the codepoint scan\n",
+        "        run: cargo run --bin codepoint_scan\n"
+    );
+    assert!(ci_text.contains(scan_step));
+    let mut moved = ci_text.replace(scan_step, "");
+    assert!(!moved.contains(SCAN_COMMAND));
+    moved.push_str(scan_step);
+    let commands = run_commands(&moved);
+    assert!(commands.iter().any(|c| c == GATE_COMMAND));
+    assert!(commands.iter().any(|c| c == FMT_COMMAND));
+    assert!(commands.iter().any(|c| c == CLIPPY_COMMAND));
+    assert!(!commands.iter().any(|c| c == SCAN_COMMAND));
 }
 
 #[test]
