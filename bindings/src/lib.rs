@@ -154,9 +154,11 @@ fn pool_argument(value: Option<&Bound<'_, PyAny>>, name: &str, default: i64) -> 
 ///
 /// The pool arguments default to the values the library records
 /// as DEFAULT_PORT_START and DEFAULT_RANGE_SIZE and
-/// DEFAULT_RANGE_COUNT, resolved from the library itself.
+/// DEFAULT_RANGE_COUNT, resolved from the library itself. The
+/// pool arguments stand keyword-only, so no caller can place
+/// one in another's slot by position.
 #[pyfunction]
-#[pyo3(signature = (stack, port_start = None, range_size = None, range_count = None))]
+#[pyo3(signature = (stack, *, port_start = None, range_size = None, range_count = None))]
 fn init(
     py: Python<'_>,
     stack: PathBuf,
@@ -340,10 +342,10 @@ fn claim_routed(
                     agent,
                     description,
                     default,
+                    bound,
                     transport
                         .as_ref()
                         .map(|transport| transport as &dyn switchyard_core::JudgeTransport),
-                    bound,
                 )
             })
             .map_err(to_py_error)?;
