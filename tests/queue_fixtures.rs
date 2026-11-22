@@ -174,6 +174,25 @@ fn read_lines(stack: &Path, name: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The eleven fields of a queue log line, in sorted order,
+/// the same list the queue suite carries. The corpus records
+/// a queue line in full apart from its instant, so a produced
+/// line must carry exactly these fields: the ten the corpus
+/// records and its own instant, and no more.
+const QUEUE_LOG_FIELDS: [&str; 11] = [
+    "agent",
+    "at",
+    "confidence",
+    "fallback",
+    "kind",
+    "model",
+    "ports",
+    "profile",
+    "request_bytes",
+    "request_sha256",
+    "score",
+];
+
 fn assert_fields(actual: &serde_json::Value, expected: &serde_json::Value, what: &str) {
     let expected = expected.as_object().unwrap();
     for (key, want) in expected {
@@ -290,6 +309,25 @@ fn the_recorded_queue_fixtures_replay_exactly() {
             &lines[0],
             &fixture["expected_queue_line"],
             &format!("{id} queue line"),
+        );
+        // The subset comparison above cannot see a field the
+        // library adds beyond the recorded set. The produced
+        // line's own field set is asserted exact: the ten
+        // recorded fields and its instant.
+        let mut produced_fields: Vec<String> = lines[0]
+            .as_object()
+            .expect("the queue line is an object")
+            .keys()
+            .cloned()
+            .collect();
+        produced_fields.sort();
+        assert_eq!(
+            produced_fields,
+            QUEUE_LOG_FIELDS
+                .iter()
+                .map(|field| field.to_string())
+                .collect::<Vec<String>>(),
+            "{id}: the queue line's field set"
         );
         if let Some(expected) = fixture["expected_routing_line"].as_object() {
             let lines = read_lines(&stack, "switchyard-routing.jsonl");
