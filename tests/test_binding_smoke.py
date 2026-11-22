@@ -122,6 +122,24 @@ def test_the_other_refusal_classes_raise_their_own_types(tmp_path):
     assert "invalid agent name" in str(invalid.value)
 
 
+def test_a_corrupt_registry_raises_the_corrupt_class_through_the_binding(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    registry = tmp_path / "stack" / "switchyard-registry.json"
+    registry.write_text("this is not json")
+
+    # The binding maps each refusal class to its own exception
+    # subclass, and the corrupt registry class is the one the
+    # Rust suites can only ever meet as exit code 2, so this pin
+    # is its only consumer proof. It fails if the mapping ever
+    # classes a corrupt registry as a plain refusal or as the
+    # base error, because the raises check names the subclass.
+    with pytest.raises(switchyard.CorruptRegistryError) as corrupt:
+        switchyard.list(stack)
+    assert "corrupt" in str(corrupt.value)
+
+
 def _verdict_body(choice, confidence):
     import json
 
