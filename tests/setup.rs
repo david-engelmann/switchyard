@@ -316,6 +316,7 @@ fn codepoint_scan_counts_an_em_dash() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
     assert!(result.stdout.contains("note.md"));
 }
 
@@ -326,6 +327,7 @@ fn codepoint_scan_counts_an_en_dash() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("en dash U+2013 count 1"));
+    assert!(result.stdout.contains("em dash U+2014 count 0"));
 }
 
 #[test]
@@ -336,6 +338,7 @@ fn codepoint_scan_scans_a_root_under_an_excluded_ancestor() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -348,6 +351,7 @@ fn codepoint_scan_skips_excluded_dirs_below_the_root() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 0);
     assert!(result.stdout.contains("em dash U+2014 count 0"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -382,6 +386,7 @@ fn codepoint_scan_counts_a_dash_in_a_file_with_no_suffix() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -391,6 +396,7 @@ fn codepoint_scan_counts_a_dash_in_an_uppercase_suffix_file() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
