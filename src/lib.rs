@@ -141,7 +141,7 @@ fn py_repr(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+            ch if (ch as u32) < 0x20 || (0x7f..=0x9f).contains(&(ch as u32)) => {
                 out.push_str(&format!("\\x{:02x}", ch as u32));
             }
             ch => out.push(ch),
