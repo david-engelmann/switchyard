@@ -122,6 +122,24 @@ def test_the_other_refusal_classes_raise_their_own_types(tmp_path):
     assert "invalid agent name" in str(invalid.value)
 
 
+def test_a_corrupt_registry_raises_the_corrupt_class_through_the_binding(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    registry = tmp_path / "stack" / "switchyard-registry.json"
+    registry.write_text("this is not json")
+
+    # The binding maps each refusal class to its own exception
+    # subclass, and the corrupt registry class is the one the
+    # Rust suites can only ever meet as exit code 2, so this pin
+    # is its only consumer proof. It fails if the mapping ever
+    # classes a corrupt registry as a plain refusal or as the
+    # base error, because the raises check names the subclass.
+    with pytest.raises(switchyard.CorruptRegistryError) as corrupt:
+        switchyard.list(stack)
+    assert "corrupt" in str(corrupt.value)
+
+
 def _verdict_body(choice, confidence):
     import json
 
@@ -376,3 +394,60 @@ def test_an_oversized_wait_bound_is_a_named_refusal(tmp_path):
     assert "wait_for" in str(caught.value)
     assert "64-bit" in str(caught.value)
     assert switchyard.list(stack) == []
+
+
+def test_a_pool_argument_of_a_wrong_type_raises_type_error(tmp_path):
+    stack = str(tmp_path / "stack")
+
+    # A value of a wrong type at extraction passes through as
+    # the TypeError the extraction raises, beside the one width
+    # failure the binding maps to a named RefusalError and the
+    # boolean shape it refuses by name. A build that mapped
+    # every extraction failure to RefusalError would fail this
+    # pin, because the documented TypeError would arrive as a
+    # SwitchyardError instead.
+    with pytest.raises(TypeError) as caught:
+        switchyard.init(stack, port_start="20000")
+    assert not isinstance(caught.value, switchyard.SwitchyardError)
+    assert not (tmp_path / "stack").exists()
+
+
+def test_a_wait_bound_of_a_wrong_type_raises_type_error(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    with pytest.raises(TypeError) as caught:
+        switchyard.claim(stack, "waiter", wait=True, wait_for="30")
+    assert not isinstance(caught.value, switchyard.SwitchyardError)
+    assert switchyard.list(stack) == []
+
+
+def test_a_transport_returning_a_non_text_value_lands_as_transport(tmp_path):
+    import json
+
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    # A callable that returns a value that is not text surfaces
+    # as a transport failure, so the claim lands on its declared
+    # default under the transport class. A build that stringified
+    # the return would land the claim under the malformed class,
+    # and a build that let the extraction failure escape as an
+    # exception would break the claim instead of landing it, and
+    # this pin fails against either. The callable is passed by
+    # keyword, so the pin stands true on both sides of the claim
+    # family's keyword only signatures.
+    def judge(request):
+        return {"not": "text"}
+
+    record = switchyard.claim_routed(
+        stack, "alpha", "Run one server.", "lean", transport=judge
+    )
+    assert (record["port_start"], record["port_end"]) == (20000, 20009)
+
+    lines = (tmp_path / "stack" / "switchyard-routing.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    line = json.loads(lines[0])
+    assert line["fallback"] == "transport"
+    assert line["verdict"] is None
+    assert line["allocated"] == "lean"
