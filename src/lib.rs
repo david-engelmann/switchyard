@@ -2,11 +2,15 @@
 //!
 //! A stack is a plain directory. Inside it live a git repository, a
 //! worktrees directory, a lock file, and one registry file that
-//! records the port pool and every live claim. The registry is the
-//! only record, and every mutating command holds an exclusive flock
-//! lock on the lock file across the whole read and check and modify
-//! and write of the registry, so racing processes cannot both take
-//! the same agent name or overlapping port ranges.
+//! records the port pool and every live claim and every standing
+//! wait. Routed claims append to a routing log in the root, and
+//! waits and their leavings append to a queue log in the root,
+//! and no command reads either log to decide anything. The
+//! registry is the only record, and every mutating command holds
+//! an exclusive flock lock on the lock file across the whole read
+//! and check and modify and write of the registry, so racing
+//! processes cannot both take the same agent name or overlapping
+//! port ranges.
 
 pub mod cli;
 
@@ -137,7 +141,7 @@ fn py_repr(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+            ch if (ch as u32) < 0x20 || (0x7f..=0x9f).contains(&(ch as u32)) => {
                 out.push_str(&format!("\\x{:02x}", ch as u32));
             }
             ch => out.push(ch),
@@ -2100,8 +2104,8 @@ pub fn rollback_claim(
         }
     }
     if !branch_preexisted {
-        if let Ok(listed) = git.result(repo, &["branch", "--list", branch]) {
-            if listed.code == 0 && !listed.stdout.trim().is_empty() {
+        match git.result(repo, &["branch", "--list", branch]) {
+            Ok(listed) if listed.code == 0 && !listed.stdout.trim().is_empty() => {
                 match git.result(repo, &["branch", "-D", branch]) {
                     Ok(result) if result.code == 0 => {}
                     Ok(result) => problems.push(format!(
@@ -2114,6 +2118,15 @@ pub fn rollback_claim(
                     )),
                 }
             }
+            Ok(listed) if listed.code == 0 => {}
+            Ok(listed) => problems.push(format!(
+                "the branch {branch} could not be checked, {}",
+                git_detail(&listed)
+            )),
+            Err(exc) => problems.push(format!(
+                "the branch {branch} could not be checked, {}",
+                exc.message()
+            )),
         }
     }
     problems
@@ -2385,11 +2398,11 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
     } = parts;
     let furnished = furnish_claim(&mut data, stack, agent, draw, &instant, git)?;
     let attempt = (|| -> Result<()> {
-        lock.verify_current()?;
         append_leavings(stack, &instant, "expired", &expired, None)?;
         if let Some(line) = routing {
             line.append(stack)?;
         }
+        lock.verify_current()?;
         saver(stack, &data)?;
         Ok(())
     })();
@@ -4429,6 +4442,76 @@ mod tests {
         assert_eq!(
             settled, later,
             "the descendant of the timed out git kept running"
+        );
+    }
+
+    struct ErroringListGit;
+
+    impl GitRunner for ErroringListGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
+                return Err(Error::plain("the branch listing is broken in this test"));
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    struct FailingListGit;
+
+    impl GitRunner for FailingListGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
+                return Ok(GitOutput {
+                    code: 128,
+                    stdout: String::new(),
+                    stderr: "the branch listing is broken in this test".to_string(),
+                });
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    #[test]
+    fn a_rollback_whose_branch_probe_errors_reports_the_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-rollback-probe-error",
+            std::process::id()
+        ));
+        let problems = rollback_claim(
+            &ErroringListGit,
+            &dir,
+            &dir.join("worktree"),
+            "switchyard/alpha",
+            false,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("switchyard/alpha"), "{problems:?}");
+        assert!(problems[0].contains("could not be checked"), "{problems:?}");
+        assert!(
+            problems[0].contains("the branch listing is broken in this test"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_rollback_whose_branch_probe_fails_reports_the_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-rollback-probe-failure",
+            std::process::id()
+        ));
+        let problems = rollback_claim(
+            &FailingListGit,
+            &dir,
+            &dir.join("worktree"),
+            "switchyard/alpha",
+            false,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("switchyard/alpha"), "{problems:?}");
+        assert!(problems[0].contains("could not be checked"), "{problems:?}");
+        assert!(
+            problems[0].contains("the branch listing is broken in this test"),
+            "{problems:?}"
         );
     }
 
