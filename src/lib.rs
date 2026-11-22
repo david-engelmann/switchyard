@@ -2,11 +2,15 @@
 //!
 //! A stack is a plain directory. Inside it live a git repository, a
 //! worktrees directory, a lock file, and one registry file that
-//! records the port pool and every live claim. The registry is the
-//! only record, and every mutating command holds an exclusive flock
-//! lock on the lock file across the whole read and check and modify
-//! and write of the registry, so racing processes cannot both take
-//! the same agent name or overlapping port ranges.
+//! records the port pool and every live claim and every standing
+//! wait. Routed claims append to a routing log in the root, and
+//! waits and their leavings append to a queue log in the root,
+//! and no command reads either log to decide anything. The
+//! registry is the only record, and every mutating command holds
+//! an exclusive flock lock on the lock file across the whole read
+//! and check and modify and write of the registry, so racing
+//! processes cannot both take the same agent name or overlapping
+//! port ranges.
 
 pub mod cli;
 
@@ -137,7 +141,7 @@ fn py_repr(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+            ch if (ch as u32) < 0x20 || (0x7f..=0x9f).contains(&(ch as u32)) => {
                 out.push_str(&format!("\\x{:02x}", ch as u32));
             }
             ch => out.push(ch),
@@ -2394,11 +2398,11 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
     } = parts;
     let furnished = furnish_claim(&mut data, stack, agent, draw, &instant, git)?;
     let attempt = (|| -> Result<()> {
-        lock.verify_current()?;
         append_leavings(stack, &instant, "expired", &expired, None)?;
         if let Some(line) = routing {
             line.append(stack)?;
         }
+        lock.verify_current()?;
         saver(stack, &data)?;
         Ok(())
     })();
