@@ -126,9 +126,20 @@ fn flush_step(step_lines: &mut Vec<String>, commands: &mut Vec<String>) {
     step_lines.clear();
 }
 
+/// A job head line of the workflow, a key standing at the two
+/// space indent the jobs of ci.yml are keyed at, so the parser
+/// can tell one job from the next in a file it reads as lines.
+fn is_job_head(line: &str) -> bool {
+    line.starts_with("  ")
+        && !line.starts_with("   ")
+        && line.trim_end().ends_with(':')
+        && !line.trim().starts_with('-')
+}
+
 fn run_commands(ci_text: &str) -> Vec<String> {
     let mut commands = Vec::new();
     let mut step_lines: Vec<String> = Vec::new();
+    let mut in_jobs = false;
     let mut in_steps = false;
     let mut in_test_job = false;
     let mut job_disabled = false;
@@ -137,11 +148,25 @@ fn run_commands(ci_text: &str) -> Vec<String> {
         if stripped.starts_with('#') {
             continue;
         }
-        if stripped == "test:" {
-            in_test_job = true;
+        if stripped == "jobs:" {
+            in_jobs = true;
             continue;
         }
-        if in_test_job && !in_steps && stripped.starts_with("if:") {
+        if in_jobs && is_job_head(line) {
+            // A new job ends the test job's steps. The run
+            // commands of a later job are that job's own and
+            // are never collected as the test job's, because
+            // the gate this parser proves is the one the test
+            // job runs.
+            flush_step(&mut step_lines, &mut commands);
+            in_test_job = stripped == "test:";
+            in_steps = false;
+            continue;
+        }
+        if !in_test_job {
+            continue;
+        }
+        if !in_steps && stripped.starts_with("if:") {
             let value = stripped
                 .split_once(':')
                 .map(|(_, rest)| rest)
@@ -184,6 +209,31 @@ fn ci_runs_the_local_gate_commands() {
 }
 
 #[test]
+fn ci_gate_parser_does_not_credit_a_later_job_with_a_gate_command() {
+    let ci_text = read(".github/workflows/ci.yml");
+    // Move the scan step out of the test job and stand it at
+    // the end of the file, where it belongs to the binding
+    // job. The parser must still report the gate commands the
+    // test job itself runs and must not report the scan,
+    // because obligation S2 speaks of the gate the workflow's
+    // test job runs, not of a command standing anywhere in
+    // the file.
+    let scan_step = concat!(
+        "      - name: Run the codepoint scan\n",
+        "        run: cargo run --bin codepoint_scan\n"
+    );
+    assert!(ci_text.contains(scan_step));
+    let mut moved = ci_text.replace(scan_step, "");
+    assert!(!moved.contains(SCAN_COMMAND));
+    moved.push_str(scan_step);
+    let commands = run_commands(&moved);
+    assert!(commands.iter().any(|c| c == GATE_COMMAND));
+    assert!(commands.iter().any(|c| c == FMT_COMMAND));
+    assert!(commands.iter().any(|c| c == CLIPPY_COMMAND));
+    assert!(!commands.iter().any(|c| c == SCAN_COMMAND));
+}
+
+#[test]
 fn ci_carries_the_fleet_credential_hygiene() {
     let text = read(".github/workflows/ci.yml");
     // The workflow asks for no more than it uses. Its token
@@ -195,19 +245,32 @@ fn ci_carries_the_fleet_credential_hygiene() {
     assert!(text.contains("contents: read"));
     assert!(text.contains("persist-credentials: false"));
     assert!(!text.contains("rust-toolchain@master"));
-    let toolchain_line = text
+    // Every toolchain step stands judged, not only the first
+    // one the file finds: the workflow carries two, one per
+    // job, and a shortened pin on either fails this pin
+    // (SY-A40).
+    let toolchain_lines: Vec<&str> = text
         .lines()
-        .find(|line| line.contains("dtolnay/rust-toolchain@"))
-        .expect("the workflow carries no toolchain step");
-    let pin = toolchain_line
-        .split("dtolnay/rust-toolchain@")
-        .nth(1)
-        .unwrap()
-        .trim();
-    assert_eq!(pin.len(), 40, "{}", toolchain_line);
-    assert!(pin
-        .bytes()
-        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        .filter(|line| line.contains("dtolnay/rust-toolchain@"))
+        .collect();
+    assert!(
+        !toolchain_lines.is_empty(),
+        "the workflow carries no toolchain step"
+    );
+    for toolchain_line in toolchain_lines {
+        let pin = toolchain_line
+            .split("dtolnay/rust-toolchain@")
+            .nth(1)
+            .unwrap()
+            .trim();
+        assert_eq!(pin.len(), 40, "{}", toolchain_line);
+        assert!(
+            pin.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{}",
+            toolchain_line
+        );
+    }
 }
 
 #[test]
@@ -277,6 +340,31 @@ fn codepoint_scan_reports_zero_for_repo_tree() {
     assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
+#[test]
+fn codepoint_scan_with_no_argument_scans_the_current_directory() {
+    // The scanner's module doc names the scan root defaulting
+    // to the current directory among the port's deliberate
+    // differences from the setup scanner, and the workflow scan
+    // step names no root and relies on that default over the
+    // checkout tree. Every other drive of the scanner in this
+    // suite names its root, so the default stands pinned here.
+    // A scanner defaulting to any fixed tree reports zero
+    // counts over the staged tree at exit 0, and one refusing
+    // with no argument exits 2, and this pin fails on both.
+    let dir = temp_dir("no-argument");
+    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.lines().any(|line| line == "em dash U+2014 count 1"),
+        "{stdout}"
+    );
+}
+
 const CANONICAL_ABOVE_MARKER_SHA256: &str =
     "bb3e2fc1790b13729da3495c3f0902b968577f4e45ceb27e48e90b489f36e1a7";
 
@@ -316,6 +404,7 @@ fn codepoint_scan_counts_an_em_dash() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
     assert!(result.stdout.contains("note.md"));
 }
 
@@ -326,6 +415,7 @@ fn codepoint_scan_counts_an_en_dash() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("en dash U+2013 count 1"));
+    assert!(result.stdout.contains("em dash U+2014 count 0"));
 }
 
 #[test]
@@ -336,6 +426,7 @@ fn codepoint_scan_scans_a_root_under_an_excluded_ancestor() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -348,6 +439,7 @@ fn codepoint_scan_skips_excluded_dirs_below_the_root() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 0);
     assert!(result.stdout.contains("em dash U+2014 count 0"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -376,12 +468,36 @@ fn codepoint_scan_fails_loudly_on_undecodable_input() {
 }
 
 #[test]
+fn codepoint_scan_refuses_a_root_that_does_not_stand() {
+    // The scanner's module doc names a scan root that does not
+    // stand as a scan error at exit 2, one of its four deliberate
+    // differences from the setup scanner, which exited 0 with
+    // zero counts there. The pin drives the built scanner at a
+    // root that is never created, so it fails on any form that
+    // falls back to a default root and reports zero counts, and
+    // on any form that panics on the missing root at exit 101.
+    let dir = temp_dir("missing-root").join("no-such-root");
+    let result = scan_tree(&dir);
+    assert_eq!(result.status, 2);
+    let root = dir.display().to_string();
+    assert!(
+        result
+            .stderr
+            .lines()
+            .any(|line| line.contains("scan error") && line.contains(&root)),
+        "{}",
+        result.stderr
+    );
+}
+
+#[test]
 fn codepoint_scan_counts_a_dash_in_a_file_with_no_suffix() {
     let dir = temp_dir("no-suffix");
     std::fs::write(dir.join("LICENSE"), "a\u{2014}b").unwrap();
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -391,6 +507,7 @@ fn codepoint_scan_counts_a_dash_in_an_uppercase_suffix_file() {
     let result = scan_tree(&dir);
     assert_eq!(result.status, 1);
     assert!(result.stdout.contains("em dash U+2014 count 1"));
+    assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
 #[test]
@@ -401,4 +518,29 @@ fn codepoint_scan_skips_a_file_with_an_uppercase_binary_suffix() {
     assert_eq!(result.status, 0);
     assert!(result.stdout.contains("em dash U+2014 count 0"));
     assert!(result.stdout.contains("en dash U+2013 count 0"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn codepoint_scan_reports_a_failed_output_write_at_exit_2() {
+    use std::process::Stdio;
+    // The scanner writes its whole output through one checked
+    // writer, so a stdout that refuses the write lands the scan
+    // at its stated error exit instead of panicking inside a
+    // print (SY-A42). The drive stages /dev/full as the output,
+    // which answers every write with no space left; before the
+    // repair the count lines went through println! and this
+    // drive died at exit 101.
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .arg(root())
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot write the scan output"), "{stderr}");
 }

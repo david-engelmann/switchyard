@@ -815,9 +815,9 @@ fn run_cli(args: &[&str]) -> (i32, String, String) {
         .output()
         .unwrap();
     (
-        output.status.code().unwrap(),
-        String::from_utf8(output.stdout).unwrap(),
-        String::from_utf8(output.stderr).unwrap(),
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
 
@@ -961,9 +961,16 @@ fn a_routed_claim_from_the_command_line_with_no_judge_command() {
 
 fn write_judge_script(tag: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let path = temp_dir(tag).join("judge.sh");
-    std::fs::write(&path, body).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The script is staged under a temporary name and renamed
+    // into place, the shape the in crate pins stage their
+    // executables in, so a spawn can never take the file while
+    // the writer still holds it open.
+    let dir = temp_dir(tag);
+    let staged = dir.join("judge.staged");
+    std::fs::write(&staged, body).unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = dir.join("judge.sh");
+    std::fs::rename(&staged, &path).unwrap();
     path
 }
 
