@@ -150,7 +150,12 @@ fn rewrite_recorded_at(stack: &Path, agent: &str, stamp: &str) {
     .unwrap();
 }
 
-fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+fn snapshot_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+    // Directories stand recorded as entries of their own, the
+    // shape the snapshot of tests/switchyard.rs keeps, so a
+    // change that creates only an empty directory stands
+    // visible to the changes nothing comparisons this map
+    // feeds. A files only walk passed such a change unseen.
     let mut snapshot = BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -163,9 +168,10 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
                 .to_string_lossy()
                 .into_owned();
             if path.is_dir() {
+                snapshot.insert(rel, None);
                 pending.push(path);
             } else {
-                snapshot.insert(rel, std::fs::read(&path).unwrap());
+                snapshot.insert(rel, Some(std::fs::read(&path).unwrap()));
             }
         }
     }
@@ -354,8 +360,8 @@ fn a_waiting_routed_claim_waits_on_the_profile_its_consultation_settled() {
         "routed",
         "Run the web app and its API while I fix the checkout flow.",
         Profile::Lean,
-        Some(&transport),
         None,
+        Some(&transport),
     )
     .unwrap();
     let wait = waited(outcome);
@@ -670,8 +676,8 @@ fn a_queue_filled_during_a_consultation_refuses_queue_full_and_records_it() {
         "routed",
         "Run the web app and its API while I fix the checkout flow.",
         Profile::Lean,
-        Some(&transport),
         None,
+        Some(&transport),
     )
     .expect_err("a queue filled during the consultations refuses as queue full");
     assert!(
@@ -750,8 +756,8 @@ fn a_routed_waiting_claim_whose_settled_draw_is_taken_during_routing_waits_with_
         "waiter",
         "Run the web app and its API while I fix the checkout flow.",
         Profile::Lean,
-        Some(&transport),
         None,
+        Some(&transport),
     )
     .unwrap();
     let wait = waited(outcome);
@@ -1179,6 +1185,7 @@ fn a_wait_stands_short_of_its_bound_and_is_swept_at_and_past_it() {
                 .collect::<Vec<_>>();
             assert_eq!(expired.len(), 1, "{tag}");
             assert_eq!(expired[0]["agent"], "waiter", "{tag}");
+            assert_eq!(queue_log_field_set(expired[0]), QUEUE_LOG_FIELDS, "{tag}");
         }
     }
 }
@@ -1222,6 +1229,7 @@ fn release_cancels_a_standing_wait_and_a_second_release_refuses() {
     assert_eq!(lines[1]["kind"], "cancelled");
     assert_eq!(lines[1]["agent"], "waiter");
     assert_eq!(lines[1]["ports"], serde_json::Value::Null);
+    assert_eq!(queue_log_field_set(&lines[1]), QUEUE_LOG_FIELDS);
     let error = release(&stack, "waiter").expect_err("an agent holding nothing refuses");
     assert!(
         error
@@ -1437,9 +1445,16 @@ fn a_judge_descendant_holding_the_pipe_open_cannot_stretch_the_consultation() {
     let stack_arg = stack.to_string_lossy().into_owned();
     let (code, _, _) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
     assert_eq!(code, 0);
-    let judge = temp_dir("cli-deadline-judge").join("judge.sh");
-    std::fs::write(&judge, "#!/bin/sh\nsleep 90 &\ncat > /dev/null\nexit 0\n").unwrap();
-    std::fs::set_permissions(&judge, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The judge is staged under a temporary name and renamed
+    // into place, the shape the in crate pins stage their
+    // executables in, so the spawn can never take the file
+    // while the writer still holds it open.
+    let judge_dir = temp_dir("cli-deadline-judge");
+    let staged = judge_dir.join("judge.staged");
+    std::fs::write(&staged, "#!/bin/sh\nsleep 90 &\ncat > /dev/null\nexit 0\n").unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let judge = judge_dir.join("judge.sh");
+    std::fs::rename(&staged, &judge).unwrap();
     let started = std::time::Instant::now();
     let (code, out, err) = run_cli(&[
         "claim",
@@ -1611,8 +1626,8 @@ fn a_routed_waiting_claim_that_allocates_spends_no_scoring_consultation() {
             "routed",
             "Run the web app and its API while I fix the checkout flow.",
             Profile::Lean,
-            Some(&transport),
             None,
+            Some(&transport),
         )
         .unwrap(),
     );
@@ -1810,4 +1825,58 @@ fn the_release_command_prints_each_furnishing_failure_on_its_error_output() {
         "{err}"
     );
     assert!(!err.contains("leaner"), "{err}");
+}
+
+#[test]
+fn the_waiting_print_names_the_score_or_the_fallback_and_the_bound() {
+    use std::os::unix::fs::PermissionsExt;
+    let stack = cli_stack("cli-print", 1);
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, _) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
+    assert_eq!(code, 0);
+    // A stub judge that scores the wait, staged under a
+    // temporary name and renamed into place, the shape the
+    // deadline pin above stages its own judge in.
+    let judge_dir = temp_dir("cli-print-judge");
+    let staged = judge_dir.join("judge.staged");
+    let body = score_body("5", 0.9);
+    std::fs::write(
+        &staged,
+        format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{body}'\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let judge = judge_dir.join("judge.sh");
+    std::fs::rename(&staged, &judge).unwrap();
+    let (code, out, err) = run_cli(&[
+        "claim",
+        "--stack",
+        &stack_arg,
+        "scored",
+        "--wait",
+        "--judge-command",
+        &judge.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("waiting scored"), "{out}");
+    assert!(out.contains("profile plain"), "{out}");
+    assert!(out.contains("score 5"), "{out}");
+    assert!(out.contains("confidence 0.9"), "{out}");
+    assert!(!out.contains("fallback"), "{out}");
+    // A bounded scoreless wait prints the other arm of the
+    // print and the bound line beside it.
+    let (code, out, err) = run_cli(&[
+        "claim",
+        "--stack",
+        &stack_arg,
+        "bounded",
+        "--wait",
+        "--wait-for",
+        "30",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("waiting bounded"), "{out}");
+    assert!(out.contains("score none"), "{out}");
+    assert!(out.contains("fallback no transport"), "{out}");
+    assert!(out.contains("wait bound 30 seconds"), "{out}");
 }

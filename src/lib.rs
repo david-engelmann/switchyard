@@ -2,11 +2,15 @@
 //!
 //! A stack is a plain directory. Inside it live a git repository, a
 //! worktrees directory, a lock file, and one registry file that
-//! records the port pool and every live claim. The registry is the
-//! only record, and every mutating command holds an exclusive flock
-//! lock on the lock file across the whole read and check and modify
-//! and write of the registry, so racing processes cannot both take
-//! the same agent name or overlapping port ranges.
+//! records the port pool and every live claim and every standing
+//! wait. Routed claims append to a routing log in the root, and
+//! waits and their leavings append to a queue log in the root,
+//! and no command reads either log to decide anything. The
+//! registry is the only record, and every mutating command holds
+//! an exclusive flock lock on the lock file across the whole read
+//! and check and modify and write of the registry, so racing
+//! processes cannot both take the same agent name or overlapping
+//! port ranges.
 
 pub mod cli;
 
@@ -137,7 +141,7 @@ fn py_repr(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+            ch if (ch as u32) < 0x20 || (0x7f..=0x9f).contains(&(ch as u32)) => {
                 out.push_str(&format!("\\x{:02x}", ch as u32));
             }
             ch => out.push(ch),
@@ -1250,7 +1254,19 @@ fn stamp_micros(text: &str) -> Option<i128> {
             if !byte.is_ascii_digit() {
                 break;
             }
-            value = value * 10 + (byte - b'0') as i128;
+            // Only the first six digits are accumulated, and
+            // the rest are counted and passed over. The standing
+            // division of the whole accumulation by
+            // 10^(digits - 6) yields exactly those six digits,
+            // because the remainder is smaller than the divisor,
+            // so the truncated value is the same number; and
+            // accumulating every digit overflows the i128 on a
+            // long enough fraction, 39 digits of nines being
+            // enough, in a panic under the test profile and in
+            // silence under release (SY-A41).
+            if at - start < 6 {
+                value = value * 10 + (byte - b'0') as i128;
+            }
             at += 1;
         }
         let digits = (at - start) as u32;
@@ -1260,7 +1276,7 @@ fn stamp_micros(text: &str) -> Option<i128> {
         micros = if digits <= 6 {
             value * 10_i128.pow(6 - digits)
         } else {
-            value / 10_i128.pow(digits - 6)
+            value
         };
     }
     let mut offset_seconds: i128 = 0;
@@ -1973,16 +1989,25 @@ fn free_run(data: &Registry, ranges: i64) -> Option<(i64, i64)> {
     if ranges < 1 || ranges > pool.range_count {
         return None;
     }
-    let taken: Vec<(i64, i64)> = data
-        .claims
-        .values()
-        .map(|record| (record.port_start, record.port_end))
-        .collect();
-    for index in 0..=(pool.range_count - ranges) {
-        let start = pool.start + index * pool.range_size;
-        let end = start + ranges * pool.range_size - 1;
-        if taken.iter().all(|(low, high)| end < *low || start > *high) {
-            return Some((start, end));
+    let mut taken: BTreeSet<i64> = BTreeSet::new();
+    for record in data.claims.values() {
+        let first = (record.port_start - pool.start) / pool.range_size;
+        let last = (record.port_end - pool.start) / pool.range_size;
+        for index in first..=last {
+            taken.insert(index);
+        }
+    }
+    let mut run: i64 = 0;
+    for index in 0..pool.range_count {
+        if taken.contains(&index) {
+            run = 0;
+        } else {
+            run += 1;
+            if run == ranges {
+                let start = pool.start + (index - ranges + 1) * pool.range_size;
+                let end = start + ranges * pool.range_size - 1;
+                return Some((start, end));
+            }
         }
     }
     None
@@ -2100,8 +2125,8 @@ pub fn rollback_claim(
         }
     }
     if !branch_preexisted {
-        if let Ok(listed) = git.result(repo, &["branch", "--list", branch]) {
-            if listed.code == 0 && !listed.stdout.trim().is_empty() {
+        match git.result(repo, &["branch", "--list", branch]) {
+            Ok(listed) if listed.code == 0 && !listed.stdout.trim().is_empty() => {
                 match git.result(repo, &["branch", "-D", branch]) {
                     Ok(result) if result.code == 0 => {}
                     Ok(result) => problems.push(format!(
@@ -2114,6 +2139,15 @@ pub fn rollback_claim(
                     )),
                 }
             }
+            Ok(listed) if listed.code == 0 => {}
+            Ok(listed) => problems.push(format!(
+                "the branch {branch} could not be checked, {}",
+                git_detail(&listed)
+            )),
+            Err(exc) => problems.push(format!(
+                "the branch {branch} could not be checked, {}",
+                exc.message()
+            )),
         }
     }
     problems
@@ -2385,11 +2419,11 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
     } = parts;
     let furnished = furnish_claim(&mut data, stack, agent, draw, &instant, git)?;
     let attempt = (|| -> Result<()> {
-        lock.verify_current()?;
         append_leavings(stack, &instant, "expired", &expired, None)?;
         if let Some(line) = routing {
             line.append(stack)?;
         }
+        lock.verify_current()?;
         saver(stack, &data)?;
         Ok(())
     })();
@@ -4158,16 +4192,16 @@ pub fn claim_routed_waiting(
     agent: &str,
     description: &str,
     default_profile: Profile,
-    transport: Option<&dyn JudgeTransport>,
     wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
 ) -> Result<ClaimOutcome> {
     claim_routed_waiting_with(
         stack,
         agent,
         description,
         default_profile,
-        transport,
         wait_for,
+        transport,
         &ProcessGit,
         &save_registry,
     )
@@ -4179,8 +4213,8 @@ fn claim_routed_waiting_with(
     agent: &str,
     description: &str,
     default_profile: Profile,
-    transport: Option<&dyn JudgeTransport>,
     wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ClaimOutcome> {
@@ -4429,6 +4463,76 @@ mod tests {
         assert_eq!(
             settled, later,
             "the descendant of the timed out git kept running"
+        );
+    }
+
+    struct ErroringListGit;
+
+    impl GitRunner for ErroringListGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
+                return Err(Error::plain("the branch listing is broken in this test"));
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    struct FailingListGit;
+
+    impl GitRunner for FailingListGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
+                return Ok(GitOutput {
+                    code: 128,
+                    stdout: String::new(),
+                    stderr: "the branch listing is broken in this test".to_string(),
+                });
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    #[test]
+    fn a_rollback_whose_branch_probe_errors_reports_the_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-rollback-probe-error",
+            std::process::id()
+        ));
+        let problems = rollback_claim(
+            &ErroringListGit,
+            &dir,
+            &dir.join("worktree"),
+            "switchyard/alpha",
+            false,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("switchyard/alpha"), "{problems:?}");
+        assert!(problems[0].contains("could not be checked"), "{problems:?}");
+        assert!(
+            problems[0].contains("the branch listing is broken in this test"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_rollback_whose_branch_probe_fails_reports_the_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-rollback-probe-failure",
+            std::process::id()
+        ));
+        let problems = rollback_claim(
+            &FailingListGit,
+            &dir,
+            &dir.join("worktree"),
+            "switchyard/alpha",
+            false,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("switchyard/alpha"), "{problems:?}");
+        assert!(problems[0].contains("could not be checked"), "{problems:?}");
+        assert!(
+            problems[0].contains("the branch listing is broken in this test"),
+            "{problems:?}"
         );
     }
 
@@ -4749,6 +4853,39 @@ mod tests {
         Err(Error::plain("the save is staged to fail in this test"))
     }
 
+    /// The long fraction of SY-A41. A fraction past six digits
+    /// computes the micros of its first six digits, exactly as
+    /// the standing division computed them, and a fraction far
+    /// past the width an i128 accumulation holds computes them
+    /// too, where the standing accumulation overflowed. The
+    /// grammar stands unchanged, so the validator still accepts
+    /// the shape, and the expiry comparison answers by the
+    /// truncated instant.
+    #[test]
+    fn stamp_micros_truncates_a_long_fraction_without_overflow() {
+        let nines = format!("2026-11-02T10:00:00.{}Z", "9".repeat(50));
+        assert!(is_valid_timestamp(&nines));
+        assert_eq!(
+            stamp_micros(&nines),
+            stamp_micros("2026-11-02T10:00:00.999999Z")
+        );
+        let zeros = format!("2026-11-02T10:00:00.{}Z", "0".repeat(50));
+        assert!(is_valid_timestamp(&zeros));
+        assert_eq!(stamp_micros(&zeros), stamp_micros("2026-11-02T10:00:00Z"));
+        let wait = Wait {
+            agent: "waiter".to_string(),
+            profile: "plain".to_string(),
+            recorded_at: nines,
+            wait_for: Some(1),
+            score: None,
+            confidence: None,
+            model: None,
+            fallback: "none".to_string(),
+        };
+        assert!(!wait_expired(&wait, "2026-11-02T10:00:01Z"));
+        assert!(wait_expired(&wait, "2026-11-02T10:00:02Z"));
+    }
+
     fn read_queue_lines(stack: &Path) -> Vec<serde_json::Value> {
         let text = fs::read_to_string(stack.join(QUEUE_LOG_NAME)).unwrap();
         text.lines()
@@ -4964,6 +5101,44 @@ mod tests {
         let digests = queued_digests(&stack, &wanted);
         assert_eq!(digests.len(), 1);
         assert_eq!(digests["w1"], ("d".repeat(64), 7));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The first fit search of SY-A44 over a fragmented pool.
+    /// Claims stand on slots 0, 2, and 5 of eight, so the free
+    /// runs stand as slot 1 alone, slots 3 and 4, and slots 6
+    /// and 7, and the search answers the first run that reaches
+    /// each draw and refuses the draws no run reaches. The pin
+    /// passes against the search as it stood, the repair being
+    /// behavior identical; its work is to fail against a search
+    /// that returns a later run or a longer run, or one that
+    /// miscounts at the pool's end.
+    #[test]
+    fn free_run_finds_the_first_run_in_a_fragmented_pool() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-free-run",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        init_stack(&stack, 20000, 10, 8).unwrap();
+        for index in 0..6 {
+            claim(&stack, &format!("holder-{index}")).unwrap();
+        }
+        release(&stack, "holder-1").unwrap();
+        release(&stack, "holder-3").unwrap();
+        release(&stack, "holder-4").unwrap();
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(free_run(&data, 1), Some((20010, 20019)));
+        assert_eq!(free_run(&data, 2), Some((20030, 20049)));
+        assert_eq!(free_run(&data, 3), None);
+        assert_eq!(free_run(&data, 8), None);
+        release(&stack, "holder-0").unwrap();
+        release(&stack, "holder-2").unwrap();
+        release(&stack, "holder-5").unwrap();
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(free_run(&data, 8), Some((20000, 20079)));
         let _ = fs::remove_dir_all(&dir);
     }
 }
