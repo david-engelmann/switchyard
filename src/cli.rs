@@ -15,10 +15,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::{
-    claim, claim_profile, claim_profile_waiting, claim_routed, claim_routed_waiting, claim_waiting,
-    init_stack, list_claims, list_waits, profile_named, release_report, resolve_path, ClaimOutcome,
-    JudgeTransport, Record, ReleaseOutcome, Result, Wait, DEFAULT_PORT_START, DEFAULT_RANGE_COUNT,
-    DEFAULT_RANGE_SIZE, JUDGE_TIMEOUT_SECONDS,
+    active_child_group, claim, claim_profile, claim_profile_waiting, claim_routed,
+    claim_routed_waiting, claim_waiting, init_stack, list_claims, list_waits, profile_named,
+    release_report, resolve_path, ClaimOutcome, JudgeTransport, Record, ReleaseOutcome, Result,
+    Wait, DEFAULT_PORT_START, DEFAULT_RANGE_COUNT, DEFAULT_RANGE_SIZE, JUDGE_TIMEOUT_SECONDS,
 };
 
 const COMMANDS: [&str; 4] = ["init", "claim", "list", "release"];
@@ -404,25 +404,19 @@ fn run_judge_command_within(
         let read = stdout.read_to_end(&mut bytes);
         let _ = reader_out.send((read, bytes));
     });
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    crate::kill_process_group(&mut child);
-                    let _ = child.wait();
-                    return Err(format!(
-                        "the judge command {program} did not finish inside the deadline of {} seconds",
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(exc) => {
-                return Err(format!(
-                    "the judge command {program} could not be waited on, {exc}"
-                ));
-            }
+    let pid = child.id();
+    let status = match crate::await_child(child, timeout) {
+        crate::ChildWait::Exited(status) => status,
+        crate::ChildWait::TimedOut => {
+            return Err(format!(
+                "the judge command {program} did not finish inside the deadline of {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        crate::ChildWait::Failed(exc) => {
+            return Err(format!(
+                "the judge command {program} could not be waited on, {exc}"
+            ));
         }
     };
     if !status.success() {
@@ -448,7 +442,7 @@ fn run_judge_command_within(
             ));
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            crate::kill_process_group(&mut child);
+            crate::kill_group(pid);
             return Err(format!(
                 "the judge command {program} did not finish inside the deadline of {} seconds",
                 timeout.as_secs()
@@ -462,7 +456,7 @@ fn run_judge_command_within(
     let (read, bytes) = match reader_in.recv_timeout(remaining) {
         Ok(carried) => carried,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            crate::kill_process_group(&mut child);
+            crate::kill_group(pid);
             return Err(format!(
                 "the judge command {program} did not finish inside the deadline of {} seconds",
                 timeout.as_secs()
@@ -738,7 +732,50 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
+/// Forward one signal to the group of the child standing inside
+/// this command, where one stands.
+///
+/// A spawned child leads its own process group, so the
+/// terminal's interrupt never reaches it, and a child whose
+/// parent died by the signal would run on with nothing left to
+/// enforce its deadline. The runners record the standing
+/// child's group in the crate registry; this sends the signal
+/// there, so the child and its descendants take the same signal
+/// the operator sent the command.
+fn forward_to_active_child(signal: i32) {
+    let group = active_child_group();
+    if group > 0 {
+        unsafe {
+            libc::kill(-group, signal);
+        }
+    }
+}
+
+/// The signal handler the command installs. It forwards the
+/// signal to the standing child's group, then restores the
+/// default disposition and raises the signal again, so the
+/// command itself still ends the way the operator asked. The
+/// handler confines itself to an atomic load, kill, signal, and
+/// raise, the calls a signal handler may make.
+extern "C" fn forward_signal(signal: i32) {
+    forward_to_active_child(signal);
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+/// Install the forwarding handler for the two signals an
+/// operator or a supervisor ends a command with.
+fn install_signal_forwarding() {
+    unsafe {
+        libc::signal(libc::SIGINT, forward_signal as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, forward_signal as libc::sighandler_t);
+    }
+}
+
 pub fn main() -> i32 {
+    install_signal_forwarding();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
@@ -895,13 +932,19 @@ mod tests {
         // only returned the error would leave the loop standing
         // on the pipe, and the heartbeat would keep growing;
         // the group stop at the collection deadline stops it.
-        // The script is staged and renamed into place, as the
-        // test above stages its own.
+        // The judge consumes its standard input before it exits,
+        // the way the integration suite's judge of the same shape
+        // does, because a judge that exits before the request
+        // write lands fails the write instead, and the runner
+        // judges the write first, so the consultation would
+        // return the write error and race the deadline outcome
+        // this pin asserts. The script is staged and renamed
+        // into place, as the test above stages its own.
         let staged = dir.join("judge.staged");
         std::fs::write(
             &staged,
             format!(
-                "#!/bin/sh\nwhile true; do echo tick >> {}; sleep 0.2; done &\nexit 0\n",
+                "#!/bin/sh\nwhile true; do echo tick >> {}; sleep 0.2; done &\ncat > /dev/null\nexit 0\n",
                 heartbeat.display()
             ),
         )
@@ -924,6 +967,63 @@ mod tests {
         assert_eq!(
             settled, later,
             "the descendant of the exited judge kept running"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_signal_stops_the_standing_child_and_its_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-cli-test-{}-forwarded-signal",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let heartbeat = dir.join("heartbeat");
+        // A child leading its own group, backgrounding the same
+        // heartbeat loop the descendant pins stage and then
+        // sleeping in the foreground, recorded in the forwarding
+        // registry the way a runner records its child. The
+        // forward must reach the whole group: a forward aimed
+        // only at the child leaves the loop appending, and this
+        // test fails against it. The script is staged and renamed
+        // into place, as the tests above stage theirs.
+        let staged = dir.join("child.staged");
+        std::fs::write(
+            &staged,
+            format!(
+                "#!/bin/sh\nwhile true; do echo tick >> {}; sleep 0.2; done &\nsleep 30\n",
+                heartbeat.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = dir.join("child.sh");
+        std::fs::rename(&staged, &program).unwrap();
+        let mut child = Command::new(&program).process_group(0).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        crate::note_child_spawned(child.id());
+        forward_to_active_child(libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stopped = loop {
+            match child.try_wait().unwrap() {
+                Some(_) => break true,
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                None => break false,
+            }
+        };
+        crate::note_child_finished(child.id());
+        assert!(stopped, "the forwarded signal did not stop the child");
+        std::thread::sleep(Duration::from_millis(300));
+        let settled = std::fs::metadata(&heartbeat).unwrap().len();
+        std::thread::sleep(Duration::from_millis(1500));
+        let later = std::fs::metadata(&heartbeat).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            settled, later,
+            "the descendant of the signalled child kept running"
         );
     }
 }
