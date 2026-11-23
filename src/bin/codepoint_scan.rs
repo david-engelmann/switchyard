@@ -120,7 +120,10 @@ fn scan(root: &Path) -> Result<(usize, usize, String), ScanError> {
 }
 
 fn main() -> ExitCode {
-    let root = std::env::args()
+    // The root is a path, taken from args_os so a root whose
+    // name is not Unicode scans instead of panicking the way
+    // std::env::args would on the argument.
+    let root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));

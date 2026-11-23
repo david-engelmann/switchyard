@@ -409,6 +409,21 @@ fn codepoint_scan_counts_an_em_dash() {
 }
 
 #[test]
+fn codepoint_scan_scans_a_root_whose_name_is_not_unicode() {
+    use std::os::unix::ffi::OsStringExt;
+    let parent = temp_dir("nonunicode");
+    let dir = parent.join(std::ffi::OsString::from_vec(vec![b'r', 0xff, b'o', b't']));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
+    let result = scan_tree(&dir);
+    // Before the args_os repair the scanner read its arguments
+    // with std::env::args and panicked on this root at exit 101;
+    // the scan now runs and counts what stands under the root.
+    assert_eq!(result.status, 1, "{}", result.stderr);
+    assert!(result.stdout.contains("em dash U+2014 count 1"));
+}
+
+#[test]
 fn codepoint_scan_counts_an_en_dash() {
     let dir = temp_dir("en-dash");
     std::fs::write(dir.join("note.md"), "a\u{2013}b").unwrap();
