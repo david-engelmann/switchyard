@@ -188,7 +188,7 @@ def test_a_routed_claim_through_a_callable_transport(tmp_path):
         return _verdict_body("standard", 0.9)
 
     record = switchyard.claim_routed(
-        stack, "alpha", "Run the app and its API and a worker.", "lean", judge
+        stack, "alpha", "Run the app and its API and a worker.", "lean", transport=judge
     )
     assert (record["port_start"], record["port_end"]) == (20000, 20019)
     assert len(seen) == 1
@@ -216,7 +216,7 @@ def test_a_routed_claim_with_no_transport_and_with_a_raising_callable(tmp_path):
     def broken(request):
         raise RuntimeError("the judge is down in this test")
 
-    record = switchyard.claim_routed(stack, "beta", "Run one server.", "lean", broken)
+    record = switchyard.claim_routed(stack, "beta", "Run one server.", "lean", transport=broken)
     assert (record["port_start"], record["port_end"]) == (20020, 20029)
 
     lines = (tmp_path / "stack" / "switchyard-routing.jsonl").read_text().splitlines()
@@ -325,7 +325,7 @@ def test_a_routed_waiting_claim_through_a_callable_transport(tmp_path):
         "waiter",
         "Run the app and its API and a worker.",
         "lean",
-        judge,
+        transport=judge,
         wait=True,
     )
     assert wait["profile"] == "standard"
@@ -393,6 +393,23 @@ def test_an_oversized_wait_bound_is_a_named_refusal(tmp_path):
         switchyard.claim(stack, "waiter", wait=True, wait_for=10**40)
     assert "wait_for" in str(caught.value)
     assert "64-bit" in str(caught.value)
+    assert switchyard.list(stack) == []
+
+
+def test_the_claim_functions_take_their_options_by_keyword_only(tmp_path):
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    def judge(request):
+        return "{}"
+
+    with pytest.raises(TypeError):
+        switchyard.claim(stack, "alpha", False, None, judge)
+    with pytest.raises(TypeError):
+        switchyard.claim_profile(stack, "alpha", "lean", False, None, judge)
+    with pytest.raises(TypeError):
+        switchyard.claim_routed(stack, "alpha", "Run one server.", "lean", judge)
+
     assert switchyard.list(stack) == []
 
 
