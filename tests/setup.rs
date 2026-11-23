@@ -245,19 +245,32 @@ fn ci_carries_the_fleet_credential_hygiene() {
     assert!(text.contains("contents: read"));
     assert!(text.contains("persist-credentials: false"));
     assert!(!text.contains("rust-toolchain@master"));
-    let toolchain_line = text
+    // Every toolchain step stands judged, not only the first
+    // one the file finds: the workflow carries two, one per
+    // job, and a shortened pin on either fails this pin
+    // (SY-A40).
+    let toolchain_lines: Vec<&str> = text
         .lines()
-        .find(|line| line.contains("dtolnay/rust-toolchain@"))
-        .expect("the workflow carries no toolchain step");
-    let pin = toolchain_line
-        .split("dtolnay/rust-toolchain@")
-        .nth(1)
-        .unwrap()
-        .trim();
-    assert_eq!(pin.len(), 40, "{}", toolchain_line);
-    assert!(pin
-        .bytes()
-        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        .filter(|line| line.contains("dtolnay/rust-toolchain@"))
+        .collect();
+    assert!(
+        !toolchain_lines.is_empty(),
+        "the workflow carries no toolchain step"
+    );
+    for toolchain_line in toolchain_lines {
+        let pin = toolchain_line
+            .split("dtolnay/rust-toolchain@")
+            .nth(1)
+            .unwrap()
+            .trim();
+        assert_eq!(pin.len(), 40, "{}", toolchain_line);
+        assert!(
+            pin.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{}",
+            toolchain_line
+        );
+    }
 }
 
 #[test]
