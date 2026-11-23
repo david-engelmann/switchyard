@@ -2,11 +2,15 @@
 //!
 //! A stack is a plain directory. Inside it live a git repository, a
 //! worktrees directory, a lock file, and one registry file that
-//! records the port pool and every live claim. The registry is the
-//! only record, and every mutating command holds an exclusive flock
-//! lock on the lock file across the whole read and check and modify
-//! and write of the registry, so racing processes cannot both take
-//! the same agent name or overlapping port ranges.
+//! records the port pool and every live claim and every standing
+//! wait. Routed claims append to a routing log in the root, and
+//! waits and their leavings append to a queue log in the root,
+//! and no command reads either log to decide anything. The
+//! registry is the only record, and every mutating command holds
+//! an exclusive flock lock on the lock file across the whole read
+//! and check and modify and write of the registry, so racing
+//! processes cannot both take the same agent name or overlapping
+//! port ranges.
 
 pub mod cli;
 
@@ -17,7 +21,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -137,7 +142,7 @@ fn py_repr(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+            ch if (ch as u32) < 0x20 || (0x7f..=0x9f).contains(&(ch as u32)) => {
                 out.push_str(&format!("\\x{:02x}", ch as u32));
             }
             ch => out.push(ch),
@@ -1189,14 +1194,22 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 /// The epoch microseconds a timestamp names, for a timestamp in
-/// the grammar is_valid_timestamp accepts. The registry reader
-/// validates every recorded instant against that grammar before
-/// an expiry comparison reads it, so a value outside the grammar
-/// never reaches this parser from a validated document, and the
+/// the grammar is_valid_timestamp accepts. The parser refuses a
+/// value outside that grammar at its head, by the validator
+/// itself, so the two readers agree by construction. A month or
+/// a day or an hour outside its range, and a shape the grammar
+/// does not carry, return None here rather than an instant the
+/// validator would refuse. The registry reader validates every
+/// recorded instant against that grammar before an expiry
+/// comparison reads it, so a value outside the grammar never
+/// reaches this parser from a validated document, and the
 /// parser reads every shape inside the grammar, the minute and
 /// the second and the offset second standing optional exactly
 /// where the grammar leaves them optional.
 fn stamp_micros(text: &str) -> Option<i128> {
+    if !is_valid_timestamp(text) {
+        return None;
+    }
     let bytes = text.as_bytes();
     let (year, mut at) = take_digits(bytes, 0, 4)?;
     let extended = bytes.get(at) == Some(&b'-');
@@ -1250,7 +1263,19 @@ fn stamp_micros(text: &str) -> Option<i128> {
             if !byte.is_ascii_digit() {
                 break;
             }
-            value = value * 10 + (byte - b'0') as i128;
+            // Only the first six digits are accumulated, and
+            // the rest are counted and passed over. The standing
+            // division of the whole accumulation by
+            // 10^(digits - 6) yields exactly those six digits,
+            // because the remainder is smaller than the divisor,
+            // so the truncated value is the same number; and
+            // accumulating every digit overflows the i128 on a
+            // long enough fraction, 39 digits of nines being
+            // enough, in a panic under the test profile and in
+            // silence under release (SY-A41).
+            if at - start < 6 {
+                value = value * 10 + (byte - b'0') as i128;
+            }
             at += 1;
         }
         let digits = (at - start) as u32;
@@ -1260,7 +1285,7 @@ fn stamp_micros(text: &str) -> Option<i128> {
         micros = if digits <= 6 {
             value * 10_i128.pow(6 - digits)
         } else {
-            value / 10_i128.pow(digits - 6)
+            value
         };
     }
     let mut offset_seconds: i128 = 0;
@@ -1569,13 +1594,113 @@ impl GitRunner for ProcessGit {
 /// stands behind the group signal for the case where the group
 /// is already gone.
 pub(crate) fn kill_process_group(child: &mut std::process::Child) {
-    let pid = child.id() as libc::pid_t;
+    kill_group(child.id());
+    let _ = child.kill();
+}
+
+/// Stop every process in the group led by the child of the given
+/// pid, where no handle on the child itself stands. The reply
+/// collection deadlines of the judge runner stop a group whose
+/// child already stands reaped, where only the pid remains to
+/// name the group.
+pub(crate) fn kill_group(pid: u32) {
+    let pid = pid as libc::pid_t;
     // The child leads its process group by construction, so the
     // negated pid names the group and nothing outside it.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
-    let _ = child.kill();
+}
+
+/// The process group of the one subprocess this process stands
+/// inside, git or a judge command, or zero where none stands.
+///
+/// The runners record their child here as its wait begins and
+/// clear the record as the wait completes, and the command
+/// line's signal handlers read it to forward an operator's
+/// interrupt or a supervisor's termination to the child's
+/// group, because a spawned child leads its own group and the
+/// terminal's signal never reaches it. One child stands at a
+/// time in every caller this crate serves, the command line
+/// running one operation after another, so one record serves,
+/// and a record is cleared only by the spawn that wrote it, so a
+/// nested spawn cannot clear the record of the spawn that
+/// contains it. An embedding process installs no handler, and
+/// the record stands inert there.
+static ACTIVE_CHILD_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// Record the group of a child whose wait is beginning, for the
+/// signal forwarding the command line installs.
+pub(crate) fn note_child_spawned(pid: u32) {
+    ACTIVE_CHILD_GROUP.store(pid as i32, Ordering::SeqCst);
+}
+
+/// Clear the record of a child whose wait completed, where the
+/// record still names that child.
+pub(crate) fn note_child_finished(pid: u32) {
+    let _ = ACTIVE_CHILD_GROUP.compare_exchange(pid as i32, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// The recorded group of the standing child, or zero where none
+/// stands. The command line's signal handlers read this.
+pub(crate) fn active_child_group() -> i32 {
+    ACTIVE_CHILD_GROUP.load(Ordering::SeqCst)
+}
+
+/// How a wait on a spawned child ended, as the waiter thread
+/// that owns the child reports it.
+pub(crate) enum ChildWait {
+    /// The child exited, and its status stands.
+    Exited(std::process::ExitStatus),
+    /// The wait itself failed. The waiter stopped the child's
+    /// group before reporting, so no path out of a runner leaves
+    /// a spawned child standing.
+    Failed(io::Error),
+    /// The deadline passed with the child still standing. The
+    /// caller stopped the group before returning this.
+    TimedOut,
+}
+
+/// Wait for a spawned child against a deadline without polling.
+///
+/// A waiter thread owns the child and waits blocking, reporting
+/// the exit or the wait failure over a channel, and the caller
+/// takes the report against the deadline, so a finished child is
+/// reported as it finishes rather than at the next poll. On a
+/// timeout the caller stops the group and then collects the
+/// waiter, whose own wait returns once the group stops, so the
+/// child stands reaped on every path. The child stands recorded
+/// in the forwarding registry from the start of the wait until
+/// the wait completes.
+pub(crate) fn await_child(child: std::process::Child, timeout: Duration) -> ChildWait {
+    let pid = child.id();
+    note_child_spawned(pid);
+    let (out, inside) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let mut child = child;
+        let report = match child.wait() {
+            Ok(status) => ChildWait::Exited(status),
+            Err(exc) => {
+                kill_process_group(&mut child);
+                ChildWait::Failed(exc)
+            }
+        };
+        let _ = out.send(report);
+    });
+    let report = match inside.recv_timeout(timeout) {
+        Ok(report) => report,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_group(pid);
+            let _ = inside.recv();
+            ChildWait::TimedOut
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ChildWait::Failed(
+            io::Error::other("the waiter thread ended without reporting"),
+        ),
+    };
+    let _ = waiter.join();
+    note_child_finished(pid);
+    report
 }
 
 fn run_git(
@@ -1612,33 +1737,24 @@ fn run_git(
         let _ = err_pipe.read_to_end(&mut buf);
         buf
     });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    kill_process_group(&mut child);
-                    let _ = child.wait();
-                    // The reader threads end detached on this
-                    // path. A grandchild of git can hold the
-                    // pipes open after git itself is dead, and
-                    // joining here would block past the timeout
-                    // this call was promised to keep.
-                    drop(out_thread);
-                    drop(err_thread);
-                    return Err(Error::plain(format!(
-                        "git {joined} did not finish within {} seconds and was stopped",
-                        timeout.as_secs()
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(exc) => {
-                return Err(Error::plain(format!(
-                    "git {joined} could not be waited on, {exc}"
-                )));
-            }
+    let status = match await_child(child, timeout) {
+        ChildWait::Exited(status) => status,
+        ChildWait::TimedOut => {
+            // The reader threads end detached on this path. A
+            // grandchild of git can hold the pipes open after git
+            // itself is dead, and joining here would block past
+            // the timeout this call was promised to keep.
+            drop(out_thread);
+            drop(err_thread);
+            return Err(Error::plain(format!(
+                "git {joined} did not finish within {} seconds and was stopped",
+                timeout.as_secs()
+            )));
+        }
+        ChildWait::Failed(exc) => {
+            return Err(Error::plain(format!(
+                "git {joined} could not be waited on, {exc}"
+            )));
         }
     };
     let stdout = out_thread.join().unwrap_or_default();
@@ -1973,16 +2089,25 @@ fn free_run(data: &Registry, ranges: i64) -> Option<(i64, i64)> {
     if ranges < 1 || ranges > pool.range_count {
         return None;
     }
-    let taken: Vec<(i64, i64)> = data
-        .claims
-        .values()
-        .map(|record| (record.port_start, record.port_end))
-        .collect();
-    for index in 0..=(pool.range_count - ranges) {
-        let start = pool.start + index * pool.range_size;
-        let end = start + ranges * pool.range_size - 1;
-        if taken.iter().all(|(low, high)| end < *low || start > *high) {
-            return Some((start, end));
+    let mut taken: BTreeSet<i64> = BTreeSet::new();
+    for record in data.claims.values() {
+        let first = (record.port_start - pool.start) / pool.range_size;
+        let last = (record.port_end - pool.start) / pool.range_size;
+        for index in first..=last {
+            taken.insert(index);
+        }
+    }
+    let mut run: i64 = 0;
+    for index in 0..pool.range_count {
+        if taken.contains(&index) {
+            run = 0;
+        } else {
+            run += 1;
+            if run == ranges {
+                let start = pool.start + (index - ranges + 1) * pool.range_size;
+                let end = start + ranges * pool.range_size - 1;
+                return Some((start, end));
+            }
         }
     }
     None
@@ -2100,8 +2225,8 @@ pub fn rollback_claim(
         }
     }
     if !branch_preexisted {
-        if let Ok(listed) = git.result(repo, &["branch", "--list", branch]) {
-            if listed.code == 0 && !listed.stdout.trim().is_empty() {
+        match git.result(repo, &["branch", "--list", branch]) {
+            Ok(listed) if listed.code == 0 && !listed.stdout.trim().is_empty() => {
                 match git.result(repo, &["branch", "-D", branch]) {
                     Ok(result) if result.code == 0 => {}
                     Ok(result) => problems.push(format!(
@@ -2114,6 +2239,15 @@ pub fn rollback_claim(
                     )),
                 }
             }
+            Ok(listed) if listed.code == 0 => {}
+            Ok(listed) => problems.push(format!(
+                "the branch {branch} could not be checked, {}",
+                git_detail(&listed)
+            )),
+            Err(exc) => problems.push(format!(
+                "the branch {branch} could not be checked, {}",
+                exc.message()
+            )),
         }
     }
     problems
@@ -2385,11 +2519,11 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
     } = parts;
     let furnished = furnish_claim(&mut data, stack, agent, draw, &instant, git)?;
     let attempt = (|| -> Result<()> {
-        lock.verify_current()?;
         append_leavings(stack, &instant, "expired", &expired, None)?;
         if let Some(line) = routing {
             line.append(stack)?;
         }
+        lock.verify_current()?;
         saver(stack, &data)?;
         Ok(())
     })();
@@ -2532,11 +2666,16 @@ fn rollback_offers(git: &dyn GitRunner, stack: &Path, offers: &[Furnished], exc:
 /// other queue decision, and the release and the sweep and every
 /// offer the release makes publish in the one rename.
 pub fn release(stack: &Path, agent: &str) -> Result<ReleaseOutcome> {
-    release_with(stack, agent, &ProcessGit)
+    release_with(stack, agent, &ProcessGit, &save_registry)
 }
 
-fn release_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<ReleaseOutcome> {
-    Ok(release_report_with(stack, agent, git)?.outcome)
+fn release_with(
+    stack: &Path,
+    agent: &str,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ReleaseOutcome> {
+    Ok(release_report_with(stack, agent, git, saver)?.outcome)
 }
 
 /// What a release did, with the furnishing failures its offers
@@ -2559,10 +2698,15 @@ pub struct ReleaseReport {
 /// is the one release performs, and this entry point adds no
 /// behaviour of its own.
 pub fn release_report(stack: &Path, agent: &str) -> Result<ReleaseReport> {
-    release_report_with(stack, agent, &ProcessGit)
+    release_report_with(stack, agent, &ProcessGit, &save_registry)
 }
 
-fn release_report_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result<ReleaseReport> {
+fn release_report_with(
+    stack: &Path,
+    agent: &str,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ReleaseReport> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     let repo = stack.join(REPO_NAME);
@@ -2592,7 +2736,7 @@ fn release_report_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result
             append_leavings(&stack, &instant, "expired", &expired, None)?;
             append_leavings(&stack, &instant, "furnished", &furnished, Some(&spans))?;
             lock.verify_current()?;
-            save_registry(&stack, &data)?;
+            saver(&stack, &data)?;
             Ok(())
         })();
         if let Err(exc) = published {
@@ -2614,7 +2758,7 @@ fn release_report_with(stack: &Path, agent: &str, git: &dyn GitRunner) -> Result
             None,
         )?;
         lock.verify_current()?;
-        save_registry(&stack, &data)?;
+        saver(&stack, &data)?;
         return Ok(ReleaseReport {
             outcome: ReleaseOutcome::Wait(wait),
             furnishing_failures: Vec::new(),
@@ -4146,16 +4290,16 @@ pub fn claim_routed_waiting(
     agent: &str,
     description: &str,
     default_profile: Profile,
-    transport: Option<&dyn JudgeTransport>,
     wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
 ) -> Result<ClaimOutcome> {
     claim_routed_waiting_with(
         stack,
         agent,
         description,
         default_profile,
-        transport,
         wait_for,
+        transport,
         &ProcessGit,
         &save_registry,
     )
@@ -4167,8 +4311,8 @@ fn claim_routed_waiting_with(
     agent: &str,
     description: &str,
     default_profile: Profile,
-    transport: Option<&dyn JudgeTransport>,
     wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ClaimOutcome> {
@@ -4420,6 +4564,76 @@ mod tests {
         );
     }
 
+    struct ErroringListGit;
+
+    impl GitRunner for ErroringListGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
+                return Err(Error::plain("the branch listing is broken in this test"));
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    struct FailingListGit;
+
+    impl GitRunner for FailingListGit {
+        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+            if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
+                return Ok(GitOutput {
+                    code: 128,
+                    stdout: String::new(),
+                    stderr: "the branch listing is broken in this test".to_string(),
+                });
+            }
+            ProcessGit.result(repo, args)
+        }
+    }
+
+    #[test]
+    fn a_rollback_whose_branch_probe_errors_reports_the_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-rollback-probe-error",
+            std::process::id()
+        ));
+        let problems = rollback_claim(
+            &ErroringListGit,
+            &dir,
+            &dir.join("worktree"),
+            "switchyard/alpha",
+            false,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("switchyard/alpha"), "{problems:?}");
+        assert!(problems[0].contains("could not be checked"), "{problems:?}");
+        assert!(
+            problems[0].contains("the branch listing is broken in this test"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_rollback_whose_branch_probe_fails_reports_the_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-rollback-probe-failure",
+            std::process::id()
+        ));
+        let problems = rollback_claim(
+            &FailingListGit,
+            &dir,
+            &dir.join("worktree"),
+            "switchyard/alpha",
+            false,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("switchyard/alpha"), "{problems:?}");
+        assert!(problems[0].contains("could not be checked"), "{problems:?}");
+        assert!(
+            problems[0].contains("the branch listing is broken in this test"),
+            "{problems:?}"
+        );
+    }
+
     struct BusyBranchGit;
 
     impl GitRunner for BusyBranchGit {
@@ -4463,6 +4677,73 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("could not be deleted"), "{message}");
+    }
+
+    /// The settlement pin of SY-A5, on the saver seam of
+    /// SY-A35. A release whose publish fails at its save step,
+    /// after the released claim's worktree and branch already
+    /// stand removed, leaves the claim's record standing in the
+    /// registry over the deleted git state, its furnished
+    /// offers rolled back and the wait standing. The retry of
+    /// the same release heals the state whole: it takes the
+    /// missing worktree prune path, skips the missing branch,
+    /// furnishes the wait exactly once, and publishes. The pin
+    /// passes on the behaviour as it stands by design, because
+    /// the behaviour is the settlement's claim, and it fails on
+    /// the plausible wrong repairs, a retry that refuses a
+    /// missing worktree or a missing branch, a release that
+    /// publishes its record removal ahead of its offers, or a
+    /// rollback that leaves a furnished offer standing.
+    #[test]
+    fn a_release_whose_publish_fails_leaves_a_record_the_retry_heals() {
+        let (dir, stack) = unit_stack("release-save-fails");
+        claim(&stack, "holder").unwrap();
+        claim(&stack, "filler").unwrap();
+        let waited = claim_waiting(&stack, "waiter", None, None).unwrap();
+        assert!(matches!(waited, ClaimOutcome::Wait(_)));
+        let error = release_report_with(&stack, "holder", &ProcessGit, &failing_saver)
+            .expect_err("the staged save must fail the release after its offers");
+        assert!(
+            error.message().contains("staged to fail"),
+            "{}",
+            error.message()
+        );
+        let data = load_registry(&stack).unwrap();
+        assert!(data.claims.contains_key("holder"));
+        assert!(data.claims.contains_key("filler"));
+        assert!(!data.claims.contains_key("waiter"));
+        assert_eq!(data.waits.len(), 1);
+        assert_eq!(data.waits[0].agent, "waiter");
+        assert!(!stack.join("worktrees/holder").exists());
+        assert!(!stack.join("worktrees/waiter").exists());
+        let listing = ProcessGit
+            .result(&stack.join(REPO_NAME), &["branch", "--list"])
+            .unwrap();
+        assert!(
+            !listing.stdout.contains("switchyard/holder"),
+            "{}",
+            listing.stdout
+        );
+        assert!(
+            !listing.stdout.contains("switchyard/waiter"),
+            "{}",
+            listing.stdout
+        );
+        match release(&stack, "holder").unwrap() {
+            ReleaseOutcome::Claim(record) => assert_eq!(record.agent, "holder"),
+            ReleaseOutcome::Wait(_) => panic!("the retry must release the claim"),
+        }
+        let data = load_registry(&stack).unwrap();
+        assert!(!data.claims.contains_key("holder"));
+        assert!(data.waits.is_empty());
+        let furnished = data
+            .claims
+            .get("waiter")
+            .expect("the retry furnishes the standing wait");
+        assert_eq!((furnished.port_start, furnished.port_end), (20000, 20009));
+        assert!(stack.join("worktrees/waiter").is_dir());
+        assert!(!stack.join("worktrees/holder").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4704,6 +4985,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The gate of SY-A3. A shape the validator refuses returns
+    /// None from stamp_micros rather than an instant computed
+    /// past the refusal, one shape for each range the validator
+    /// checks and one for the colonless basic time its grammar
+    /// does not carry. Every shape below computed an instant on
+    /// the code before the gate, so each assertion fails there
+    /// for the real reason.
+    #[test]
+    fn stamp_micros_refuses_every_shape_the_validator_refuses() {
+        for shape in [
+            "2026-13-02T10:00:00Z",
+            "2026-11-32T10:00:00Z",
+            "2026-02-30T10:00:00Z",
+            "2026-11-02T24:00:00Z",
+            "2026-11-02T10:60:00Z",
+            "2026-11-02T10:00:60Z",
+            "2026-11-02T10:00:00+24:00",
+            "20261102T100000",
+        ] {
+            assert!(!is_valid_timestamp(shape), "{shape}");
+            assert_eq!(stamp_micros(shape), None, "{shape}");
+        }
+    }
+
     #[test]
     fn stamp_micros_reads_every_shape_the_validator_accepts() {
         let whole = stamp_micros("2026-11-02T10:00:00Z").unwrap();
@@ -4723,6 +5028,17 @@ mod tests {
             assert!(is_valid_timestamp(shape), "{shape}");
             assert_eq!(stamp_micros(shape), Some(whole), "{shape}");
         }
+        // The no separator basic shape the SY-A4 examination
+        // settled: a basic date run into a basic time with no
+        // separator character is refused by both readers, the
+        // validator at its separator step and stamp_micros at
+        // its offset match, so neither computes an instant for
+        // it. The pin passes on the code as it stands by design
+        // and fails on the plausible wrong repairs, a validator
+        // loosened to accept the shape or a reader taught to
+        // compute its instant.
+        assert!(!is_valid_timestamp("20261102100000"));
+        assert_eq!(stamp_micros("20261102100000"), None);
         assert_eq!(
             stamp_micros("2026-11-02"),
             Some(days_from_civil(2026, 11, 2) as i128 * 86_400_000_000)
@@ -4735,6 +5051,39 @@ mod tests {
     /// standing for state that was never published.
     fn failing_saver(_stack: &Path, _data: &Registry) -> Result<()> {
         Err(Error::plain("the save is staged to fail in this test"))
+    }
+
+    /// The long fraction of SY-A41. A fraction past six digits
+    /// computes the micros of its first six digits, exactly as
+    /// the standing division computed them, and a fraction far
+    /// past the width an i128 accumulation holds computes them
+    /// too, where the standing accumulation overflowed. The
+    /// grammar stands unchanged, so the validator still accepts
+    /// the shape, and the expiry comparison answers by the
+    /// truncated instant.
+    #[test]
+    fn stamp_micros_truncates_a_long_fraction_without_overflow() {
+        let nines = format!("2026-11-02T10:00:00.{}Z", "9".repeat(50));
+        assert!(is_valid_timestamp(&nines));
+        assert_eq!(
+            stamp_micros(&nines),
+            stamp_micros("2026-11-02T10:00:00.999999Z")
+        );
+        let zeros = format!("2026-11-02T10:00:00.{}Z", "0".repeat(50));
+        assert!(is_valid_timestamp(&zeros));
+        assert_eq!(stamp_micros(&zeros), stamp_micros("2026-11-02T10:00:00Z"));
+        let wait = Wait {
+            agent: "waiter".to_string(),
+            profile: "plain".to_string(),
+            recorded_at: nines,
+            wait_for: Some(1),
+            score: None,
+            confidence: None,
+            model: None,
+            fallback: "none".to_string(),
+        };
+        assert!(!wait_expired(&wait, "2026-11-02T10:00:01Z"));
+        assert!(wait_expired(&wait, "2026-11-02T10:00:02Z"));
     }
 
     fn read_queue_lines(stack: &Path) -> Vec<serde_json::Value> {
@@ -4952,6 +5301,44 @@ mod tests {
         let digests = queued_digests(&stack, &wanted);
         assert_eq!(digests.len(), 1);
         assert_eq!(digests["w1"], ("d".repeat(64), 7));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The first fit search of SY-A44 over a fragmented pool.
+    /// Claims stand on slots 0, 2, and 5 of eight, so the free
+    /// runs stand as slot 1 alone, slots 3 and 4, and slots 6
+    /// and 7, and the search answers the first run that reaches
+    /// each draw and refuses the draws no run reaches. The pin
+    /// passes against the search as it stood, the repair being
+    /// behavior identical; its work is to fail against a search
+    /// that returns a later run or a longer run, or one that
+    /// miscounts at the pool's end.
+    #[test]
+    fn free_run_finds_the_first_run_in_a_fragmented_pool() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-unit-test-{}-free-run",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        init_stack(&stack, 20000, 10, 8).unwrap();
+        for index in 0..6 {
+            claim(&stack, &format!("holder-{index}")).unwrap();
+        }
+        release(&stack, "holder-1").unwrap();
+        release(&stack, "holder-3").unwrap();
+        release(&stack, "holder-4").unwrap();
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(free_run(&data, 1), Some((20010, 20019)));
+        assert_eq!(free_run(&data, 2), Some((20030, 20049)));
+        assert_eq!(free_run(&data, 3), None);
+        assert_eq!(free_run(&data, 8), None);
+        release(&stack, "holder-0").unwrap();
+        release(&stack, "holder-2").unwrap();
+        release(&stack, "holder-5").unwrap();
+        let data = load_registry(&stack).unwrap();
+        assert_eq!(free_run(&data, 8), Some((20000, 20079)));
         let _ = fs::remove_dir_all(&dir);
     }
 }

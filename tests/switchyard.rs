@@ -154,6 +154,33 @@ fn init_records_the_pool_and_creates_the_repository() {
     assert_eq!(head.trim(), "main");
 }
 
+/// The checked prints of SY-A33 against a real full device.
+/// A list printed where every write fails with ENOSPC exits 1
+/// and reports the output refusal on its error stream, where
+/// the discarded writes exited 0 over the truncated table.
+#[test]
+fn a_list_printed_to_a_full_device_fails_loudly() {
+    let stack = stack_fixture();
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, err) = run_cli(&["claim", "alpha", "--stack", &stack_arg]);
+    assert_eq!(code, 0, "{err}");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+        .args(["list", "--stack", &stack_arg])
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("the command's output could not be written"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn claim_allocates_everything_and_the_record_matches_the_disk() {
     let stack = stack_fixture();
@@ -1068,6 +1095,18 @@ fn agent_names_with_newlines_are_rejected_and_change_nothing() {
 }
 
 #[test]
+fn agent_names_with_c1_controls_are_quoted_escaped_in_the_refusal() {
+    let stack = stack_fixture();
+    let before = snapshot(&stack);
+    let (code, _, err) = run_cli(&["claim", "al\u{85}pha", "--stack", &stack.to_string_lossy()]);
+    assert_ne!(code, 0);
+    assert!(err.contains("invalid agent name"), "{err}");
+    assert!(err.contains("\\x85"), "{err}");
+    assert!(!err.contains('\u{85}'), "{err}");
+    assert_eq!(snapshot(&stack), before);
+}
+
+#[test]
 fn a_claim_ignores_git_location_variables_from_the_caller() {
     let base = temp_dir("git-env");
     let stack = init_stack_dir(&base, &[]);
@@ -1480,6 +1519,26 @@ fn an_init_with_a_50_digit_port_start_is_refused_and_creates_nothing() {
         "{err}"
     );
     assert!(!stack.exists(), "a refused init leaves no stack behind");
+}
+
+#[test]
+fn an_init_with_a_pool_option_that_is_no_integer_is_refused_by_name() {
+    // The three pool options refuse a value that is no integer
+    // under one wording, each naming its own option. The wording
+    // stands written once in the parser, and this pin holds each
+    // option to it, so a drift in any one statement of the
+    // refusal fails here.
+    for option in ["--port-start", "--range-size", "--range-count"] {
+        let base = temp_dir("not-an-integer");
+        let stack = base.join("stack");
+        let (code, _, err) = run_cli(&["init", "--stack", &stack.to_string_lossy(), option, "ten"]);
+        assert_eq!(code, 2, "{option} gave {err}");
+        assert!(
+            err.contains(&format!("argument {option}: invalid int value: 'ten'")),
+            "{option} gave {err}"
+        );
+        assert!(!stack.exists(), "a refused init leaves no stack behind");
+    }
 }
 
 #[test]
