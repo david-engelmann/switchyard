@@ -1068,6 +1068,18 @@ fn agent_names_with_newlines_are_rejected_and_change_nothing() {
 }
 
 #[test]
+fn agent_names_with_c1_controls_are_quoted_escaped_in_the_refusal() {
+    let stack = stack_fixture();
+    let before = snapshot(&stack);
+    let (code, _, err) = run_cli(&["claim", "al\u{85}pha", "--stack", &stack.to_string_lossy()]);
+    assert_ne!(code, 0);
+    assert!(err.contains("invalid agent name"), "{err}");
+    assert!(err.contains("\\x85"), "{err}");
+    assert!(!err.contains('\u{85}'), "{err}");
+    assert_eq!(snapshot(&stack), before);
+}
+
+#[test]
 fn a_claim_ignores_git_location_variables_from_the_caller() {
     let base = temp_dir("git-env");
     let stack = init_stack_dir(&base, &[]);
@@ -1480,6 +1492,26 @@ fn an_init_with_a_50_digit_port_start_is_refused_and_creates_nothing() {
         "{err}"
     );
     assert!(!stack.exists(), "a refused init leaves no stack behind");
+}
+
+#[test]
+fn an_init_with_a_pool_option_that_is_no_integer_is_refused_by_name() {
+    // The three pool options refuse a value that is no integer
+    // under one wording, each naming its own option. The wording
+    // stands written once in the parser, and this pin holds each
+    // option to it, so a drift in any one statement of the
+    // refusal fails here.
+    for option in ["--port-start", "--range-size", "--range-count"] {
+        let base = temp_dir("not-an-integer");
+        let stack = base.join("stack");
+        let (code, _, err) = run_cli(&["init", "--stack", &stack.to_string_lossy(), option, "ten"]);
+        assert_eq!(code, 2, "{option} gave {err}");
+        assert!(
+            err.contains(&format!("argument {option}: invalid int value: 'ten'")),
+            "{option} gave {err}"
+        );
+        assert!(!stack.exists(), "a refused init leaves no stack behind");
+    }
 }
 
 #[test]
