@@ -98,6 +98,19 @@ enum Parsed {
     Exit(i32),
 }
 
+/// Parse one integer option's value, refusing a value that is
+/// no integer by the option's own name. The three pool options
+/// share this refusal, so it stands written once here. A digit
+/// string past every machine width saturates inside parse_int
+/// and is refused by the library's validation instead, so this
+/// refusal fires only for text that is not an integer at all.
+fn int_option(option: &str, value: &str) -> std::result::Result<i128, String> {
+    match parse_int(value) {
+        Some(number) => Ok(number),
+        None => Err(format!("argument {option}: invalid int value: '{value}'")),
+    }
+}
+
 /// Parse an integer at whatever magnitude the caller wrote it.
 ///
 /// Python's parser accepted integers of any size and let the pool
@@ -122,7 +135,37 @@ fn parse_int(text: &str) -> Option<i128> {
     }
 }
 
-fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, String> {
+/// The refusal a failed write of the command's own output
+/// surfaces as. The command's prints are checked, so a claim
+/// or a list printed into a closed pipe or a full device fails
+/// loudly at exit 1 with this refusal, reported on the error
+/// stream where that stream still takes writes, instead of
+/// truncating silently at exit 0. Rust ignores SIGPIPE for the
+/// process, so without the check no surface reports the
+/// truncation at all.
+fn output_error(exc: std::io::Error) -> crate::Error {
+    crate::Error::Plain(format!("the command's output could not be written, {exc}"))
+}
+
+/// Print the help text, checked the way every print of the
+/// command is checked. A failed help write reports itself on
+/// the error stream and exits 1, as a failed print inside a
+/// command does.
+fn print_help(out: &mut dyn Write, err: &mut dyn Write) -> Parsed {
+    match write!(out, "{HELP}") {
+        Ok(()) => Parsed::Exit(0),
+        Err(exc) => {
+            let _ = writeln!(err, "error: {}", output_error(exc).message());
+            Parsed::Exit(1)
+        }
+    }
+}
+
+fn parse(
+    args: &[OsString],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> std::result::Result<Parsed, String> {
     let tokens: Vec<String> = args
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -132,8 +175,7 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
         None => return Err("the following arguments are required: command".to_string()),
     };
     if first == "-h" || first == "--help" {
-        let _ = write!(out, "{HELP}");
-        return Ok(Parsed::Exit(0));
+        return Ok(print_help(out, err));
     }
     if !COMMANDS.contains(&first.as_str()) {
         if first.starts_with('-') {
@@ -160,8 +202,7 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
     while index < tokens.len() {
         let token = &tokens[index];
         if token == "-h" || token == "--help" {
-            let _ = write!(out, "{HELP}");
-            return Ok(Parsed::Exit(0));
+            return Ok(print_help(out, err));
         }
         if token == "--wait" && command == "claim" {
             wait = true;
@@ -203,36 +244,9 @@ fn parse(args: &[OsString], out: &mut dyn Write) -> std::result::Result<Parsed, 
             };
             match option.as_str() {
                 "--stack" => stack = Some(PathBuf::from(value)),
-                "--port-start" => {
-                    port_start = match parse_int(&value) {
-                        Some(number) => number,
-                        None => {
-                            return Err(format!(
-                                "argument --port-start: invalid int value: '{value}'"
-                            ))
-                        }
-                    }
-                }
-                "--range-size" => {
-                    range_size = match parse_int(&value) {
-                        Some(number) => number,
-                        None => {
-                            return Err(format!(
-                                "argument --range-size: invalid int value: '{value}'"
-                            ))
-                        }
-                    }
-                }
-                "--range-count" => {
-                    range_count = match parse_int(&value) {
-                        Some(number) => number,
-                        None => {
-                            return Err(format!(
-                                "argument --range-count: invalid int value: '{value}'"
-                            ))
-                        }
-                    }
-                }
+                "--port-start" => port_start = int_option(&option, &value)?,
+                "--range-size" => range_size = int_option(&option, &value)?,
+                "--range-count" => range_count = int_option(&option, &value)?,
                 "--describe" => describe = Some(value),
                 "--default-profile" => default_profile = Some(value),
                 "--profile" => profile = Some(value),
@@ -492,11 +506,11 @@ fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<(
         if parsed.wait {
             let outcome =
                 claim_profile_waiting(stack, agent, profile, wait_bound(parsed), transport_ref)?;
-            print_outcome(out, &outcome);
+            print_outcome(out, &outcome).map_err(output_error)?;
             return Ok(());
         }
         let record = claim_profile(stack, agent, profile)?;
-        print_claim(out, &record);
+        print_claim(out, &record).map_err(output_error)?;
         return Ok(());
     }
     if let Some(description) = &parsed.describe {
@@ -507,65 +521,67 @@ fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<(
                 agent,
                 description,
                 default,
-                transport_ref,
                 wait_bound(parsed),
+                transport_ref,
             )?;
-            print_outcome(out, &outcome);
+            print_outcome(out, &outcome).map_err(output_error)?;
             return Ok(());
         }
         let record = claim_routed(stack, agent, description, default, transport_ref)?;
-        print_claim(out, &record);
+        print_claim(out, &record).map_err(output_error)?;
         return Ok(());
     }
     if parsed.wait {
         let outcome = claim_waiting(stack, agent, wait_bound(parsed), transport_ref)?;
-        print_outcome(out, &outcome);
+        print_outcome(out, &outcome).map_err(output_error)?;
         return Ok(());
     }
     let record = claim(stack, agent)?;
-    print_claim(out, &record);
+    print_claim(out, &record).map_err(output_error)?;
     Ok(())
 }
 
-fn print_outcome(out: &mut dyn Write, outcome: &ClaimOutcome) {
+fn print_outcome(out: &mut dyn Write, outcome: &ClaimOutcome) -> std::io::Result<()> {
     match outcome {
         ClaimOutcome::Claim(record) => print_claim(out, record),
         ClaimOutcome::Wait(wait) => print_wait(out, wait),
     }
 }
 
-fn print_claim(out: &mut dyn Write, record: &Record) {
-    let _ = writeln!(out, "claimed {}", record.agent);
-    let _ = writeln!(out, "branch {}", record.branch);
-    let _ = writeln!(out, "worktree {}", record.worktree);
-    let _ = writeln!(out, "ports {}-{}", record.port_start, record.port_end);
-    let _ = writeln!(out, "database {}", record.database);
-    let _ = writeln!(out, "env file {}", record.env_file);
+fn print_claim(out: &mut dyn Write, record: &Record) -> std::io::Result<()> {
+    writeln!(out, "claimed {}", record.agent)?;
+    writeln!(out, "branch {}", record.branch)?;
+    writeln!(out, "worktree {}", record.worktree)?;
+    writeln!(out, "ports {}-{}", record.port_start, record.port_end)?;
+    writeln!(out, "database {}", record.database)?;
+    writeln!(out, "env file {}", record.env_file)?;
+    Ok(())
 }
 
 /// Print a claim that waited. The claim holds no branch and no
 /// worktree and no ports, so the print names the wait and the
 /// settled profile and the score the consultation returned or
 /// the fallback class that left the wait scoreless.
-fn print_wait(out: &mut dyn Write, wait: &Wait) {
-    let _ = writeln!(out, "waiting {}", wait.agent);
-    let _ = writeln!(out, "profile {}", wait.profile);
+fn print_wait(out: &mut dyn Write, wait: &Wait) -> std::io::Result<()> {
+    writeln!(out, "waiting {}", wait.agent)?;
+    writeln!(out, "profile {}", wait.profile)?;
     match (wait.score, wait.confidence) {
         (Some(score), Some(confidence)) => {
-            let _ = writeln!(out, "score {score}");
-            let _ = writeln!(out, "confidence {confidence}");
+            writeln!(out, "score {score}")?;
+            writeln!(out, "confidence {confidence}")?;
         }
         _ => {
-            let _ = writeln!(out, "score none");
-            let _ = writeln!(out, "fallback {}", wait.fallback);
+            writeln!(out, "score none")?;
+            writeln!(out, "fallback {}", wait.fallback)?;
         }
     }
     if let Some(bound) = wait.wait_for {
-        let _ = writeln!(out, "wait bound {bound} seconds");
+        writeln!(out, "wait bound {bound} seconds")?;
     }
+    Ok(())
 }
 
-fn print_table(out: &mut dyn Write, records: &[Record]) {
+fn print_table(out: &mut dyn Write, records: &[Record]) -> std::io::Result<()> {
     let header: Vec<String> = ["AGENT", "BRANCH", "PORTS", "DATABASE", "WORKTREE"]
         .iter()
         .map(|cell| cell.to_string())
@@ -582,14 +598,14 @@ fn print_table(out: &mut dyn Write, records: &[Record]) {
             ]
         })
         .collect();
-    print_grid(out, &header, &rows);
+    print_grid(out, &header, &rows)
 }
 
 /// Print the standing waits in offer order, the queue table of
 /// obligation SY-24, carrying the agent and the settled profile
 /// and the score or the word none and the instant the wait was
 /// recorded.
-fn print_queue_table(out: &mut dyn Write, waits: &[Wait]) {
+fn print_queue_table(out: &mut dyn Write, waits: &[Wait]) -> std::io::Result<()> {
     let header: Vec<String> = ["AGENT", "PROFILE", "SCORE", "RECORDED"]
         .iter()
         .map(|cell| cell.to_string())
@@ -608,13 +624,13 @@ fn print_queue_table(out: &mut dyn Write, waits: &[Wait]) {
             ]
         })
         .collect();
-    print_grid(out, &header, &rows);
+    print_grid(out, &header, &rows)
 }
 
 /// Render one table in the shape the claims table landed, each
 /// column as wide as its widest cell and the columns joined by
 /// two spaces.
-fn print_grid(out: &mut dyn Write, header: &[String], rows: &[Vec<String>]) {
+fn print_grid(out: &mut dyn Write, header: &[String], rows: &[Vec<String>]) -> std::io::Result<()> {
     let mut widths: Vec<usize> = header.iter().map(|cell| cell.chars().count()).collect();
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
@@ -632,14 +648,15 @@ fn print_grid(out: &mut dyn Write, header: &[String], rows: &[Vec<String>]) {
             .collect::<Vec<_>>()
             .join("  ")
     };
-    let _ = writeln!(out, "{}", render(header));
+    writeln!(out, "{}", render(header))?;
     for row in rows {
-        let _ = writeln!(out, "{}", render(row));
+        writeln!(out, "{}", render(row))?;
     }
+    Ok(())
 }
 
 fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let parsed = match parse(args, out) {
+    let parsed = match parse(args, out, err) {
         Ok(Parsed::Run(parsed)) => parsed,
         Ok(Parsed::Exit(code)) => return code,
         Err(message) => {
@@ -659,48 +676,50 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             parsed.range_size,
             parsed.range_count,
         )
-        .map(|pool| {
-            let _ = writeln!(out, "initialised stack at {}", stack.display());
-            let _ = writeln!(
+        .and_then(|pool| {
+            writeln!(out, "initialised stack at {}", stack.display()).map_err(output_error)?;
+            writeln!(
                 out,
                 "port pool {} ranges of {} ports from {}",
                 pool.range_count, pool.range_size, pool.start
-            );
+            )
+            .map_err(output_error)
         }),
         "claim" => claim_from_args(&stack, &parsed, out),
         "list" => {
             if parsed.queue {
-                list_waits(&stack).map(|waits| {
-                    print_queue_table(out, &waits);
-                })
+                list_waits(&stack)
+                    .and_then(|waits| print_queue_table(out, &waits).map_err(output_error))
             } else {
-                list_claims(&stack).map(|records| {
-                    print_table(out, &records);
-                })
+                list_claims(&stack)
+                    .and_then(|records| print_table(out, &records).map_err(output_error))
             }
         }
-        "release" => release_report(&stack, parsed.agent.as_deref().unwrap()).map(|report| {
-            match report.outcome {
+        "release" => release_report(&stack, parsed.agent.as_deref().unwrap()).and_then(|report| {
+            match &report.outcome {
                 ReleaseOutcome::Claim(record) => {
-                    let _ = writeln!(out, "released {}", record.agent);
-                    let _ = writeln!(
+                    writeln!(out, "released {}", record.agent).map_err(output_error)?;
+                    writeln!(
                         out,
                         "ports {}-{} returned",
                         record.port_start, record.port_end
-                    );
+                    )
+                    .map_err(output_error)?;
                 }
                 ReleaseOutcome::Wait(wait) => {
-                    let _ = writeln!(out, "released {}", wait.agent);
-                    let _ = writeln!(out, "wait cancelled");
+                    writeln!(out, "released {}", wait.agent).map_err(output_error)?;
+                    writeln!(out, "wait cancelled").map_err(output_error)?;
                 }
             }
             for failure in &report.furnishing_failures {
-                let _ = writeln!(
+                writeln!(
                     err,
                     "note: the wait of agent {} was skipped, furnishing it failed, {}",
                     failure.agent, failure.message
-                );
+                )
+                .map_err(output_error)?;
             }
+            Ok(())
         }),
         _ => unreachable!(),
     };
@@ -761,9 +780,17 @@ pub fn main() -> i32 {
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let code = run(&args, &mut out, &mut err);
-    let _ = out.flush();
-    let _ = err.flush();
-    code
+    match (code, out.flush()) {
+        (0, Err(exc)) => {
+            let _ = writeln!(err, "error: {}", output_error(exc).message());
+            let _ = err.flush();
+            1
+        }
+        _ => {
+            let _ = err.flush();
+            code
+        }
+    }
 }
 
 #[cfg(test)]
@@ -817,6 +844,72 @@ mod tests {
         assert_eq!(
             settled, later,
             "the descendant of the timed out judge kept running"
+        );
+    }
+
+    /// A writer whose every write fails, standing in for a
+    /// closed pipe and a full device at the command's output.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the output is full in this test"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The checked prints of SY-A33. A claim whose every output
+    /// write fails still lands, because the allocation does not
+    /// depend on its report, and the command exits 1 with the
+    /// output refusal on its error stream. On the code before
+    /// the check the writes were discarded and this run exited
+    /// 0, so the pin fails there for the real reason.
+    #[test]
+    fn a_claim_whose_output_cannot_be_written_fails_loudly_and_still_lands() {
+        let dir = std::env::temp_dir().join(format!(
+            "switchyard-cli-test-{}-output-fails",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stack = dir.join("stack");
+        crate::init_stack(&stack, 20000, 10, 2).unwrap();
+        let args: Vec<OsString> = vec![
+            "claim".into(),
+            "alpha".into(),
+            "--stack".into(),
+            stack.as_os_str().to_os_string(),
+        ];
+        let mut err: Vec<u8> = Vec::new();
+        let code = run(&args, &mut FailingWriter, &mut err);
+        assert_eq!(code, 1);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("the command's output could not be written"),
+            "{text}"
+        );
+        let records = crate::list_claims(&stack).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].agent, "alpha");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The help print is checked the same way: a help write
+    /// that fails exits 1 with the refusal on the error stream,
+    /// where the discarded write exited 0.
+    #[test]
+    fn a_help_whose_output_cannot_be_written_fails_loudly() {
+        let args: Vec<OsString> = vec!["--help".into()];
+        let mut err: Vec<u8> = Vec::new();
+        let code = run(&args, &mut FailingWriter, &mut err);
+        assert_eq!(code, 1);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("the command's output could not be written"),
+            "{text}"
         );
     }
 
