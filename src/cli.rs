@@ -98,6 +98,19 @@ enum Parsed {
     Exit(i32),
 }
 
+/// Parse one integer option's value, refusing a value that is
+/// no integer by the option's own name. The three pool options
+/// share this refusal, so it stands written once here. A digit
+/// string past every machine width saturates inside parse_int
+/// and is refused by the library's validation instead, so this
+/// refusal fires only for text that is not an integer at all.
+fn int_option(option: &str, value: &str) -> std::result::Result<i128, String> {
+    match parse_int(value) {
+        Some(number) => Ok(number),
+        None => Err(format!("argument {option}: invalid int value: '{value}'")),
+    }
+}
+
 /// Parse an integer at whatever magnitude the caller wrote it.
 ///
 /// Python's parser accepted integers of any size and let the pool
@@ -231,36 +244,9 @@ fn parse(
             };
             match option.as_str() {
                 "--stack" => stack = Some(PathBuf::from(value)),
-                "--port-start" => {
-                    port_start = match parse_int(&value) {
-                        Some(number) => number,
-                        None => {
-                            return Err(format!(
-                                "argument --port-start: invalid int value: '{value}'"
-                            ))
-                        }
-                    }
-                }
-                "--range-size" => {
-                    range_size = match parse_int(&value) {
-                        Some(number) => number,
-                        None => {
-                            return Err(format!(
-                                "argument --range-size: invalid int value: '{value}'"
-                            ))
-                        }
-                    }
-                }
-                "--range-count" => {
-                    range_count = match parse_int(&value) {
-                        Some(number) => number,
-                        None => {
-                            return Err(format!(
-                                "argument --range-count: invalid int value: '{value}'"
-                            ))
-                        }
-                    }
-                }
+                "--port-start" => port_start = int_option(&option, &value)?,
+                "--range-size" => range_size = int_option(&option, &value)?,
+                "--range-count" => range_count = int_option(&option, &value)?,
                 "--describe" => describe = Some(value),
                 "--default-profile" => default_profile = Some(value),
                 "--profile" => profile = Some(value),
@@ -541,8 +527,8 @@ fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<(
                 agent,
                 description,
                 default,
-                transport_ref,
                 wait_bound(parsed),
+                transport_ref,
             )?;
             print_outcome(out, &outcome).map_err(output_error)?;
             return Ok(());
