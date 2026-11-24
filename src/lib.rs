@@ -3683,11 +3683,13 @@ fn classify_score(body: &str) -> ScoreConsultation {
 
 /// The outcome of the one scoring consultation of a wait, the
 /// score and its confidence where one stands and the fallback
-/// word of obligation SY-20 where none does.
+/// class of obligation SY-20 where none does, carried as the
+/// typed class so the word a wait records is spelled once, at
+/// the class's own seat (SY-A29).
 struct ScoreOutcome {
     score: Option<i64>,
     confidence: Option<f64>,
-    fallback: &'static str,
+    fallback: Fallback,
     model: Option<String>,
 }
 
@@ -3702,7 +3704,7 @@ fn settle_score(transport: Option<&dyn JudgeTransport>, request: &str) -> ScoreO
             return ScoreOutcome {
                 score: None,
                 confidence: None,
-                fallback: "no transport",
+                fallback: Fallback::NoTransport,
                 model: None,
             }
         }
@@ -3715,7 +3717,7 @@ fn settle_score(transport: Option<&dyn JudgeTransport>, request: &str) -> ScoreO
             return ScoreOutcome {
                 score: None,
                 confidence: None,
-                fallback: "transport",
+                fallback: Fallback::Transport,
                 model,
             }
         }
@@ -3724,31 +3726,31 @@ fn settle_score(transport: Option<&dyn JudgeTransport>, request: &str) -> ScoreO
         ScoreConsultation::Score(level, confidence) => ScoreOutcome {
             score: Some(level),
             confidence: Some(confidence),
-            fallback: "none",
+            fallback: Fallback::None,
             model,
         },
         ScoreConsultation::LowConfidence => ScoreOutcome {
             score: None,
             confidence: None,
-            fallback: "low confidence",
+            fallback: Fallback::LowConfidence,
             model,
         },
         ScoreConsultation::Abstention => ScoreOutcome {
             score: None,
             confidence: None,
-            fallback: "abstention",
+            fallback: Fallback::Abstention,
             model,
         },
         ScoreConsultation::Silence => ScoreOutcome {
             score: None,
             confidence: None,
-            fallback: "silence",
+            fallback: Fallback::Silence,
             model,
         },
         ScoreConsultation::Malformed => ScoreOutcome {
             score: None,
             confidence: None,
-            fallback: "malformed",
+            fallback: Fallback::Malformed,
             model,
         },
     }
@@ -4278,7 +4280,7 @@ fn record_wait(
         score: outcome.score,
         confidence: outcome.confidence,
         model: outcome.model,
-        fallback: outcome.fallback.to_string(),
+        fallback: outcome.fallback.name().to_string(),
     };
     let mut line = QueueLine::for_wait(&instant, "queued", &wait);
     line.request_sha256 = Some(sha256_hex(request.as_bytes()));
