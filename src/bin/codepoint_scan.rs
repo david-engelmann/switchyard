@@ -18,13 +18,15 @@
 //! exit 2, where the setup scanner exited 0 with zero counts. A
 //! file that cannot be read is a clean scan error at exit 2, where
 //! the setup scanner let the failure escape as a traceback at
-//! exit 1. The walk excludes directories by name below the scan
-//! root, so the name of an ancestor of the root can never exclude
-//! the root itself, and every file in the tree is scanned,
-//! whatever its name or suffix, apart from the known binary
-//! suffixes, and the walk follows no directory symlink, and a
-//! file that does not decode as UTF-8 fails the scan loudly
-//! instead of passing unseen.
+//! exit 1. An argument standing after the root is a scan error at
+//! exit 2 as well, where the setup scanner dropped it silently
+//! and answered for the root alone. The walk excludes directories
+//! by name below the scan root, so the name of an ancestor of the
+//! root can never exclude the root itself, and every file in the
+//! tree is scanned, whatever its name or suffix, apart from the
+//! known binary suffixes, and the walk follows no directory
+//! symlink, and a file that does not decode as UTF-8 fails the
+//! scan loudly instead of passing unseen.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -127,6 +129,12 @@ fn main() -> ExitCode {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    // The scan serves the one root its call names, and no part
+    // of a call is dropped silently (SY-A56).
+    if std::env::args_os().nth(2).is_some() {
+        report_scan_error("the scan takes at most one argument, the scan root");
+        return ExitCode::from(2);
+    }
     match scan(&root) {
         Ok((em_count, en_count, hits)) => {
             let output =

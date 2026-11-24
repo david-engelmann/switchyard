@@ -332,6 +332,49 @@ fn scan_tree(root: &Path) -> ScanOutput {
     }
 }
 
+fn scan_tree_with_extra(root: &Path, extra: &str) -> ScanOutput {
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .arg(root)
+        .arg(extra)
+        .output()
+        .unwrap();
+    ScanOutput {
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+// Audit finding SY-A56: the scanner refuses an argument standing
+// after the scan root. Before the fix the extra argument was
+// dropped silently and the scan answered for the root alone, so
+// the first pin below failed on the missing refusal and the
+// second on the count report the old code printed instead.
+
+#[test]
+fn codepoint_scan_refuses_an_argument_after_the_root() {
+    let dir = temp_dir("extra-argument");
+    std::fs::write(dir.join("clean.md"), "clean").unwrap();
+    let result = scan_tree_with_extra(&dir, "second-root");
+    assert_eq!(result.status, 2, "{}", result.stdout);
+    assert!(
+        result.stderr.contains("at most one argument"),
+        "{}",
+        result.stderr
+    );
+    assert_eq!(result.stderr.lines().count(), 1, "{}", result.stderr);
+    assert!(result.stdout.is_empty(), "{}", result.stdout);
+}
+
+#[test]
+fn codepoint_scan_refuses_an_extra_argument_before_scanning() {
+    let dir = temp_dir("extra-argument-dirty");
+    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
+    let result = scan_tree_with_extra(&dir, "second-root");
+    assert_eq!(result.status, 2, "{}", result.stdout);
+    assert!(result.stdout.is_empty(), "{}", result.stdout);
+}
+
 #[test]
 fn codepoint_scan_reports_zero_for_repo_tree() {
     let result = scan_tree(&root());
