@@ -20,13 +20,13 @@
 //! the setup scanner let the failure escape as a traceback at
 //! exit 1. An argument standing after the root is a scan error at
 //! exit 2 as well, where the setup scanner dropped it silently
-//! and answered for the root alone. The walk excludes directories by name below the scan
-//! root, so the name of an ancestor of the root can never exclude
-//! the root itself, and every file in the tree is scanned,
-//! whatever its name or suffix, apart from the known binary
-//! suffixes, and the walk follows no directory symlink, and a
-//! file that does not decode as UTF-8 fails the scan loudly
-//! instead of passing unseen.
+//! and answered for the root alone. The walk excludes directories
+//! by name below the scan root, so the name of an ancestor of the
+//! root can never exclude the root itself, and every file in the
+//! tree is scanned, whatever its name or suffix, apart from the
+//! known binary suffixes, and the walk follows no directory
+//! symlink, and a file that does not decode as UTF-8 fails the
+//! scan loudly instead of passing unseen.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
