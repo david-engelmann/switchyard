@@ -526,6 +526,45 @@ fn wait_record_corruptions_refuse_as_corrupt_and_change_nothing() {
 }
 
 #[test]
+fn an_empty_waits_list_refuses_as_corrupt_and_changes_nothing() {
+    let stack = default_stack("record-empty-waits");
+    claim(&stack, "holder").unwrap();
+    inject_waits(&stack, &[]);
+    let before = snapshot_tree(&stack);
+    for (label, result) in [
+        ("load", load_registry(&stack).map(|_| ())),
+        ("claim", claim(&stack, "other").map(|_| ())),
+        ("list_waits", list_waits(&stack).map(|_| ())),
+        ("release", release(&stack, "holder").map(|_| ())),
+    ] {
+        let error = result.expect_err("an empty waits list must refuse as corrupt");
+        assert_eq!(error.exit_code(), 2, "{label}");
+        assert!(
+            error
+                .message()
+                .contains("the waits list is empty, and waits stands only where a wait stands"),
+            "{label}: {}",
+            error.message()
+        );
+    }
+    let stack_arg = stack.to_string_lossy().into_owned();
+    for args in [
+        vec!["list", "--stack", &stack_arg],
+        vec!["list", "--stack", &stack_arg, "--queue"],
+        vec!["claim", "other", "--stack", &stack_arg],
+        vec!["release", "holder", "--stack", &stack_arg],
+    ] {
+        let (code, _, err) = run_cli(&args);
+        assert_eq!(code, 2, "{args:?}: {err}");
+        assert!(
+            err.contains("the waits list is empty, and waits stands only where a wait stands"),
+            "{args:?}: {err}"
+        );
+    }
+    assert_eq!(snapshot_tree(&stack), before);
+}
+
+#[test]
 fn a_preslice_registry_document_loads_with_its_queue_read_as_empty() {
     let stack = default_stack("record-preslice");
     claim(&stack, "holder").unwrap();
@@ -1429,6 +1468,51 @@ fn the_queue_table_prints_a_mixed_queue_in_offer_order() {
         .find(|line| line.contains("scoreless-first"))
         .unwrap();
     assert!(none_line.contains("none"), "{none_line}");
+}
+
+#[test]
+fn a_waiting_claim_passes_repeatable_judge_args_for_scoring_consultation() {
+    use std::os::unix::fs::PermissionsExt;
+    let stack = cli_stack("cli-wait-judge-args", 1);
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, err) = run_cli(&["claim", "--stack", &stack_arg, "holder"]);
+    assert_eq!(code, 0, "{err}");
+    let judge_dir = temp_dir("cli-wait-judge-args-script");
+    let staged = judge_dir.join("score.staged");
+    let reply = score_body("9", 0.85);
+    std::fs::write(
+        &staged,
+        format!(
+            "#!/bin/sh\n[ \"$#\" -eq 2 ] || exit 4\n[ \"$1\" = \"score-nine\" ] || exit 5\n[ \"$2\" = \"--calibrate\" ] || exit 6\nbody=$(cat)\ncase \"$body\" in\n  *'\"score\"'*) printf '%s' '{reply}' ;;\n  *) exit 7 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = judge_dir.join("score.sh");
+    std::fs::rename(&staged, &script).unwrap();
+    let (code, out, err) = run_cli(&[
+        "claim",
+        "--stack",
+        &stack_arg,
+        "waiter",
+        "--wait",
+        "--judge-command",
+        "/bin/sh",
+        "--judge-arg",
+        &script.to_string_lossy(),
+        "--judge-arg",
+        "score-nine",
+        "--judge-arg",
+        "--calibrate",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("waiting waiter"), "{out}");
+    assert!(out.contains("score 9"), "{out}");
+    let data = load_registry(&stack).unwrap();
+    assert_eq!(data.waits.len(), 1);
+    assert_eq!(data.waits[0].score, Some(9));
+    assert_eq!(data.waits[0].confidence, Some(0.85));
+    assert_eq!(data.waits[0].fallback, "none");
 }
 
 // The subprocess deadline of the consultation, driven against a

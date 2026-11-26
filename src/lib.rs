@@ -4626,7 +4626,12 @@ mod tests {
             "PATH".to_string(),
             format!("{}:/usr/bin:/bin", fake_bin.display()),
         )];
-        let result = run_git(&real_git, &["status"], &env, Duration::from_secs(1));
+        let result = run_git(
+            &real_git,
+            &[OsStr::new("status")],
+            &env,
+            Duration::from_secs(1),
+        );
         let _ = fs::remove_dir_all(&dir);
         let error = result.expect_err("the sleeping git must time out");
         assert_eq!(error.exit_code(), 1);
@@ -4673,10 +4678,21 @@ mod tests {
             "PATH".to_string(),
             format!("{}:/usr/bin:/bin", fake_bin.display()),
         )];
-        let result = run_git(&real_git, &["status"], &env, Duration::from_secs(1));
+        // Recorded correction under SY-26 for macOS gate parity: on
+        // macOS under parallel test load, kernel validation of a
+        // freshly written script in temp_dir on first execve can
+        // take slightly over one second after posix_spawn returns,
+        // so a three-second bound gives the background loop time to
+        // start ticking before the timeout stops the process group.
+        let result = run_git(
+            &real_git,
+            &[OsStr::new("status")],
+            &env,
+            Duration::from_secs(3),
+        );
         let error = result.expect_err("the sleeping git must time out");
         assert!(
-            error.message().contains("did not finish within 1 seconds"),
+            error.message().contains("did not finish within 3 seconds"),
             "{}",
             error.message()
         );
@@ -4691,10 +4707,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_git_call_whose_descendant_holds_a_pipe_open_times_out_and_stops_the_group() {
+        use std::os::unix::fs::PermissionsExt;
+        for (tag, body_fn) in [
+            (
+                "stdout-held",
+                (|hb: &Path| {
+                    format!(
+                        "#!/bin/sh\nwhile true; do echo tick >> {0}; sleep 0.2; done &\nwhile [ ! -s {0} ]; do sleep 0.02; done\nexit 0\n",
+                        hb.display()
+                    )
+                }) as fn(&Path) -> String,
+            ),
+            (
+                "stderr-held",
+                (|hb: &Path| {
+                    format!(
+                        "#!/bin/sh\n(exec >/dev/null; while true; do echo tick >> {0}; sleep 0.2; done) &\nwhile [ ! -s {0} ]; do sleep 0.02; done\nexit 0\n",
+                        hb.display()
+                    )
+                }) as fn(&Path) -> String,
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "switchyard-unit-test-{}-git-pipe-{tag}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let fake_bin = dir.join("bin");
+            fs::create_dir_all(&fake_bin).unwrap();
+            let heartbeat = dir.join("heartbeat");
+            let staged_git = fake_bin.join("git.staged");
+            fs::write(&staged_git, body_fn(&heartbeat)).unwrap();
+            fs::set_permissions(&staged_git, fs::Permissions::from_mode(0o755)).unwrap();
+            let fake_git = fake_bin.join("git");
+            fs::rename(&staged_git, &fake_git).unwrap();
+            let real_git = dir.join("repo");
+            fs::create_dir_all(&real_git).unwrap();
+            let env = vec![(
+                "PATH".to_string(),
+                format!("{}:/usr/bin:/bin", fake_bin.display()),
+            )];
+            let started = Instant::now();
+            let result = run_git(
+                &real_git,
+                &[OsStr::new("status")],
+                &env,
+                Duration::from_secs(3),
+            );
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(8),
+                "{tag} ran {elapsed:?} past its bound"
+            );
+            let error = result.expect_err("the held git pipe must time out");
+            assert_eq!(error.exit_code(), 1, "{tag}");
+            assert!(
+                error
+                    .message()
+                    .contains("did not finish within 3 seconds and was stopped"),
+                "{tag}: {}",
+                error.message()
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let settled = fs::metadata(&heartbeat).unwrap().len();
+            std::thread::sleep(Duration::from_millis(1500));
+            let later = fs::metadata(&heartbeat).unwrap().len();
+            let _ = fs::remove_dir_all(&dir);
+            assert_eq!(
+                settled, later,
+                "{tag}: the pipe holding descendant kept running"
+            );
+        }
+    }
+
     struct ErroringListGit;
 
     impl GitRunner for ErroringListGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
             if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
                 return Err(Error::plain("the branch listing is broken in this test"));
             }
@@ -4705,10 +4797,11 @@ mod tests {
     struct FailingListGit;
 
     impl GitRunner for FailingListGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
             if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
                 return Ok(GitOutput {
                     code: 128,
+                    stdout_bytes: Vec::new(),
                     stdout: String::new(),
                     stderr: "the branch listing is broken in this test".to_string(),
                 });
@@ -4764,10 +4857,11 @@ mod tests {
     struct BusyBranchGit;
 
     impl GitRunner for BusyBranchGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
             if args.len() >= 2 && args[0] == "branch" && args[1] == "-D" {
                 return Ok(GitOutput {
                     code: 1,
+                    stdout_bytes: Vec::new(),
                     stdout: String::new(),
                     stderr: "the branch is busy".to_string(),
                 });
@@ -4843,9 +4937,8 @@ mod tests {
         assert_eq!(data.waits[0].agent, "waiter");
         assert!(!stack.join("worktrees/holder").exists());
         assert!(!stack.join("worktrees/waiter").exists());
-        let listing = ProcessGit
-            .result(&stack.join(REPO_NAME), &["branch", "--list"])
-            .unwrap();
+        let listing =
+            git_result(&ProcessGit, &stack.join(REPO_NAME), &["branch", "--list"]).unwrap();
         assert!(
             !listing.stdout.contains("switchyard/holder"),
             "{}",
@@ -4931,8 +5024,10 @@ mod tests {
     }
 
     impl GitRunner for LockReplacingGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
-            if !self.fired.get() && args.first() == Some(&"worktree") && args.get(1) == Some(&"add")
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
+            if !self.fired.get()
+                && args.first() == Some(&OsStr::new("worktree"))
+                && args.get(1) == Some(&OsStr::new("add"))
             {
                 self.fired.set(true);
                 fs::remove_file(self.stack.join(LOCK_NAME)).unwrap();
@@ -4976,9 +5071,8 @@ mod tests {
         assert_eq!((beta.port_start, beta.port_end), (26000, 26004));
         assert!(stack.join("worktrees/beta").is_dir());
         assert!(!stack.join("worktrees/alpha").exists());
-        let listing = ProcessGit
-            .result(&stack.join(REPO_NAME), &["branch", "--list"])
-            .unwrap();
+        let listing =
+            git_result(&ProcessGit, &stack.join(REPO_NAME), &["branch", "--list"]).unwrap();
         assert!(
             listing.stdout.contains("switchyard/beta"),
             "{}",
@@ -5040,17 +5134,18 @@ mod tests {
     }
 
     impl GitRunner for RacingInitGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
-            if !self.fired.get() && args.first() == Some(&"init") {
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
+            if !self.fired.get() && args.first() == Some(&OsStr::new("init")) {
                 self.fired.set(true);
                 let nested = init_stack_with(&self.stack, 20000, 10, 16, &ProcessGit)
                     .map(|_| ())
                     .map_err(|error| error.message().to_string());
                 *self.nested.borrow_mut() = Some(nested);
             }
-            if args.first() == Some(&"commit") {
+            if args.first() == Some(&OsStr::new("commit")) {
                 return Ok(GitOutput {
                     code: 1,
+                    stdout_bytes: Vec::new(),
                     stdout: String::new(),
                     stderr: "the commit is staged to fail".to_string(),
                 });
@@ -5466,6 +5561,118 @@ mod tests {
         release(&stack, "holder-5").unwrap();
         let data = load_registry(&stack).unwrap();
         assert_eq!(free_run(&data, 8), Some((20000, 20079)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_registry_orders_sync_file_before_rename_and_sync_dir_and_preserves_plants() {
+        use std::cell::{Cell, RefCell};
+
+        struct RecordingOps {
+            events: RefCell<Vec<&'static str>>,
+            suffix_calls: Cell<usize>,
+            fail_sync_file: bool,
+            fail_sync_dir_check: PathBuf,
+            before_bytes: Vec<u8>,
+        }
+
+        impl PublishOps for RecordingOps {
+            fn draw_suffix(&self) -> String {
+                let call = self.suffix_calls.get();
+                self.suffix_calls.set(call + 1);
+                if call == 0 {
+                    "planted".to_string()
+                } else {
+                    format!("fresh-{call}")
+                }
+            }
+
+            fn sync_file(&self, file: &fs::File) -> io::Result<()> {
+                self.events.borrow_mut().push("sync_file");
+                assert_eq!(
+                    fs::read(self.fail_sync_dir_check.join(REGISTRY_NAME)).unwrap(),
+                    self.before_bytes,
+                    "sync_file must run before rename replaces the registry"
+                );
+                if self.fail_sync_file {
+                    return Err(io::Error::other("staged sync_file failure"));
+                }
+                file.sync_all()
+            }
+
+            fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+                self.events.borrow_mut().push("rename");
+                fs::rename(from, to)
+            }
+
+            fn sync_dir(&self, stack: &Path) {
+                self.events.borrow_mut().push("sync_dir");
+                assert_ne!(
+                    fs::read(stack.join(REGISTRY_NAME)).unwrap(),
+                    self.before_bytes,
+                    "sync_dir must run after rename has published the new registry"
+                );
+                if let Ok(dir) = fs::File::open(stack) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
+
+        let (dir, stack) = unit_stack("save-seam");
+        let planted = stack.join(format!("{REGISTRY_NAME}.tmp-planted"));
+        fs::write(&planted, b"planted sentinel\n").unwrap();
+        let before_bytes = fs::read(stack.join(REGISTRY_NAME)).unwrap();
+        let mut updated = load_registry(&stack).unwrap();
+        updated.port_pool.range_count = 4;
+
+        let failing_ops = RecordingOps {
+            events: RefCell::new(Vec::new()),
+            suffix_calls: Cell::new(0),
+            fail_sync_file: true,
+            fail_sync_dir_check: stack.clone(),
+            before_bytes: before_bytes.clone(),
+        };
+        let error = save_registry_with_ops(&stack, &updated, &failing_ops)
+            .expect_err("sync_file failure must abort publication");
+        assert!(
+            error.message().contains("staged sync_file failure"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(*failing_ops.events.borrow(), vec!["sync_file"]);
+        assert_eq!(fs::read(stack.join(REGISTRY_NAME)).unwrap(), before_bytes);
+        assert_eq!(
+            fs::read(&planted).unwrap(),
+            b"planted sentinel\n",
+            "AlreadyExists retry must never remove a file save_registry did not create"
+        );
+        for entry in fs::read_dir(&stack).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name != format!("{REGISTRY_NAME}.tmp-planted") {
+                assert!(!name.contains(".tmp-"), "leftover temp file: {name}");
+            }
+        }
+
+        let good_ops = RecordingOps {
+            events: RefCell::new(Vec::new()),
+            suffix_calls: Cell::new(0),
+            fail_sync_file: false,
+            fail_sync_dir_check: stack.clone(),
+            before_bytes,
+        };
+        save_registry_with_ops(&stack, &updated, &good_ops).unwrap();
+        assert_eq!(
+            *good_ops.events.borrow(),
+            vec!["sync_file", "rename", "sync_dir"]
+        );
+        assert_eq!(load_registry(&stack).unwrap().port_pool.range_count, 4);
+        assert_eq!(fs::read(&planted).unwrap(), b"planted sentinel\n");
+        for entry in fs::read_dir(&stack).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name != format!("{REGISTRY_NAME}.tmp-planted") {
+                assert!(!name.contains(".tmp-"), "leftover temp file: {name}");
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

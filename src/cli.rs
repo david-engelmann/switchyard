@@ -920,11 +920,15 @@ mod tests {
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
         let program = dir.join("judge.sh");
         std::fs::rename(&staged, &program).unwrap();
+        // Recorded correction under SY-26 for macOS gate parity:
+        // allow a three-second bound so macOS first-exec validation
+        // of a newly staged script under parallel cargo test never
+        // races the background loop writing its first tick.
         let result =
-            run_judge_command_within(&program.to_string_lossy(), "{}", Duration::from_secs(1));
+            run_judge_command_within(program.as_os_str(), &[], "{}", Duration::from_secs(3));
         let error = result.expect_err("the sleeping judge must pass its deadline");
         assert!(
-            error.contains("did not finish inside the deadline of 1 seconds"),
+            error.contains("did not finish inside the deadline of 3 seconds"),
             "{error}"
         );
         std::thread::sleep(Duration::from_millis(300));
@@ -1031,11 +1035,16 @@ mod tests {
         // return the write error and race the deadline outcome
         // this pin asserts. The script is staged and renamed
         // into place, as the test above stages its own.
+        // Recorded correction under SY-26 for macOS gate parity:
+        // wait until the background loop writes its first tick
+        // before the judge exits and allow a three-second bound so
+        // macOS first-exec validation of the newly staged script
+        // under parallel cargo test never races heartbeat creation.
         let staged = dir.join("judge.staged");
         std::fs::write(
             &staged,
             format!(
-                "#!/bin/sh\nwhile true; do echo tick >> {}; sleep 0.2; done &\ncat > /dev/null\nexit 0\n",
+                "#!/bin/sh\nwhile true; do echo tick >> {0}; sleep 0.2; done &\nwhile [ ! -s {0} ]; do sleep 0.02; done\ncat > /dev/null\nexit 0\n",
                 heartbeat.display()
             ),
         )
@@ -1044,10 +1053,10 @@ mod tests {
         let program = dir.join("judge.sh");
         std::fs::rename(&staged, &program).unwrap();
         let result =
-            run_judge_command_within(&program.to_string_lossy(), "{}", Duration::from_secs(1));
+            run_judge_command_within(program.as_os_str(), &[], "{}", Duration::from_secs(3));
         let error = result.expect_err("the held reply pipe must pass the collection deadline");
         assert!(
-            error.contains("did not finish inside the deadline of 1 seconds"),
+            error.contains("did not finish inside the deadline of 3 seconds"),
             "{error}"
         );
         std::thread::sleep(Duration::from_millis(300));
@@ -1092,7 +1101,14 @@ mod tests {
         let program = dir.join("child.sh");
         std::fs::rename(&staged, &program).unwrap();
         let mut child = Command::new(&program).process_group(0).spawn().unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+        // Recorded correction under SY-26 for macOS gate parity:
+        // wait until the background loop writes its first tick
+        // before signalling, rather than assuming 500ms covers
+        // macOS first-exec script validation under parallel load.
+        let start_deadline = Instant::now() + Duration::from_secs(5);
+        while !heartbeat.is_file() && Instant::now() < start_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         crate::note_child_spawned(child.id());
         forward_to_active_child(libc::SIGTERM);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1116,5 +1132,76 @@ mod tests {
             settled, later,
             "the descendant of the signalled child kept running"
         );
+    }
+
+    #[test]
+    fn parse_preserves_non_utf8_bytes_for_stack_and_judge_arguments() {
+        let raw_stack = OsString::from_vec(b"/tmp/stack-\xff".to_vec());
+        let raw_judge = OsString::from_vec(b"/tmp/judge-\xff".to_vec());
+        let raw_arg_one = OsString::from_vec(b"arg-one-\xff".to_vec());
+        let raw_arg_inline = OsString::from_vec(b"--judge-arg=arg-two-\xff".to_vec());
+        let args = vec![
+            OsString::from("claim"),
+            OsString::from("alpha"),
+            OsString::from("--stack"),
+            raw_stack.clone(),
+            OsString::from("--describe"),
+            OsString::from("Run the service"),
+            OsString::from("--default-profile"),
+            OsString::from("lean"),
+            OsString::from("--judge-command"),
+            raw_judge.clone(),
+            OsString::from("--judge-arg"),
+            raw_arg_one.clone(),
+            raw_arg_inline,
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let parsed = match parse(&args, &mut out, &mut err).unwrap() {
+            Parsed::Run(parsed) => parsed,
+            Parsed::Exit(code) => panic!("unexpected exit {code}"),
+        };
+        assert_eq!(parsed.stack.as_os_str(), raw_stack.as_os_str());
+        assert_eq!(parsed.judge_command.as_ref(), Some(&raw_judge));
+        assert_eq!(
+            parsed.judge_args,
+            vec![raw_arg_one, OsString::from_vec(b"arg-two-\xff".to_vec())]
+        );
+
+        let inline_args = vec![
+            OsString::from("claim"),
+            OsString::from("alpha"),
+            OsString::from_vec(b"--stack=/tmp/inline-stack-\xff".to_vec()),
+            OsString::from("--wait"),
+            OsString::from_vec(b"--judge-command=/tmp/inline-judge-\xff".to_vec()),
+        ];
+        let parsed_inline = match parse(&inline_args, &mut out, &mut err).unwrap() {
+            Parsed::Run(parsed) => parsed,
+            Parsed::Exit(code) => panic!("unexpected exit {code}"),
+        };
+        assert_eq!(
+            parsed_inline.stack.as_os_str().as_bytes(),
+            b"/tmp/inline-stack-\xff"
+        );
+        assert_eq!(
+            parsed_inline.judge_command.as_ref().unwrap().as_bytes(),
+            b"/tmp/inline-judge-\xff"
+        );
+
+        let bad_describe = vec![
+            OsString::from("claim"),
+            OsString::from("alpha"),
+            OsString::from("--stack"),
+            OsString::from("/tmp/stack"),
+            OsString::from("--describe"),
+            OsString::from_vec(b"bad-\xff-text".to_vec()),
+            OsString::from("--default-profile"),
+            OsString::from("lean"),
+        ];
+        let error = match parse(&bad_describe, &mut out, &mut err) {
+            Err(error) => error,
+            Ok(_) => panic!("non UTF-8 describe must refuse"),
+        };
+        assert!(error.contains("not valid UTF-8"), "{error}");
     }
 }
