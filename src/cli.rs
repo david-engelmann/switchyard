@@ -7,8 +7,9 @@
 //! claim may wait where its draw does not stand free. List may
 //! print the queue of standing waits instead of the claims.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -55,6 +56,8 @@ claim options:
   --judge-command PROGRAM  the one program a claim consults, named
                            beside --describe for the routing question
                            or beside --wait for the scoring question
+  --judge-arg VALUE        one argument passed to --judge-command,
+                           repeatable in order beside --judge-command
   --wait                   record a wait in the queue where the draw
                            does not stand free instead of refusing,
                            creating nothing and taking no port span
@@ -65,9 +68,10 @@ list options:
   --queue                  print the standing waits in offer order
                            instead of the claims table
 
-A judge command is spawned with no arguments. It receives the request
-document as one line on its standard input and answers with the reply
-document on its standard output, inside a deadline of 30 seconds. A
+A judge command is spawned with any --judge-arg arguments in the order
+they were given. It receives the request document as one line on its
+standard input and answers with the reply document on its standard
+output, inside a deadline of 30 seconds. A
 judge command that cannot be started, or whose request cannot be
 written, or that answers nothing usable, or that runs past the
 deadline leaves the claim on its declared default, and the routing
@@ -87,7 +91,8 @@ struct Args {
     describe: Option<String>,
     default_profile: Option<String>,
     profile: Option<String>,
-    judge_command: Option<String>,
+    judge_command: Option<OsString>,
+    judge_args: Vec<OsString>,
     wait: bool,
     wait_for: Option<i128>,
     queue: bool,
@@ -161,31 +166,54 @@ fn print_help(out: &mut dyn Write, err: &mut dyn Write) -> Parsed {
     }
 }
 
+fn is_switchyard_option(bytes: &[u8]) -> bool {
+    let head = match bytes.iter().position(|&b| b == b'=') {
+        Some(eq) if bytes.starts_with(b"--") => &bytes[..eq],
+        _ => bytes,
+    };
+    matches!(
+        head,
+        b"-h"
+            | b"--help"
+            | b"--stack"
+            | b"--port-start"
+            | b"--range-size"
+            | b"--range-count"
+            | b"--describe"
+            | b"--default-profile"
+            | b"--profile"
+            | b"--judge-command"
+            | b"--judge-arg"
+            | b"--wait"
+            | b"--wait-for"
+            | b"--queue"
+    )
+}
+
 fn parse(
     args: &[OsString],
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> std::result::Result<Parsed, String> {
-    let tokens: Vec<String> = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let first = match tokens.first() {
-        Some(token) => token.clone(),
+    let first = match args.first() {
+        Some(token) => token,
         None => return Err("the following arguments are required: command".to_string()),
     };
     if first == "-h" || first == "--help" {
         return Ok(print_help(out, err));
     }
-    if !COMMANDS.contains(&first.as_str()) {
-        if first.starts_with('-') {
-            return Err(format!("unrecognized arguments: {first}"));
+    let first_lossy = first.to_string_lossy();
+    let command = match first.to_str() {
+        Some(name) if COMMANDS.contains(&name) => name.to_string(),
+        _ => {
+            if first.as_os_str().as_bytes().starts_with(b"-") {
+                return Err(format!("unrecognized arguments: {first_lossy}"));
+            }
+            return Err(format!(
+                "invalid choice: '{first_lossy}' (choose from 'init', 'claim', 'list', 'release')"
+            ));
         }
-        return Err(format!(
-            "invalid choice: '{first}' (choose from 'init', 'claim', 'list', 'release')"
-        ));
-    }
-    let command = first;
+    };
     let mut agent: Option<String> = None;
     let mut stack: Option<PathBuf> = None;
     let mut port_start: i128 = DEFAULT_PORT_START as i128;
@@ -194,31 +222,42 @@ fn parse(
     let mut describe: Option<String> = None;
     let mut default_profile: Option<String> = None;
     let mut profile: Option<String> = None;
-    let mut judge_command: Option<String> = None;
+    let mut judge_command: Option<OsString> = None;
+    let mut judge_args: Vec<OsString> = Vec::new();
     let mut wait = false;
     let mut wait_for: Option<i128> = None;
     let mut queue = false;
     let mut index = 1;
-    while index < tokens.len() {
-        let token = &tokens[index];
-        if token == "-h" || token == "--help" {
+    while index < args.len() {
+        let raw = &args[index];
+        let raw_bytes = raw.as_os_str().as_bytes();
+        let token = raw.to_string_lossy();
+        if raw == "-h" || raw == "--help" {
             return Ok(print_help(out, err));
         }
-        if token == "--wait" && command == "claim" {
+        if raw == "--wait" && command == "claim" {
             wait = true;
             index += 1;
             continue;
         }
-        if token == "--queue" && command == "list" {
+        if raw == "--queue" && command == "list" {
             queue = true;
             index += 1;
             continue;
         }
-        let (option, inline_value) = match token.split_once('=') {
-            Some((name, value)) if name.starts_with("--") => {
-                (name.to_string(), Some(value.to_string()))
-            }
-            _ => (token.clone(), None),
+        let (option, inline_value) = match raw_bytes
+            .iter()
+            .position(|&b| b == b'=')
+            .filter(|_| raw_bytes.starts_with(b"--"))
+        {
+            Some(eq) => match std::str::from_utf8(&raw_bytes[..eq]) {
+                Ok(name) => (
+                    name.to_string(),
+                    Some(OsString::from_vec(raw_bytes[eq + 1..].to_vec())),
+                ),
+                Err(_) => (token.clone().into_owned(), None),
+            },
+            None => (token.clone().into_owned(), None),
         };
         let known_option = matches!(
             option.as_str(),
@@ -226,48 +265,71 @@ fn parse(
         ) && (option == "--stack" || command == "init")
             || matches!(
                 option.as_str(),
-                "--describe" | "--default-profile" | "--profile" | "--judge-command" | "--wait-for"
+                "--describe"
+                    | "--default-profile"
+                    | "--profile"
+                    | "--judge-command"
+                    | "--judge-arg"
+                    | "--wait-for"
             ) && command == "claim";
         if known_option {
             let value = match inline_value {
                 Some(value) => value,
                 None => {
-                    let next = tokens.get(index + 1);
-                    match next {
-                        Some(value) if !value.starts_with("--") => {
-                            index += 1;
-                            value.clone()
+                    let next = args.get(index + 1);
+                    let accepted = match next {
+                        Some(candidate) if option == "--judge-arg" => {
+                            !is_switchyard_option(candidate.as_os_str().as_bytes())
                         }
-                        _ => return Err(format!("argument {option}: expected one argument")),
+                        Some(candidate) => !candidate.as_os_str().as_bytes().starts_with(b"--"),
+                        None => false,
+                    };
+                    if accepted {
+                        index += 1;
+                        next.unwrap().clone()
+                    } else {
+                        return Err(format!("argument {option}: expected one argument"));
                     }
                 }
             };
             match option.as_str() {
                 "--stack" => stack = Some(PathBuf::from(value)),
-                "--port-start" => port_start = int_option(&option, &value)?,
-                "--range-size" => range_size = int_option(&option, &value)?,
-                "--range-count" => range_count = int_option(&option, &value)?,
-                "--describe" => describe = Some(value),
-                "--default-profile" => default_profile = Some(value),
-                "--profile" => profile = Some(value),
+                "--port-start" => port_start = int_option(&option, &value.to_string_lossy())?,
+                "--range-size" => range_size = int_option(&option, &value.to_string_lossy())?,
+                "--range-count" => range_count = int_option(&option, &value.to_string_lossy())?,
+                "--describe" => {
+                    describe = Some(match value.into_string() {
+                        Ok(text) => text,
+                        Err(_) => {
+                            return Err(
+                                "argument --describe: the job description is not valid UTF-8"
+                                    .to_string(),
+                            )
+                        }
+                    });
+                }
+                "--default-profile" => default_profile = Some(value.to_string_lossy().into_owned()),
+                "--profile" => profile = Some(value.to_string_lossy().into_owned()),
                 "--judge-command" => judge_command = Some(value),
+                "--judge-arg" => judge_args.push(value),
                 "--wait-for" => {
-                    wait_for = Some(match parse_int(&value) {
+                    let value_text = value.to_string_lossy();
+                    wait_for = Some(match parse_int(&value_text) {
                         Some(number) if number > 0 && i64::try_from(number).is_ok() => number,
                         Some(number) if number > 0 => {
                             return Err(format!(
-                                "argument --wait-for: a wait bound cannot stand past {} seconds, not '{value}'",
+                                "argument --wait-for: a wait bound cannot stand past {} seconds, not '{value_text}'",
                                 i64::MAX
                             ))
                         }
                         Some(_) => {
                             return Err(format!(
-                                "argument --wait-for: a wait bound is a positive number of seconds, not '{value}'"
+                                "argument --wait-for: a wait bound is a positive number of seconds, not '{value_text}'"
                             ))
                         }
                         None => {
                             return Err(format!(
-                                "argument --wait-for: invalid int value: '{value}'"
+                                "argument --wait-for: invalid int value: '{value_text}'"
                             ))
                         }
                     })
@@ -277,11 +339,11 @@ fn parse(
             index += 1;
             continue;
         }
-        if token.starts_with('-') && token.len() > 1 {
+        if raw_bytes.starts_with(b"-") && raw_bytes.len() > 1 {
             return Err(format!("unrecognized arguments: {token}"));
         }
         if (command == "claim" || command == "release") && agent.is_none() {
-            agent = Some(token.clone());
+            agent = Some(token.into_owned());
             index += 1;
             continue;
         }
@@ -304,6 +366,12 @@ fn parse(
         if describe.is_none() && default_profile.is_some() {
             return Err(
                 "argument --default-profile: a routed claim takes --describe beside it".to_string(),
+            );
+        }
+        if !judge_args.is_empty() && judge_command.is_none() {
+            return Err(
+                "argument --judge-arg: a judge argument takes --judge-command beside it"
+                    .to_string(),
             );
         }
         if describe.is_none() && !wait && judge_command.is_some() {
@@ -337,6 +405,7 @@ fn parse(
         default_profile,
         profile,
         judge_command,
+        judge_args,
         wait,
         wait_for,
         queue,
@@ -346,8 +415,9 @@ fn parse(
 /// The transport that consults a judge through one named program,
 /// the operator's side of the seam of obligation SY-16.
 ///
-/// The program is spawned with no arguments, receives the request
-/// document as one line on its standard input, and answers with
+/// The program is spawned with any --judge-arg arguments in order,
+/// receives the request document as one line on its standard input,
+/// and answers with
 /// the reply body on its standard output. A spawn failure, a failed
 /// request write, a nonzero exit, a run past the deadline, and a
 /// reply that is not text each surface as a transport failure of
@@ -359,34 +429,49 @@ fn parse(
 /// included, because a descendant of the judge holding the reply
 /// pipe open cannot stretch a read past it.
 struct SubprocessTransport {
-    program: String,
+    program: OsString,
+    args: Vec<OsString>,
 }
 
 impl JudgeTransport for SubprocessTransport {
     fn consult(&self, request: &str) -> std::result::Result<String, String> {
-        run_judge_command(&self.program, request)
+        run_judge_command(&self.program, &self.args, request)
     }
 }
 
-fn run_judge_command(program: &str, request: &str) -> std::result::Result<String, String> {
-    run_judge_command_within(program, request, Duration::from_secs(JUDGE_TIMEOUT_SECONDS))
+fn run_judge_command(
+    program: &OsStr,
+    args: &[OsString],
+    request: &str,
+) -> std::result::Result<String, String> {
+    run_judge_command_within(
+        program,
+        args,
+        request,
+        Duration::from_secs(JUDGE_TIMEOUT_SECONDS),
+    )
 }
 
 fn run_judge_command_within(
-    program: &str,
+    program: &OsStr,
+    args: &[OsString],
     request: &str,
     timeout: Duration,
 ) -> std::result::Result<String, String> {
-    let deadline = Instant::now() + timeout;
+    let display = Path::new(program).display();
     // The child leads a new process group, so the deadline below
     // can stop the whole group and not only the judge itself.
     let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .map_err(|exc| format!("the judge command {program} could not be started, {exc}"))?;
+        .map_err(|exc| format!("the judge command {display} could not be started, {exc}"))?;
+    let pid = child.id();
+    let group_guard = crate::ActiveChildGuard::new(pid);
+    let deadline = Instant::now() + timeout;
     let mut stdin = child.stdin.take().unwrap();
     let payload = request.as_bytes().to_vec();
     let (writer_out, writer_in) = std::sync::mpsc::channel();
@@ -404,23 +489,22 @@ fn run_judge_command_within(
         let read = stdout.read_to_end(&mut bytes);
         let _ = reader_out.send((read, bytes));
     });
-    let pid = child.id();
-    let status = match crate::await_child(child, timeout) {
+    let status = match crate::await_child(child, timeout, &group_guard) {
         crate::ChildWait::Exited(status) => status,
         crate::ChildWait::TimedOut => {
             return Err(format!(
-                "the judge command {program} did not finish inside the deadline of {} seconds",
+                "the judge command {display} did not finish inside the deadline of {} seconds",
                 timeout.as_secs()
             ));
         }
         crate::ChildWait::Failed(exc) => {
             return Err(format!(
-                "the judge command {program} could not be waited on, {exc}"
+                "the judge command {display} could not be waited on, {exc}"
             ));
         }
     };
     if !status.success() {
-        return Err(format!("the judge command {program} exited with {status}"));
+        return Err(format!("the judge command {display} exited with {status}"));
     }
     // The command answered, so the request write and the reply
     // read are collected over channels against the same deadline.
@@ -438,13 +522,13 @@ fn run_judge_command_within(
         Ok(Ok(())) => {}
         Ok(Err(_)) => {
             return Err(format!(
-                "the request could not be written to the judge command {program}"
+                "the request could not be written to the judge command {display}"
             ));
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             crate::kill_group(pid);
             return Err(format!(
-                "the judge command {program} did not finish inside the deadline of {} seconds",
+                "the judge command {display} did not finish inside the deadline of {} seconds",
                 timeout.as_secs()
             ));
         }
@@ -458,7 +542,7 @@ fn run_judge_command_within(
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             crate::kill_group(pid);
             return Err(format!(
-                "the judge command {program} did not finish inside the deadline of {} seconds",
+                "the judge command {display} did not finish inside the deadline of {} seconds",
                 timeout.as_secs()
             ));
         }
@@ -467,10 +551,10 @@ fn run_judge_command_within(
         }
     };
     read.map_err(|exc| {
-        format!("the reply of the judge command {program} could not be read, {exc}")
+        format!("the reply of the judge command {display} could not be read, {exc}")
     })?;
     String::from_utf8(bytes)
-        .map_err(|_| format!("the reply of the judge command {program} is not text"))
+        .map_err(|_| format!("the reply of the judge command {display} is not text"))
 }
 
 /// The wait bound a parsed claim carries, in the seconds the
@@ -497,6 +581,7 @@ fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<(
         .as_ref()
         .map(|program| SubprocessTransport {
             program: program.clone(),
+            args: parsed.judge_args.clone(),
         });
     let transport_ref = transport
         .as_ref()
@@ -769,8 +854,14 @@ extern "C" fn forward_signal(signal: i32) {
 /// operator or a supervisor ends a command with.
 fn install_signal_forwarding() {
     unsafe {
-        libc::signal(libc::SIGINT, forward_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, forward_signal as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            forward_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            forward_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
