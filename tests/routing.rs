@@ -1040,6 +1040,306 @@ fn a_routed_claim_through_a_judge_command_and_through_a_failing_one() {
 }
 
 #[test]
+fn a_judge_command_receives_repeatable_judge_args_in_order() {
+    let stack = cli_stack("cli-judge-args");
+    let stack_arg = stack.to_str().unwrap();
+    let verdict = verdict_body("roomy", probs("roomy", 0.9), 0.5);
+    let script = write_judge_script(
+        "cli-judge-multi-arg",
+        &format!(
+            "#!/bin/sh\n[ \"$#\" -eq 3 ] || exit 4\n[ \"$1\" = \"roomy\" ] || exit 5\n[ \"$2\" = \"-u\" ] || exit 6\n[ \"$3\" = \"--strict-mode\" ] || exit 7\nbody=$(cat)\ncase \"$body\" in\n  *'\"profile\"'*) printf '%s' '{verdict}' ;;\n  *) exit 8 ;;\nesac\n"
+        ),
+    );
+    let script_arg = script.to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "alpha",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        "/bin/sh",
+        "--judge-arg",
+        script_arg,
+        "--judge-arg",
+        "roomy",
+        "--judge-arg",
+        "-u",
+        "--judge-arg=--strict-mode",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20000-20039"), "{stdout}");
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "beta",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        "/bin/sh",
+        "--judge-arg",
+        script_arg,
+        "--judge-arg",
+        "roomy",
+        "--judge-arg",
+        "-u",
+        "--judge-arg",
+        "--strict-mode",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20040-20079"), "{stdout}");
+    let lines = read_log(&stack);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["verdict"], "roomy");
+    assert_eq!(lines[0]["fallback"], "none");
+    assert_eq!(lines[1]["verdict"], "roomy");
+    assert_eq!(lines[1]["fallback"], "none");
+
+    let (_, help_out, _) = run_cli(&["--help"]);
+    assert!(help_out.contains("--judge-arg"), "{help_out}");
+
+    // --judge-command alone still spawns with zero arguments ($# == 0).
+    let zero_arg_script = write_judge_script(
+        "cli-judge-zero-args",
+        &format!(
+            "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 9\ncat > /dev/null\nprintf '%s' '{verdict}'\n"
+        ),
+    );
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "gamma",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        zero_arg_script.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20080-20119"), "{stdout}");
+
+    // Shell metacharacters and spaces pass verbatim as one argument
+    // with zero shell interpolation.
+    let literal_dir = temp_dir("cli-judge-literal");
+    let captured_literal = literal_dir.join("literal.txt");
+    let literal_script = write_judge_script(
+        "cli-judge-literal-script",
+        &format!(
+            "#!/bin/sh\n[ \"$#\" -eq 1 ] || exit 10\nprintf '%s' \"$1\" > {}\ncat > /dev/null\nprintf '%s' '{verdict}'\n",
+            captured_literal.display()
+        ),
+    );
+    let metachar_arg = "two words; $UNSET_VAR * `false`";
+    let (code, stdout, stderr) = run_cli(&[
+        "claim",
+        "delta",
+        "--stack",
+        stack_arg,
+        "--describe",
+        DESCRIPTION,
+        "--default-profile",
+        "lean",
+        "--judge-command",
+        literal_script.to_str().unwrap(),
+        "--judge-arg",
+        metachar_arg,
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ports 20120-20159"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&captured_literal).unwrap(),
+        metachar_arg
+    );
+
+    // Raw 0xff byte in --judge-arg reaches child argv intact.
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let raw_stack = cli_stack("cli-judge-raw-arg");
+    let captured_raw = literal_dir.join("raw.bin");
+    let raw_script = write_judge_script(
+        "cli-judge-raw-script",
+        &format!(
+            "#!/bin/sh\n[ \"$#\" -eq 1 ] || exit 11\nprintf '%s' \"$1\" > {}\ncat > /dev/null\nprintf '%s' '{verdict}'\n",
+            captured_raw.display()
+        ),
+    );
+    let raw_out = std::process::Command::new(env!("CARGO_BIN_EXE_switchyard"))
+        .arg("claim")
+        .arg("epsilon")
+        .arg("--stack")
+        .arg(&raw_stack)
+        .arg("--describe")
+        .arg(DESCRIPTION)
+        .arg("--default-profile")
+        .arg("lean")
+        .arg("--judge-command")
+        .arg(&raw_script)
+        .arg("--judge-arg")
+        .arg(OsString::from_vec(b"arg-\xff-bytes".to_vec()))
+        .output()
+        .unwrap();
+    assert_eq!(
+        raw_out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&raw_out.stderr)
+    );
+    assert_eq!(std::fs::read(&captured_raw).unwrap(), b"arg-\xff-bytes");
+}
+
+#[test]
+fn sigterm_during_judge_pipe_drain_after_parent_exit_stops_the_grandchild() {
+    let stack = cli_stack("cli-judge-sigterm-drain");
+    let dir = temp_dir("cli-judge-sigterm-files");
+    let heartbeat = dir.join("heartbeat");
+    let parent_exited = dir.join("parent-exited");
+    let script = write_judge_script(
+        "cli-judge-sigterm-script",
+        &format!(
+            "#!/bin/sh\nwhile true; do echo tick >> {0}; sleep 0.2; done &\nwhile [ ! -s {0} ]; do sleep 0.02; done\ncat > /dev/null\necho exited > {1}\nexit 0\n",
+            heartbeat.display(),
+            parent_exited.display()
+        ),
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_switchyard"))
+        .arg("claim")
+        .arg("alpha")
+        .arg("--stack")
+        .arg(&stack)
+        .arg("--describe")
+        .arg(DESCRIPTION)
+        .arg("--default-profile")
+        .arg("lean")
+        .arg("--judge-command")
+        .arg(&script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !parent_exited.is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(parent_exited.is_file(), "the judge never reached exit 0");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let settled = std::fs::metadata(&heartbeat).unwrap().len();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let later = std::fs::metadata(&heartbeat).unwrap().len();
+    assert_eq!(
+        settled, later,
+        "the pipe holding grandchild survived SIGTERM during pipe drain"
+    );
+}
+
+#[test]
+fn judge_arg_option_shapes_refuse_at_the_parser() {
+    let stack = cli_stack("cli-judge-arg-shapes");
+    let stack_arg = stack.to_str().unwrap();
+    for args in [
+        vec![
+            "claim",
+            "alpha",
+            "--stack",
+            stack_arg,
+            "--describe",
+            "work",
+            "--default-profile",
+            "lean",
+            "--judge-arg",
+            "extra",
+        ],
+        vec![
+            "claim",
+            "alpha",
+            "--stack",
+            stack_arg,
+            "--wait",
+            "--judge-arg",
+            "extra",
+        ],
+        vec![
+            "claim",
+            "alpha",
+            "--stack",
+            stack_arg,
+            "--judge-arg",
+            "extra",
+        ],
+    ] {
+        let (code, _, stderr) = run_cli(&args);
+        assert_eq!(code, 2, "{args:?} gave {stderr}");
+        assert!(
+            stderr
+                .contains("argument --judge-arg: a judge argument takes --judge-command beside it"),
+            "{args:?} gave {stderr}"
+        );
+    }
+    let (code, _, stderr) = run_cli(&[
+        "claim",
+        "alpha",
+        "--stack",
+        stack_arg,
+        "--judge-command",
+        "/bin/true",
+        "--judge-arg",
+        "extra",
+    ]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains(
+            "argument --judge-command: a judge command takes --describe or --wait beside it"
+        ),
+        "{stderr}"
+    );
+    for args in [
+        vec![
+            "claim",
+            "alpha",
+            "--stack",
+            stack_arg,
+            "--wait",
+            "--judge-command",
+            "/bin/true",
+            "--judge-arg",
+        ],
+        vec![
+            "claim",
+            "alpha",
+            "--stack",
+            stack_arg,
+            "--judge-command",
+            "/bin/true",
+            "--judge-arg",
+            "--wait",
+        ],
+    ] {
+        let (code, _, stderr) = run_cli(&args);
+        assert_eq!(code, 2, "{args:?} gave {stderr}");
+        assert!(
+            stderr.contains("argument --judge-arg: expected one argument"),
+            "{args:?} gave {stderr}"
+        );
+    }
+    let (code, _, stderr) = run_cli(&["list", "--stack", stack_arg, "--judge-arg", "extra"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("unrecognized arguments"), "{stderr}");
+    assert!(switchyard::list_claims(&stack).unwrap().is_empty());
+}
+
+#[test]
 fn a_judge_that_answers_and_leaves_a_descendant_on_the_pipe_lands_on_the_default_at_the_deadline() {
     let stack = cli_stack("cli-judge-descendant");
     let stack_arg = stack.to_str().unwrap();

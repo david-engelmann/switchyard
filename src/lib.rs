@@ -15,16 +15,17 @@
 pub mod cli;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fs2::FileExt;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
@@ -706,6 +707,12 @@ fn validate_waits(
         JVal::Arr(entries) => entries,
         _ => return Err(corrupt(path, "the waits are not a list")),
     };
+    if entries.is_empty() {
+        return Err(corrupt(
+            path,
+            "the waits list is empty, and waits stands only where a wait stands",
+        ));
+    }
     if entries.len() > QUEUE_BOUND {
         return Err(corrupt(
             path,
@@ -964,49 +971,76 @@ fn random_suffix() -> String {
     }
 }
 
+/// Private seam for save_registry durability and ordering pins.
+trait PublishOps {
+    fn draw_suffix(&self) -> String {
+        random_suffix()
+    }
+    fn sync_file(&self, file: &fs::File) -> io::Result<()> {
+        file.sync_all()
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+    fn sync_dir(&self, stack: &Path) {
+        if let Ok(dir) = fs::File::open(stack) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+struct OsPublishOps;
+
+impl PublishOps for OsPublishOps {}
+
 /// Save the registry by rename from a sibling temporary file, so a
 /// reader never sees a half written registry.
 ///
 /// The temporary file carries a random suffix drawn for this save
-/// alone and is created with create_new, so the save never opens a
-/// name that already stands in the stack. A fixed temporary name
-/// would be a plant target, because a link left at that name would
-/// redirect the write through itself onto whatever it points at
-/// and the rename would then leave the registry path as that link.
-/// The save removes its own temporary file on every failure path.
+/// alone and is created with create_new, so the save never opens or
+/// removes a name that already stands in the stack. Only the
+/// temporary file this save created is removed when writing, syncing,
+/// or renaming fails, and directory sync runs best effort after the
+/// rename has already published the registry.
 pub fn save_registry(stack: &Path, data: &Registry) -> Result<()> {
+    save_registry_with_ops(stack, data, &OsPublishOps)
+}
+
+fn save_registry_with_ops(stack: &Path, data: &Registry, ops: &dyn PublishOps) -> Result<()> {
     let path = stack.join(REGISTRY_NAME);
     let text = serde_json::to_string_pretty(&registry_value(data)).unwrap() + "\n";
-    let mut attempt = 0;
-    let result = loop {
-        attempt += 1;
-        let tmp = stack.join(format!("{REGISTRY_NAME}.tmp-{}", random_suffix()));
-        let written = (|| -> io::Result<()> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(text.as_bytes())?;
-            drop(file);
-            fs::rename(&tmp, &path)
-        })();
-        match written {
-            Ok(()) => break Ok(()),
-            Err(exc) => {
-                let _ = fs::remove_file(&tmp);
-                if exc.kind() == io::ErrorKind::AlreadyExists && attempt < 8 {
-                    continue;
-                }
-                break Err(exc);
-            }
-        }
-    };
-    result.map_err(|exc| {
+    let fail = |exc: io::Error| {
         Error::plain(format!(
             "the registry at {} cannot be written, {exc}",
             path.display()
         ))
-    })
+    };
+    let mut attempt = 0;
+    let (tmp, mut file) = loop {
+        attempt += 1;
+        let candidate = stack.join(format!("{REGISTRY_NAME}.tmp-{}", ops.draw_suffix()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(exc) if exc.kind() == io::ErrorKind::AlreadyExists && attempt < 8 => continue,
+            Err(exc) => return Err(fail(exc)),
+        }
+    };
+    let staged = (|| -> io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        ops.sync_file(&file)?;
+        drop(file);
+        ops.rename(&tmp, &path)
+    })();
+    if let Err(exc) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(fail(exc));
+    }
+    ops.sync_dir(stack);
+    Ok(())
 }
 
 /// The stack lock, held across the whole read and check and modify
@@ -1081,7 +1115,7 @@ fn locked(stack: &Path) -> Result<Locked> {
                 )));
             }
         };
-        file.lock_exclusive().map_err(|exc| {
+        file.lock().map_err(|exc| {
             Error::plain(format!(
                 "the lock file at {} cannot be locked, {exc}",
                 lock_path.display()
@@ -1556,6 +1590,7 @@ pub fn git_env() -> Vec<(String, String)> {
 #[derive(Debug)]
 pub struct GitOutput {
     pub code: i32,
+    pub stdout_bytes: Vec<u8>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -1563,14 +1598,14 @@ pub struct GitOutput {
 /// The seam the git calls run through, so the crate's own tests can
 /// stage a git failure no real repository offers.
 pub trait GitRunner {
-    fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput>;
+    fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput>;
 }
 
 /// The real git runner, a subprocess under a timeout.
 pub struct ProcessGit;
 
 impl GitRunner for ProcessGit {
-    fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+    fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
         run_git(
             repo,
             args,
@@ -1578,6 +1613,11 @@ impl GitRunner for ProcessGit {
             Duration::from_secs(GIT_TIMEOUT_SECONDS),
         )
     }
+}
+
+fn git_result<A: AsRef<OsStr>>(git: &dyn GitRunner, repo: &Path, args: &[A]) -> Result<GitOutput> {
+    let os_args: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
+    git.result(repo, &os_args)
 }
 
 /// Stop a spawned child and every process in its group.
@@ -1645,6 +1685,26 @@ pub(crate) fn active_child_group() -> i32 {
     ACTIVE_CHILD_GROUP.load(Ordering::SeqCst)
 }
 
+/// RAII registration of a spawned child's process group across both
+/// its wait and its pipe drains, so a signal arriving while a
+/// descendant holds stdout or stderr open still reaches the group.
+pub(crate) struct ActiveChildGuard {
+    pid: u32,
+}
+
+impl ActiveChildGuard {
+    pub(crate) fn new(pid: u32) -> Self {
+        note_child_spawned(pid);
+        Self { pid }
+    }
+}
+
+impl Drop for ActiveChildGuard {
+    fn drop(&mut self) {
+        note_child_finished(self.pid);
+    }
+}
+
 /// How a wait on a spawned child ended, as the waiter thread
 /// that owns the child reports it.
 pub(crate) enum ChildWait {
@@ -1667,12 +1727,16 @@ pub(crate) enum ChildWait {
 /// reported as it finishes rather than at the next poll. On a
 /// timeout the caller stops the group and then collects the
 /// waiter, whose own wait returns once the group stops, so the
-/// child stands reaped on every path. The child stands recorded
-/// in the forwarding registry from the start of the wait until
-/// the wait completes.
-pub(crate) fn await_child(child: std::process::Child, timeout: Duration) -> ChildWait {
+/// child stands reaped on every path. The caller holds an
+/// ActiveChildGuard across both this wait and any subsequent pipe
+/// collection so signal forwarding covers the whole child group
+/// lifetime.
+pub(crate) fn await_child(
+    child: std::process::Child,
+    timeout: Duration,
+    _guard: &ActiveChildGuard,
+) -> ChildWait {
     let pid = child.id();
-    note_child_spawned(pid);
     let (out, inside) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
         let mut child = child;
@@ -1697,17 +1761,23 @@ pub(crate) fn await_child(child: std::process::Child, timeout: Duration) -> Chil
         ),
     };
     let _ = waiter.join();
-    note_child_finished(pid);
     report
+}
+
+fn format_git_args(args: &[&OsStr]) -> String {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn run_git(
     repo: &Path,
-    args: &[&str],
+    args: &[&OsStr],
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<GitOutput> {
-    let joined = args.join(" ");
+    let joined = format_git_args(args);
     let mut command = Command::new("git");
     // The child leads a new process group, so the timeout below
     // can stop the whole group and not only git itself.
@@ -1723,27 +1793,26 @@ fn run_git(
     let mut child = command
         .spawn()
         .map_err(|exc| Error::plain(format!("git {joined} could not be started, {exc}")))?;
+    let pid = child.id();
+    let group_guard = ActiveChildGuard::new(pid);
+    let deadline = Instant::now() + timeout;
     let mut out_pipe = child.stdout.take().unwrap();
-    let out_thread = std::thread::spawn(move || {
+    let (out_send, out_recv) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = out_pipe.read_to_end(&mut buf);
-        buf
+        let _ = out_send.send(buf);
     });
     let mut err_pipe = child.stderr.take().unwrap();
-    let err_thread = std::thread::spawn(move || {
+    let (err_send, err_recv) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = err_pipe.read_to_end(&mut buf);
-        buf
+        let _ = err_send.send(buf);
     });
-    let status = match await_child(child, timeout) {
+    let status = match await_child(child, timeout, &group_guard) {
         ChildWait::Exited(status) => status,
         ChildWait::TimedOut => {
-            // The reader threads end detached on this path. A
-            // grandchild of git can hold the pipes open after git
-            // itself is dead, and joining here would block past
-            // the timeout this call was promised to keep.
-            drop(out_thread);
-            drop(err_thread);
             return Err(Error::plain(format!(
                 "git {joined} did not finish within {} seconds and was stopped",
                 timeout.as_secs()
@@ -1755,11 +1824,30 @@ fn run_git(
             )));
         }
     };
-    let stdout = out_thread.join().unwrap_or_default();
-    let stderr = err_thread.join().unwrap_or_default();
+    // Bound pipe reader collection against the remaining deadline,
+    // killing the whole process group if a background descendant of
+    // git keeps stdout or stderr open after git itself exited.
+    let collect_pipe = |rx: std::sync::mpsc::Receiver<Vec<u8>>| -> Result<Vec<u8>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(bytes) => Ok(bytes),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                kill_group(pid);
+                Err(Error::plain(format!(
+                    "git {joined} did not finish within {} seconds and was stopped",
+                    timeout.as_secs()
+                )))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(Vec::new()),
+        }
+    };
+    let stdout = collect_pipe(out_recv)?;
+    let stderr = collect_pipe(err_recv)?;
+    let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
     Ok(GitOutput {
         code: status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stdout_bytes: stdout,
+        stdout: stdout_text,
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
 }
@@ -1773,17 +1861,29 @@ fn git_detail(result: &GitOutput) -> String {
     }
 }
 
-fn git_checked(git: &dyn GitRunner, repo: &Path, args: &[&str]) -> Result<String> {
-    let result = git.result(repo, args)?;
+fn git_checked<A: AsRef<OsStr>>(git: &dyn GitRunner, repo: &Path, args: &[A]) -> Result<String> {
+    let os_args: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
+    let result = git.result(repo, &os_args)?;
     if result.code != 0 {
         return Err(Error::plain(format!(
             "git {} failed with exit {}, {}",
-            args.join(" "),
+            format_git_args(&os_args),
             result.code,
             git_detail(&result)
         )));
     }
     Ok(result.stdout)
+}
+
+fn trim_line_endings(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&last, rest)) = bytes.split_last() {
+        if last == b'\n' || last == b'\r' {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
 }
 
 /// Refuse to run git unless the stack repo is its own repository.
@@ -1806,7 +1906,11 @@ fn verify_own_repo(git: &dyn GitRunner, stack: &Path) -> Result<()> {
             repo.display()
         )));
     }
-    let result = git.result(&repo, &["rev-parse", "--show-toplevel"])?;
+    let result = git_result(
+        git,
+        &repo,
+        &["-c", "core.quotePath=false", "rev-parse", "--show-toplevel"],
+    )?;
     if result.code != 0 {
         return Err(Error::plain(format!(
             "the stack repository at {} cannot be read by git, {}",
@@ -1814,16 +1918,26 @@ fn verify_own_repo(git: &dyn GitRunner, stack: &Path) -> Result<()> {
             git_detail(&result)
         )));
     }
-    let top = result.stdout.trim();
-    if resolve_path(Path::new(top)) != resolve_path(&repo) {
+    let top_path = Path::new(OsStr::from_bytes(trim_line_endings(&result.stdout_bytes)));
+    if resolve_path(top_path) != resolve_path(&repo) {
         return Err(Error::plain(format!(
-            "the stack repository at {} resolves to the repository at {top}, \
+            "the stack repository at {} resolves to the repository at {}, \
              which is not the stack repository, \
              so switchyard will not run git against it",
-            repo.display()
+            repo.display(),
+            top_path.display()
         )));
     }
-    let common = git.result(&repo, &["rev-parse", "--git-common-dir"])?;
+    let common = git_result(
+        git,
+        &repo,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "rev-parse",
+            "--git-common-dir",
+        ],
+    )?;
     if common.code != 0 {
         return Err(Error::plain(format!(
             "the stack repository at {} cannot be read by git, {}",
@@ -1831,7 +1945,7 @@ fn verify_own_repo(git: &dyn GitRunner, stack: &Path) -> Result<()> {
             git_detail(&common)
         )));
     }
-    let printed = PathBuf::from(common.stdout.trim());
+    let printed = PathBuf::from(OsStr::from_bytes(trim_line_endings(&common.stdout_bytes)));
     let common_dir = if printed.is_absolute() {
         printed
     } else {
@@ -2014,7 +2128,13 @@ fn init_stack_with(
         git_checked(
             git,
             &stack,
-            &["init", "-q", "-b", "main", &repo.to_string_lossy()],
+            &[
+                OsStr::new("init"),
+                OsStr::new("-q"),
+                OsStr::new("-b"),
+                OsStr::new("main"),
+                repo.as_os_str(),
+            ],
         )?;
         git_checked(
             git,
@@ -2172,7 +2292,7 @@ fn write_env_file(stack: &Path, env_rel: &str, record: &Record) -> Result<()> {
 }
 
 fn require_committed_head(git: &dyn GitRunner, repo: &Path) -> Result<()> {
-    let result = git.result(repo, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    let result = git_result(git, repo, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
     if result.code != 0 {
         return Err(Error::plain(format!(
             "the stack repository at {} has no commits yet, \
@@ -2205,9 +2325,15 @@ pub fn rollback_claim(
 ) -> Vec<String> {
     let mut problems = Vec::new();
     if worktree.join(".git").exists() {
-        match git.result(
+        match git_result(
+            git,
             repo,
-            &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                OsStr::new("--force"),
+                worktree.as_os_str(),
+            ],
         ) {
             Ok(result) if result.code == 0 => {}
             Ok(result) => problems.push(format!(
@@ -2223,9 +2349,9 @@ pub fn rollback_claim(
         }
     }
     if !branch_preexisted {
-        match git.result(repo, &["branch", "--list", branch]) {
+        match git_result(git, repo, &["branch", "--list", branch]) {
             Ok(listed) if listed.code == 0 && !listed.stdout.trim().is_empty() => {
-                match git.result(repo, &["branch", "-D", branch]) {
+                match git_result(git, repo, &["branch", "-D", branch]) {
                     Ok(result) if result.code == 0 => {}
                     Ok(result) => problems.push(format!(
                         "the branch {branch} could not be deleted, {}",
@@ -2451,7 +2577,7 @@ fn furnish_claim(
         env_file: env_rel.clone(),
         claimed_at: claimed_at.to_string(),
     };
-    let listed = git.result(&repo, &["branch", "--list", &branch])?;
+    let listed = git_result(git, &repo, &["branch", "--list", &branch])?;
     let branch_preexisted = listed.code == 0 && !listed.stdout.trim().is_empty();
     let attempt = (|| -> Result<()> {
         require_committed_head(git, &repo)?;
@@ -2459,11 +2585,11 @@ fn furnish_claim(
             git,
             &repo,
             &[
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                &worktree.to_string_lossy(),
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new(&branch),
+                worktree.as_os_str(),
             ],
         )?;
         git_checked(
@@ -2719,7 +2845,12 @@ fn release_report_with(
             git_checked(
                 git,
                 &repo,
-                &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("remove"),
+                    OsStr::new("--force"),
+                    worktree.as_os_str(),
+                ],
             )?;
         } else {
             git_checked(git, &repo, &["worktree", "prune"])?;
@@ -2787,7 +2918,7 @@ pub fn offer_order(waits: &[Wait]) -> Vec<Wait> {
         .filter(|wait| wait.score.is_some())
         .cloned()
         .collect();
-    scored.sort_by(|left, right| right.score.cmp(&left.score));
+    scored.sort_by_key(|wait| std::cmp::Reverse(wait.score));
     let scoreless: Vec<Wait> = waits
         .iter()
         .filter(|wait| wait.score.is_none())
@@ -4495,7 +4626,12 @@ mod tests {
             "PATH".to_string(),
             format!("{}:/usr/bin:/bin", fake_bin.display()),
         )];
-        let result = run_git(&real_git, &["status"], &env, Duration::from_secs(1));
+        let result = run_git(
+            &real_git,
+            &[OsStr::new("status")],
+            &env,
+            Duration::from_secs(1),
+        );
         let _ = fs::remove_dir_all(&dir);
         let error = result.expect_err("the sleeping git must time out");
         assert_eq!(error.exit_code(), 1);
@@ -4542,10 +4678,21 @@ mod tests {
             "PATH".to_string(),
             format!("{}:/usr/bin:/bin", fake_bin.display()),
         )];
-        let result = run_git(&real_git, &["status"], &env, Duration::from_secs(1));
+        // Recorded correction under SY-26 for macOS gate parity: on
+        // macOS under parallel test load, kernel validation of a
+        // freshly written script in temp_dir on first execve can
+        // take slightly over one second after posix_spawn returns,
+        // so a three-second bound gives the background loop time to
+        // start ticking before the timeout stops the process group.
+        let result = run_git(
+            &real_git,
+            &[OsStr::new("status")],
+            &env,
+            Duration::from_secs(3),
+        );
         let error = result.expect_err("the sleeping git must time out");
         assert!(
-            error.message().contains("did not finish within 1 seconds"),
+            error.message().contains("did not finish within 3 seconds"),
             "{}",
             error.message()
         );
@@ -4560,10 +4707,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_git_call_whose_descendant_holds_a_pipe_open_times_out_and_stops_the_group() {
+        use std::os::unix::fs::PermissionsExt;
+        for (tag, body_fn) in [
+            (
+                "stdout-held",
+                (|hb: &Path| {
+                    format!(
+                        "#!/bin/sh\nwhile true; do echo tick >> {0}; sleep 0.2; done &\nwhile [ ! -s {0} ]; do sleep 0.02; done\nexit 0\n",
+                        hb.display()
+                    )
+                }) as fn(&Path) -> String,
+            ),
+            (
+                "stderr-held",
+                (|hb: &Path| {
+                    format!(
+                        "#!/bin/sh\n(exec >/dev/null; while true; do echo tick >> {0}; sleep 0.2; done) &\nwhile [ ! -s {0} ]; do sleep 0.02; done\nexit 0\n",
+                        hb.display()
+                    )
+                }) as fn(&Path) -> String,
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "switchyard-unit-test-{}-git-pipe-{tag}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let fake_bin = dir.join("bin");
+            fs::create_dir_all(&fake_bin).unwrap();
+            let heartbeat = dir.join("heartbeat");
+            let staged_git = fake_bin.join("git.staged");
+            fs::write(&staged_git, body_fn(&heartbeat)).unwrap();
+            fs::set_permissions(&staged_git, fs::Permissions::from_mode(0o755)).unwrap();
+            let fake_git = fake_bin.join("git");
+            fs::rename(&staged_git, &fake_git).unwrap();
+            let real_git = dir.join("repo");
+            fs::create_dir_all(&real_git).unwrap();
+            let env = vec![(
+                "PATH".to_string(),
+                format!("{}:/usr/bin:/bin", fake_bin.display()),
+            )];
+            let started = Instant::now();
+            let result = run_git(
+                &real_git,
+                &[OsStr::new("status")],
+                &env,
+                Duration::from_secs(3),
+            );
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(8),
+                "{tag} ran {elapsed:?} past its bound"
+            );
+            let error = result.expect_err("the held git pipe must time out");
+            assert_eq!(error.exit_code(), 1, "{tag}");
+            assert!(
+                error
+                    .message()
+                    .contains("did not finish within 3 seconds and was stopped"),
+                "{tag}: {}",
+                error.message()
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let settled = fs::metadata(&heartbeat).unwrap().len();
+            std::thread::sleep(Duration::from_millis(1500));
+            let later = fs::metadata(&heartbeat).unwrap().len();
+            let _ = fs::remove_dir_all(&dir);
+            assert_eq!(
+                settled, later,
+                "{tag}: the pipe holding descendant kept running"
+            );
+        }
+    }
+
     struct ErroringListGit;
 
     impl GitRunner for ErroringListGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
             if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
                 return Err(Error::plain("the branch listing is broken in this test"));
             }
@@ -4574,10 +4797,11 @@ mod tests {
     struct FailingListGit;
 
     impl GitRunner for FailingListGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
             if args.len() >= 2 && args[0] == "branch" && args[1] == "--list" {
                 return Ok(GitOutput {
                     code: 128,
+                    stdout_bytes: Vec::new(),
                     stdout: String::new(),
                     stderr: "the branch listing is broken in this test".to_string(),
                 });
@@ -4633,10 +4857,11 @@ mod tests {
     struct BusyBranchGit;
 
     impl GitRunner for BusyBranchGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
             if args.len() >= 2 && args[0] == "branch" && args[1] == "-D" {
                 return Ok(GitOutput {
                     code: 1,
+                    stdout_bytes: Vec::new(),
                     stdout: String::new(),
                     stderr: "the branch is busy".to_string(),
                 });
@@ -4712,9 +4937,8 @@ mod tests {
         assert_eq!(data.waits[0].agent, "waiter");
         assert!(!stack.join("worktrees/holder").exists());
         assert!(!stack.join("worktrees/waiter").exists());
-        let listing = ProcessGit
-            .result(&stack.join(REPO_NAME), &["branch", "--list"])
-            .unwrap();
+        let listing =
+            git_result(&ProcessGit, &stack.join(REPO_NAME), &["branch", "--list"]).unwrap();
         assert!(
             !listing.stdout.contains("switchyard/holder"),
             "{}",
@@ -4800,8 +5024,10 @@ mod tests {
     }
 
     impl GitRunner for LockReplacingGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
-            if !self.fired.get() && args.first() == Some(&"worktree") && args.get(1) == Some(&"add")
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
+            if !self.fired.get()
+                && args.first() == Some(&OsStr::new("worktree"))
+                && args.get(1) == Some(&OsStr::new("add"))
             {
                 self.fired.set(true);
                 fs::remove_file(self.stack.join(LOCK_NAME)).unwrap();
@@ -4845,9 +5071,8 @@ mod tests {
         assert_eq!((beta.port_start, beta.port_end), (26000, 26004));
         assert!(stack.join("worktrees/beta").is_dir());
         assert!(!stack.join("worktrees/alpha").exists());
-        let listing = ProcessGit
-            .result(&stack.join(REPO_NAME), &["branch", "--list"])
-            .unwrap();
+        let listing =
+            git_result(&ProcessGit, &stack.join(REPO_NAME), &["branch", "--list"]).unwrap();
         assert!(
             listing.stdout.contains("switchyard/beta"),
             "{}",
@@ -4909,17 +5134,18 @@ mod tests {
     }
 
     impl GitRunner for RacingInitGit {
-        fn result(&self, repo: &Path, args: &[&str]) -> Result<GitOutput> {
-            if !self.fired.get() && args.first() == Some(&"init") {
+        fn result(&self, repo: &Path, args: &[&OsStr]) -> Result<GitOutput> {
+            if !self.fired.get() && args.first() == Some(&OsStr::new("init")) {
                 self.fired.set(true);
                 let nested = init_stack_with(&self.stack, 20000, 10, 16, &ProcessGit)
                     .map(|_| ())
                     .map_err(|error| error.message().to_string());
                 *self.nested.borrow_mut() = Some(nested);
             }
-            if args.first() == Some(&"commit") {
+            if args.first() == Some(&OsStr::new("commit")) {
                 return Ok(GitOutput {
                     code: 1,
+                    stdout_bytes: Vec::new(),
                     stdout: String::new(),
                     stderr: "the commit is staged to fail".to_string(),
                 });
@@ -5335,6 +5561,118 @@ mod tests {
         release(&stack, "holder-5").unwrap();
         let data = load_registry(&stack).unwrap();
         assert_eq!(free_run(&data, 8), Some((20000, 20079)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_registry_orders_sync_file_before_rename_and_sync_dir_and_preserves_plants() {
+        use std::cell::{Cell, RefCell};
+
+        struct RecordingOps {
+            events: RefCell<Vec<&'static str>>,
+            suffix_calls: Cell<usize>,
+            fail_sync_file: bool,
+            fail_sync_dir_check: PathBuf,
+            before_bytes: Vec<u8>,
+        }
+
+        impl PublishOps for RecordingOps {
+            fn draw_suffix(&self) -> String {
+                let call = self.suffix_calls.get();
+                self.suffix_calls.set(call + 1);
+                if call == 0 {
+                    "planted".to_string()
+                } else {
+                    format!("fresh-{call}")
+                }
+            }
+
+            fn sync_file(&self, file: &fs::File) -> io::Result<()> {
+                self.events.borrow_mut().push("sync_file");
+                assert_eq!(
+                    fs::read(self.fail_sync_dir_check.join(REGISTRY_NAME)).unwrap(),
+                    self.before_bytes,
+                    "sync_file must run before rename replaces the registry"
+                );
+                if self.fail_sync_file {
+                    return Err(io::Error::other("staged sync_file failure"));
+                }
+                file.sync_all()
+            }
+
+            fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+                self.events.borrow_mut().push("rename");
+                fs::rename(from, to)
+            }
+
+            fn sync_dir(&self, stack: &Path) {
+                self.events.borrow_mut().push("sync_dir");
+                assert_ne!(
+                    fs::read(stack.join(REGISTRY_NAME)).unwrap(),
+                    self.before_bytes,
+                    "sync_dir must run after rename has published the new registry"
+                );
+                if let Ok(dir) = fs::File::open(stack) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
+
+        let (dir, stack) = unit_stack("save-seam");
+        let planted = stack.join(format!("{REGISTRY_NAME}.tmp-planted"));
+        fs::write(&planted, b"planted sentinel\n").unwrap();
+        let before_bytes = fs::read(stack.join(REGISTRY_NAME)).unwrap();
+        let mut updated = load_registry(&stack).unwrap();
+        updated.port_pool.range_count = 4;
+
+        let failing_ops = RecordingOps {
+            events: RefCell::new(Vec::new()),
+            suffix_calls: Cell::new(0),
+            fail_sync_file: true,
+            fail_sync_dir_check: stack.clone(),
+            before_bytes: before_bytes.clone(),
+        };
+        let error = save_registry_with_ops(&stack, &updated, &failing_ops)
+            .expect_err("sync_file failure must abort publication");
+        assert!(
+            error.message().contains("staged sync_file failure"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(*failing_ops.events.borrow(), vec!["sync_file"]);
+        assert_eq!(fs::read(stack.join(REGISTRY_NAME)).unwrap(), before_bytes);
+        assert_eq!(
+            fs::read(&planted).unwrap(),
+            b"planted sentinel\n",
+            "AlreadyExists retry must never remove a file save_registry did not create"
+        );
+        for entry in fs::read_dir(&stack).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name != format!("{REGISTRY_NAME}.tmp-planted") {
+                assert!(!name.contains(".tmp-"), "leftover temp file: {name}");
+            }
+        }
+
+        let good_ops = RecordingOps {
+            events: RefCell::new(Vec::new()),
+            suffix_calls: Cell::new(0),
+            fail_sync_file: false,
+            fail_sync_dir_check: stack.clone(),
+            before_bytes,
+        };
+        save_registry_with_ops(&stack, &updated, &good_ops).unwrap();
+        assert_eq!(
+            *good_ops.events.borrow(),
+            vec!["sync_file", "rename", "sync_dir"]
+        );
+        assert_eq!(load_registry(&stack).unwrap().port_pool.range_count, 4);
+        assert_eq!(fs::read(&planted).unwrap(), b"planted sentinel\n");
+        for entry in fs::read_dir(&stack).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name != format!("{REGISTRY_NAME}.tmp-planted") {
+                assert!(!name.contains(".tmp-"), "leftover temp file: {name}");
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

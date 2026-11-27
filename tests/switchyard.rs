@@ -154,23 +154,53 @@ fn init_records_the_pool_and_creates_the_repository() {
     assert_eq!(head.trim(), "main");
 }
 
-/// The checked prints of SY-A33 against a real full device.
-/// A list printed where every write fails with ENOSPC exits 1
-/// and reports the output refusal on its error stream, where
-/// the discarded writes exited 0 over the truncated table.
+/// The checked prints of SY-A33 against a real full device on
+/// Linux, with a closed pipe fallback under SY-26 where the
+/// operating system carries no /dev/full device (macOS ENOENT
+/// or seatbelt EPERM), keeping the root test count and the
+/// output failure pin identical on Linux and macOS.
 #[test]
 fn a_list_printed_to_a_full_device_fails_loudly() {
     let stack = stack_fixture();
     let stack_arg = stack.to_string_lossy().into_owned();
     let (code, _, err) = run_cli(&["claim", "alpha", "--stack", &stack_arg]);
     assert_eq!(code, 0, "{err}");
-    let full = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .unwrap();
+    let broken_stdout = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(full) => Stdio::from(full),
+        Err(exc)
+            if exc.kind() == std::io::ErrorKind::NotFound
+                || exc.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            Stdio::from(writer)
+        }
+        Err(exc) => panic!("unexpected /dev/full open failure: {exc}"),
+    };
     let output = Command::new(env!("CARGO_BIN_EXE_switchyard"))
         .args(["list", "--stack", &stack_arg])
-        .stdout(Stdio::from(full))
+        .stdout(broken_stdout)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("the command's output could not be written"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_list_printed_to_a_closed_pipe_fails_loudly() {
+    let stack = stack_fixture();
+    let stack_arg = stack.to_string_lossy().into_owned();
+    let (code, _, err) = run_cli(&["claim", "alpha", "--stack", &stack_arg]);
+    assert_eq!(code, 0, "{err}");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+        .args(["list", "--stack", &stack_arg])
+        .stdout(Stdio::from(writer))
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -891,6 +921,13 @@ fn a_failed_registry_save_leaves_no_temporary_file() {
         error.message()
     );
     assert!(!stack.join(format!("{REGISTRY_NAME}.tmp")).exists());
+    // Tightened under SY-26 to inspect the stack directory for
+    // random-suffixed .tmp-* residue in addition to the retired
+    // fixed .tmp name.
+    for entry in std::fs::read_dir(&stack).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!name.contains(".tmp-"), "leftover temp file: {name}");
+    }
     assert!(registry.is_dir());
 }
 
@@ -1609,4 +1646,132 @@ fn a_registry_save_never_writes_through_a_link_at_the_retired_tmp_name() {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
         assert!(!name.contains(".tmp-"), "{name}");
     }
+}
+
+#[test]
+fn non_utf8_stack_lifecycle_and_raw_judge_arg_bytes_preserve_os_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = temp_dir("non-utf8-e2e");
+    let probe = base.join(OsString::from_vec(b"probe-\xff".to_vec()));
+    let raw_stack = base.join(OsString::from_vec(b"stack-\xff".to_vec()));
+    match std::fs::create_dir_all(&probe) {
+        Ok(()) => {
+            let init_out = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+                .arg("init")
+                .arg("--stack")
+                .arg(&raw_stack)
+                .output()
+                .unwrap();
+            assert_eq!(
+                init_out.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&init_out.stderr)
+            );
+            assert!(raw_stack.join(REGISTRY_NAME).is_file());
+            let claim_out = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+                .arg("claim")
+                .arg("alpha")
+                .arg("--stack")
+                .arg(&raw_stack)
+                .output()
+                .unwrap();
+            assert_eq!(
+                claim_out.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&claim_out.stderr)
+            );
+            assert!(raw_stack
+                .join(WORKTREES_NAME)
+                .join("alpha")
+                .join(ENV_NAME)
+                .is_file());
+            let list_out = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+                .arg("list")
+                .arg("--stack")
+                .arg(&raw_stack)
+                .output()
+                .unwrap();
+            assert_eq!(list_out.status.code(), Some(0));
+            assert!(String::from_utf8_lossy(&list_out.stdout).contains("alpha"));
+            let release_out = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+                .arg("release")
+                .arg("alpha")
+                .arg("--stack")
+                .arg(&raw_stack)
+                .output()
+                .unwrap();
+            assert_eq!(
+                release_out.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&release_out.stderr)
+            );
+            assert!(!raw_stack.join(WORKTREES_NAME).join("alpha").exists());
+        }
+        Err(err)
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                || err.raw_os_error() == Some(libc::EILSEQ) =>
+        {
+            // APFS rejects creating directories with raw 0xff bytes;
+            // passing the uncreated OsString path still refuses cleanly
+            // at exit 2 as uninitialised rather than panicking.
+            let claim_out = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+                .arg("claim")
+                .arg("alpha")
+                .arg("--stack")
+                .arg(&raw_stack)
+                .output()
+                .unwrap();
+            assert_eq!(claim_out.status.code(), Some(2));
+        }
+        Err(err) => panic!("unexpected probe mkdir error: {err}"),
+    }
+
+    // Raw 0xff byte in --judge-arg reaches the child process argv
+    // intact on both Linux and macOS without touching APFS filenames.
+    let ascii_stack = init_stack_dir(&base, &[]);
+    let captured = base.join("captured-raw-arg.bin");
+    let staged = base.join("raw-judge.staged");
+    std::fs::write(
+        &staged,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$1\" > {}\ncat > /dev/null\nprintf '%s' '{{\"model\":\"jev-1.13.0\",\"answers\":{{\"profile\":{{\"type\":\"choice\",\"choice\":\"standard\",\"probabilities\":{{\"lean\":0.05,\"standard\":0.9,\"roomy\":0.03,\"other\":0.02}}}}}}}}'\n",
+            captured.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = base.join("raw-judge.sh");
+    std::fs::rename(&staged, &script).unwrap();
+    let raw_arg = OsString::from_vec(b"raw-\xff-payload".to_vec());
+    let routed = Command::new(env!("CARGO_BIN_EXE_switchyard"))
+        .arg("claim")
+        .arg("beta")
+        .arg("--stack")
+        .arg(&ascii_stack)
+        .arg("--describe")
+        .arg("Run the api server and worker")
+        .arg("--default-profile")
+        .arg("lean")
+        .arg("--judge-command")
+        .arg("/bin/sh")
+        .arg("--judge-arg")
+        .arg(&script)
+        .arg("--judge-arg")
+        .arg(&raw_arg)
+        .output()
+        .unwrap();
+    assert_eq!(
+        routed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&routed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&routed.stdout).contains("ports 20000-20019"));
+    assert_eq!(std::fs::read(&captured).unwrap(), b"raw-\xff-payload");
 }

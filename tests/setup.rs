@@ -137,11 +137,15 @@ fn is_job_head(line: &str) -> bool {
 }
 
 fn run_commands(ci_text: &str) -> Vec<String> {
+    run_commands_for_job(ci_text, "test:")
+}
+
+fn run_commands_for_job(ci_text: &str, target_job: &str) -> Vec<String> {
     let mut commands = Vec::new();
     let mut step_lines: Vec<String> = Vec::new();
     let mut in_jobs = false;
     let mut in_steps = false;
-    let mut in_test_job = false;
+    let mut in_target_job = false;
     let mut job_disabled = false;
     for line in ci_text.lines() {
         let stripped = line.trim();
@@ -153,17 +157,15 @@ fn run_commands(ci_text: &str) -> Vec<String> {
             continue;
         }
         if in_jobs && is_job_head(line) {
-            // A new job ends the test job's steps. The run
-            // commands of a later job are that job's own and
-            // are never collected as the test job's, because
-            // the gate this parser proves is the one the test
-            // job runs.
+            // A new job ends the active job's steps. The run
+            // commands of another job are that job's own and
+            // are never collected for target_job.
             flush_step(&mut step_lines, &mut commands);
-            in_test_job = stripped == "test:";
+            in_target_job = stripped == target_job;
             in_steps = false;
             continue;
         }
-        if !in_test_job {
+        if !in_target_job {
             continue;
         }
         if !in_steps && stripped.starts_with("if:") {
@@ -201,11 +203,17 @@ fn run_commands(ci_text: &str) -> Vec<String> {
 
 #[test]
 fn ci_runs_the_local_gate_commands() {
-    let commands = run_commands(&read(".github/workflows/ci.yml"));
-    assert!(commands.iter().any(|c| c == GATE_COMMAND));
-    assert!(commands.iter().any(|c| c == SCAN_COMMAND));
-    assert!(commands.iter().any(|c| c == FMT_COMMAND));
-    assert!(commands.iter().any(|c| c == CLIPPY_COMMAND));
+    // Extended under SY-26 as a mechanical consequence of adding
+    // the macos workflow job so both the ubuntu test job and the
+    // macos job are verified to run the four local gate commands.
+    let ci_text = read(".github/workflows/ci.yml");
+    for job in ["test:", "macos:"] {
+        let commands = run_commands_for_job(&ci_text, job);
+        assert!(commands.iter().any(|c| c == GATE_COMMAND), "{job}");
+        assert!(commands.iter().any(|c| c == SCAN_COMMAND), "{job}");
+        assert!(commands.iter().any(|c| c == FMT_COMMAND), "{job}");
+        assert!(commands.iter().any(|c| c == CLIPPY_COMMAND), "{job}");
+    }
 }
 
 #[test]
@@ -236,26 +244,75 @@ fn ci_gate_parser_does_not_credit_a_later_job_with_a_gate_command() {
 #[test]
 fn ci_carries_the_fleet_credential_hygiene() {
     let text = read(".github/workflows/ci.yml");
-    // The workflow asks for no more than it uses. Its token
-    // is limited to reading the repository, the checkout
-    // leaves no credential behind for later steps, and the
-    // toolchain action is pinned to a full commit SHA rather
-    // than a moving branch name.
+    // Extended under SY-26 as a mechanical consequence of adding
+    // the macos workflow job: every checkout step across test,
+    // binding, and macos must disable credential persistence, zero
+    // jobs or steps may carry if: false, zero permission lines may
+    // grant write access, and every toolchain action must pin a
+    // 40-character SHA.
     assert!(text.contains("permissions:"));
     assert!(text.contains("contents: read"));
-    assert!(text.contains("persist-credentials: false"));
+    assert!(text.contains("  test:\n    runs-on: ubuntu-latest"));
+    assert!(text.contains("  binding:\n    runs-on: ubuntu-latest"));
+    assert!(text.contains("  macos:\n    runs-on: macos-latest"));
     assert!(!text.contains("rust-toolchain@master"));
-    // Every toolchain step stands judged, not only the first
-    // one the file finds: the workflow carries two, one per
-    // job, and a shortened pin on either fails this pin
-    // (SY-A40).
+    for line in text.lines() {
+        let stripped = line.trim();
+        if stripped.starts_with('#') {
+            continue;
+        }
+        assert!(!stripped.contains(": write"), "{line}");
+        assert!(!stripped.contains("write-all"), "{line}");
+        if let Some(rest) = stripped.strip_prefix("if:") {
+            let normalized = rest
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_lowercase();
+            assert_ne!(normalized, "false", "disabled workflow item: {line}");
+        }
+    }
+    let mut checkout_steps: Vec<Vec<String>> = Vec::new();
+    let mut current_checkout: Option<Vec<String>> = None;
+    for line in text.lines() {
+        let stripped = line.trim();
+        if stripped.starts_with('#') {
+            continue;
+        }
+        if is_job_head(line) || stripped.starts_with("- ") {
+            if let Some(step) = current_checkout.take() {
+                checkout_steps.push(step);
+            }
+            if stripped.starts_with("- ") && stripped.contains("actions/checkout@") {
+                current_checkout = Some(vec![stripped.to_string()]);
+            }
+            continue;
+        }
+        if let Some(step) = current_checkout.as_mut() {
+            step.push(stripped.to_string());
+        }
+    }
+    if let Some(step) = current_checkout.take() {
+        checkout_steps.push(step);
+    }
+    assert_eq!(
+        checkout_steps.len(),
+        3,
+        "expected checkout in test, binding, and macos"
+    );
+    for (index, step) in checkout_steps.iter().enumerate() {
+        assert!(
+            step.iter().any(|line| line == "persist-credentials: false"),
+            "checkout step {index} missing persist-credentials: false: {step:?}"
+        );
+    }
     let toolchain_lines: Vec<&str> = text
         .lines()
         .filter(|line| line.contains("dtolnay/rust-toolchain@"))
         .collect();
-    assert!(
-        !toolchain_lines.is_empty(),
-        "the workflow carries no toolchain step"
+    assert_eq!(
+        toolchain_lines.len(),
+        3,
+        "expected toolchain step in test, binding, and macos"
     );
     for toolchain_line in toolchain_lines {
         let pin = toolchain_line
@@ -456,14 +513,31 @@ fn codepoint_scan_scans_a_root_whose_name_is_not_unicode() {
     use std::os::unix::ffi::OsStringExt;
     let parent = temp_dir("nonunicode");
     let dir = parent.join(std::ffi::OsString::from_vec(vec![b'r', 0xff, b'o', b't']));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
-    let result = scan_tree(&dir);
-    // Before the args_os repair the scanner read its arguments
-    // with std::env::args and panicked on this root at exit 101;
-    // the scan now runs and counts what stands under the root.
-    assert_eq!(result.status, 1, "{}", result.stderr);
-    assert!(result.stdout.contains("em dash U+2014 count 1"));
+    // Recorded correction under SY-26 for macOS gate parity: APFS
+    // rejects directory creation on raw 0xff non-UTF-8 byte names
+    // with EILSEQ (or PermissionDenied under seatbelt). Where the
+    // filesystem creates the directory (Linux), the scan counts the
+    // dash inside it at exit 1 as before; where APFS refuses the
+    // mkdir, passing the non-UTF-8 path still proves args_os avoids
+    // an exit 101 panic and refuses cleanly as a missing root at
+    // exit 2.
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => {
+            std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
+            let result = scan_tree(&dir);
+            assert_eq!(result.status, 1, "{}", result.stderr);
+            assert!(result.stdout.contains("em dash U+2014 count 1"));
+        }
+        Err(err)
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                || err.raw_os_error() == Some(libc::EILSEQ) =>
+        {
+            let result = scan_tree(&dir);
+            assert_eq!(result.status, 2, "{}", result.stderr);
+            assert!(result.stderr.contains("scan error"), "{}", result.stderr);
+        }
+        Err(err) => panic!("unexpected create_dir_all failure: {err}"),
+    }
 }
 
 #[test]
@@ -578,24 +652,44 @@ fn codepoint_scan_skips_a_file_with_an_uppercase_binary_suffix() {
     assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn codepoint_scan_reports_a_failed_output_write_at_exit_2() {
     use std::process::Stdio;
-    // The scanner writes its whole output through one checked
-    // writer, so a stdout that refuses the write lands the scan
-    // at its stated error exit instead of panicking inside a
-    // print (SY-A42). The drive stages /dev/full as the output,
-    // which answers every write with no space left; before the
-    // repair the count lines went through println! and this
-    // drive died at exit 101.
-    let full = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .unwrap();
+    // Recorded correction under SY-26 for macOS gate parity: remove
+    // the Linux-only cfg gate so Linux and macOS run the exact same
+    // test count, driving /dev/full where present (Linux ENOSPC) and
+    // falling back to a closed pipe where /dev/full is absent (macOS
+    // ENOENT or seatbelt EPERM).
+    let broken_stdout = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(full) => Stdio::from(full),
+        Err(exc)
+            if exc.kind() == std::io::ErrorKind::NotFound
+                || exc.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            Stdio::from(writer)
+        }
+        Err(exc) => panic!("unexpected /dev/full open failure: {exc}"),
+    };
     let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
         .arg(root())
-        .stdout(Stdio::from(full))
+        .stdout(broken_stdout)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot write the scan output"), "{stderr}");
+}
+
+#[test]
+fn codepoint_scan_reports_a_closed_pipe_output_write_at_exit_2() {
+    use std::process::Stdio;
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .arg(root())
+        .stdout(Stdio::from(writer))
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
