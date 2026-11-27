@@ -1,8 +1,9 @@
 //! Command line interface for switchyard.
 //!
-//! One stack per directory, four commands. Init creates the stack,
-//! claim allocates, list shows who holds what, and release returns
-//! everything. A claim is plain, or profiled under a declared
+//! One stack per directory, five commands. Init creates the stack,
+//! claim allocates, list shows who holds what, release returns
+//! everything, and doctor audits and optionally repairs stack
+//! health. A claim is plain, or profiled under a declared
 //! profile, or routed by a job description a judge settles, and any
 //! claim may wait where its draw does not stand free. List may
 //! print the queue of standing waits instead of the claims.
@@ -17,14 +18,15 @@ use std::time::{Duration, Instant};
 
 use crate::{
     active_child_group, claim, claim_profile, claim_profile_waiting, claim_routed,
-    claim_routed_waiting, claim_waiting, init_stack, list_claims, list_waits, profile_named,
-    release_report, resolve_path, ClaimOutcome, JudgeTransport, Record, ReleaseOutcome, Result,
-    Wait, DEFAULT_PORT_START, DEFAULT_RANGE_COUNT, DEFAULT_RANGE_SIZE, JUDGE_TIMEOUT_SECONDS,
+    claim_routed_waiting, claim_waiting, doctor, init_stack_with_options, list_claims, list_waits,
+    profile_named, release_report_with_options, resolve_path, ClaimOutcome, DoctorReport,
+    InitOptions, JudgeTransport, Record, ReleaseOptions, ReleaseOutcome, Result, Wait,
+    DEFAULT_PORT_START, DEFAULT_RANGE_COUNT, DEFAULT_RANGE_SIZE, JUDGE_TIMEOUT_SECONDS,
 };
 
-const COMMANDS: [&str; 4] = ["init", "claim", "list", "release"];
+const COMMANDS: [&str; 5] = ["init", "claim", "list", "release", "doctor"];
 
-const HELP: &str = "usage: switchyard [-h] {init,claim,list,release} ...
+const HELP: &str = "usage: switchyard [-h] {init,claim,list,release,doctor} ...
 
 Give every parallel agent its own branch, port range, database, and
 env file with one command.
@@ -34,6 +36,7 @@ commands:
   claim    allocate a worktree, a range, a database, and an env file
   list     print who holds what, derived only from the registry
   release  return every resource an agent holds
+  doctor   audit stack health and optionally repair orphan residue
 
 stack option:
   --stack PATH             the stack root the command works on,
@@ -44,6 +47,10 @@ init options:
                            default
   --range-size COUNT       the ports in one range, 10 by default
   --range-count COUNT      the ranges in the pool, 16 by default
+  --from PATH              clone a local git repository offline into
+                           the stack repository
+  --branch NAME            base branch for claims, resolved from the
+                           source HEAD by default or main without --from
 
 claim options:
   --profile NAME           allocate under a declared profile, one of
@@ -68,6 +75,17 @@ list options:
   --queue                  print the standing waits in offer order
                            instead of the claims table
 
+release options:
+  --keep-branch            preserve refs/heads/switchyard/<agent> when
+                           releasing a claim
+  --safe                   refuse to release a dirty or detached claim,
+                           or unmerged commits unless --keep-branch stands
+
+doctor options:
+  --fix                    remove clean orphan worktrees, zero-ahead
+                           orphan branches, prunable entries, and stale
+                           temporary files
+
 A judge command is spawned with any --judge-arg arguments in the order
 they were given. It receives the request document as one line on its
 standard input and answers with the reply document on its standard
@@ -88,6 +106,8 @@ struct Args {
     port_start: i128,
     range_size: i128,
     range_count: i128,
+    from_repo: Option<PathBuf>,
+    branch: Option<OsString>,
     describe: Option<String>,
     default_profile: Option<String>,
     profile: Option<String>,
@@ -96,6 +116,9 @@ struct Args {
     wait: bool,
     wait_for: Option<i128>,
     queue: bool,
+    keep_branch: bool,
+    safe: bool,
+    fix: bool,
 }
 
 enum Parsed {
@@ -166,7 +189,7 @@ fn print_help(out: &mut dyn Write, err: &mut dyn Write) -> Parsed {
     }
 }
 
-fn is_switchyard_option(bytes: &[u8]) -> bool {
+fn is_known_claim_option(bytes: &[u8]) -> bool {
     let head = match bytes.iter().position(|&b| b == b'=') {
         Some(eq) if bytes.starts_with(b"--") => &bytes[..eq],
         _ => bytes,
@@ -176,9 +199,6 @@ fn is_switchyard_option(bytes: &[u8]) -> bool {
         b"-h"
             | b"--help"
             | b"--stack"
-            | b"--port-start"
-            | b"--range-size"
-            | b"--range-count"
             | b"--describe"
             | b"--default-profile"
             | b"--profile"
@@ -186,7 +206,6 @@ fn is_switchyard_option(bytes: &[u8]) -> bool {
             | b"--judge-arg"
             | b"--wait"
             | b"--wait-for"
-            | b"--queue"
     )
 }
 
@@ -210,7 +229,7 @@ fn parse(
                 return Err(format!("unrecognized arguments: {first_lossy}"));
             }
             return Err(format!(
-                "invalid choice: '{first_lossy}' (choose from 'init', 'claim', 'list', 'release')"
+                "invalid choice: '{first_lossy}' (choose from 'init', 'claim', 'list', 'release', 'doctor')"
             ));
         }
     };
@@ -219,6 +238,8 @@ fn parse(
     let mut port_start: i128 = DEFAULT_PORT_START as i128;
     let mut range_size: i128 = DEFAULT_RANGE_SIZE as i128;
     let mut range_count: i128 = DEFAULT_RANGE_COUNT as i128;
+    let mut from_repo: Option<PathBuf> = None;
+    let mut branch: Option<OsString> = None;
     let mut describe: Option<String> = None;
     let mut default_profile: Option<String> = None;
     let mut profile: Option<String> = None;
@@ -227,6 +248,9 @@ fn parse(
     let mut wait = false;
     let mut wait_for: Option<i128> = None;
     let mut queue = false;
+    let mut keep_branch = false;
+    let mut safe = false;
+    let mut fix = false;
     let mut index = 1;
     while index < args.len() {
         let raw = &args[index];
@@ -242,6 +266,21 @@ fn parse(
         }
         if raw == "--queue" && command == "list" {
             queue = true;
+            index += 1;
+            continue;
+        }
+        if raw == "--keep-branch" && command == "release" {
+            keep_branch = true;
+            index += 1;
+            continue;
+        }
+        if raw == "--safe" && command == "release" {
+            safe = true;
+            index += 1;
+            continue;
+        }
+        if raw == "--fix" && command == "doctor" {
+            fix = true;
             index += 1;
             continue;
         }
@@ -261,7 +300,7 @@ fn parse(
         };
         let known_option = matches!(
             option.as_str(),
-            "--stack" | "--port-start" | "--range-size" | "--range-count"
+            "--stack" | "--port-start" | "--range-size" | "--range-count" | "--from" | "--branch"
         ) && (option == "--stack" || command == "init")
             || matches!(
                 option.as_str(),
@@ -279,7 +318,7 @@ fn parse(
                     let next = args.get(index + 1);
                     let accepted = match next {
                         Some(candidate) if option == "--judge-arg" => {
-                            !is_switchyard_option(candidate.as_os_str().as_bytes())
+                            !is_known_claim_option(candidate.as_os_str().as_bytes())
                         }
                         Some(candidate) => !candidate.as_os_str().as_bytes().starts_with(b"--"),
                         None => false,
@@ -297,6 +336,8 @@ fn parse(
                 "--port-start" => port_start = int_option(&option, &value.to_string_lossy())?,
                 "--range-size" => range_size = int_option(&option, &value.to_string_lossy())?,
                 "--range-count" => range_count = int_option(&option, &value.to_string_lossy())?,
+                "--from" => from_repo = Some(PathBuf::from(value)),
+                "--branch" => branch = Some(value),
                 "--describe" => {
                     describe = Some(match value.into_string() {
                         Ok(text) => text,
@@ -401,6 +442,8 @@ fn parse(
         port_start,
         range_size,
         range_count,
+        from_repo,
+        branch,
         describe,
         default_profile,
         profile,
@@ -409,6 +452,9 @@ fn parse(
         wait,
         wait_for,
         queue,
+        keep_branch,
+        safe,
+        fix,
     })))
 }
 
@@ -740,6 +786,31 @@ fn print_grid(out: &mut dyn Write, header: &[String], rows: &[Vec<String>]) -> s
     Ok(())
 }
 
+fn print_doctor(out: &mut dyn Write, report: &DoctorReport) -> std::io::Result<()> {
+    if report.ok {
+        writeln!(out, "doctor ok")?;
+    } else {
+        let remaining = report.issues.iter().filter(|issue| !issue.fixed).count();
+        let noun = if remaining == 1 { "issue" } else { "issues" };
+        writeln!(out, "doctor found {remaining} unfixed {noun}")?;
+    }
+    if report.fixed > 0 {
+        writeln!(out, "fixed {}", report.fixed)?;
+    }
+    for issue in &report.issues {
+        let state = if issue.fixed { "fixed" } else { "unfixed" };
+        writeln!(
+            out,
+            "issue {} {} {} {}",
+            state, issue.kind, issue.target, issue.detail
+        )?;
+    }
+    for branch in &report.kept_branches {
+        writeln!(out, "kept_branch {branch}")?;
+    }
+    out.flush()
+}
+
 fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let parsed = match parse(args, out, err) {
         Ok(Parsed::Run(parsed)) => parsed,
@@ -747,7 +818,7 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Err(message) => {
             let _ = writeln!(
                 err,
-                "usage: switchyard [-h] {{init,claim,list,release}} ..."
+                "usage: switchyard [-h] {{init,claim,list,release,doctor}} ..."
             );
             let _ = writeln!(err, "switchyard: error: {message}");
             return 2;
@@ -755,21 +826,41 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     let stack = resolve_path(&parsed.stack);
     let result = match parsed.command.as_str() {
-        "init" => init_stack(
-            &stack,
-            parsed.port_start,
-            parsed.range_size,
-            parsed.range_count,
-        )
-        .and_then(|pool| {
-            writeln!(out, "initialised stack at {}", stack.display()).map_err(output_error)?;
-            writeln!(
-                out,
-                "port pool {} ranges of {} ports from {}",
-                pool.range_count, pool.range_size, pool.start
+        "init" => {
+            let branch = match parsed.branch {
+                Some(raw) => match raw.into_string() {
+                    Ok(text) => Some(text),
+                    Err(_) => {
+                        let _ = writeln!(
+                            err,
+                            "error: invalid base branch, branch name is not valid UTF-8"
+                        );
+                        return 1;
+                    }
+                },
+                None => None,
+            };
+            let options = InitOptions {
+                from_repo: parsed.from_repo,
+                branch,
+            };
+            init_stack_with_options(
+                &stack,
+                parsed.port_start,
+                parsed.range_size,
+                parsed.range_count,
+                &options,
             )
-            .map_err(output_error)
-        }),
+            .and_then(|pool| {
+                writeln!(out, "initialised stack at {}", stack.display()).map_err(output_error)?;
+                writeln!(
+                    out,
+                    "port pool {} ranges of {} ports from {}",
+                    pool.range_count, pool.range_size, pool.start
+                )
+                .map_err(output_error)
+            })
+        }
         "claim" => claim_from_args(&stack, &parsed, out),
         "list" => {
             if parsed.queue {
@@ -780,10 +871,21 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                     .and_then(|records| print_table(out, &records).map_err(output_error))
             }
         }
-        "release" => release_report(&stack, parsed.agent.as_deref().unwrap()).and_then(|report| {
+        "release" => release_report_with_options(
+            &stack,
+            parsed.agent.as_deref().unwrap(),
+            ReleaseOptions {
+                keep_branch: parsed.keep_branch,
+                safe: parsed.safe,
+            },
+        )
+        .and_then(|report| {
             match &report.outcome {
                 ReleaseOutcome::Claim(record) => {
                     writeln!(out, "released {}", record.agent).map_err(output_error)?;
+                    if report.branch_kept {
+                        writeln!(out, "branch {} kept", record.branch).map_err(output_error)?;
+                    }
                     writeln!(
                         out,
                         "ports {}-{} returned",
@@ -806,6 +908,13 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             }
             Ok(())
         }),
+        "doctor" => match doctor(&stack, parsed.fix) {
+            Ok(report) => match print_doctor(out, &report) {
+                Ok(()) => return if report.ok { 0 } else { 1 },
+                Err(exc) => Err(output_error(exc)),
+            },
+            Err(error) => Err(error),
+        },
         _ => unreachable!(),
     };
     match result {

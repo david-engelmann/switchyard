@@ -2,17 +2,18 @@
 
 This package is the thin Python face of the switchyard library.
 Each function calls the library and returns the facts the command
-line prints as plain dictionaries, with list and queue returning
-one dictionary for each standing claim or wait. A refusal from
-the library raises a subclass of SwitchyardError carrying the
-same message text the command line prints. RefusalError covers
-the plain refusals, NotInitialisedError an uninitialised stack,
-CorruptRegistryError a corrupt registry, and InvalidNameError an
-agent name the library rejects, mirroring the exit classes the
-command line reports. An argument of the wrong shape raises
-TypeError instead, a boolean where an integer stands, a value
-passed by position for an argument that stands keyword-only, or
-a value of a wrong type in a pool argument or in a wait bound
+line prints as plain dictionaries, across init, claim, claim_profile,
+claim_routed, list, queue, release, and doctor, with list and queue
+returning one dictionary for each standing claim or wait. A refusal
+from the library raises a subclass of SwitchyardError carrying the
+same message text the command line prints. RefusalError covers the
+plain refusals, NotInitialisedError an uninitialised stack,
+CorruptRegistryError a corrupt registry or config, and
+InvalidNameError an agent name the library rejects, mirroring the
+exit classes the command line reports. An argument of the wrong
+shape raises TypeError instead, a boolean where an integer stands,
+a value passed by position for an argument that stands keyword-only,
+or a value of a wrong type in a pool argument or in a wait bound
 beside a claim that waits.
 """
 
@@ -25,6 +26,7 @@ from ._switchyard import (
     claim,
     claim_profile,
     claim_routed,
+    doctor,
     init,
     list,
     queue,
@@ -40,6 +42,7 @@ __all__ = [
     "claim",
     "claim_profile",
     "claim_routed",
+    "doctor",
     "init",
     "list",
     "queue",

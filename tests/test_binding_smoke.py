@@ -503,3 +503,107 @@ def test_a_waiting_profiled_claim_through_the_binding(tmp_path):
     assert (claims[0]["port_start"], claims[0]["port_end"]) == (20000, 20019)
     queue = switchyard.queue(stack)
     assert [entry["agent"] for entry in queue] == ["scored"]
+
+
+def test_init_from_repo_and_branch_through_the_binding(tmp_path):
+    import json
+    import subprocess
+
+    src = tmp_path / "src_repo"
+    src.mkdir()
+    subprocess.run(["git", "-C", str(src), "init", "-q", "-b", "trunk"], check=True)
+    subprocess.run(
+        ["git", "-C", str(src), "config", "user.email", "py@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(src), "config", "user.name", "py"],
+        check=True,
+    )
+    (src / "README.md").write_text("trunk\n")
+    subprocess.run(["git", "-C", str(src), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(src), "commit", "-q", "-m", "trunk"], check=True)
+    subprocess.run(
+        ["git", "-C", str(src), "checkout", "-q", "-b", "feature-base"], check=True
+    )
+    (src / "feature.txt").write_text("feature\n")
+    subprocess.run(["git", "-C", str(src), "add", "feature.txt"], check=True)
+    subprocess.run(["git", "-C", str(src), "commit", "-q", "-m", "feature"], check=True)
+    subprocess.run(["git", "-C", str(src), "checkout", "-q", "trunk"], check=True)
+
+    with pytest.raises(switchyard.RefusalError):
+        switchyard.init(
+            str(tmp_path / "bad_url"), from_repo="https://example.invalid/repo.git"
+        )
+
+    stack = str(tmp_path / "stack")
+    pool = switchyard.init(stack, from_repo=src, branch="feature-base")
+    assert pool == {"port_start": 20000, "range_size": 10, "range_count": 16}
+
+    cfg = json.loads((tmp_path / "stack" / "switchyard-config.json").read_text())
+    assert cfg["base_branch"] == "feature-base"
+    assert cfg["version"] == 1
+
+    alpha = switchyard.claim(stack, "alpha")
+    assert alpha["branch"] == "switchyard/alpha"
+    assert (tmp_path / "stack" / "worktrees" / "alpha" / "feature.txt").is_file()
+
+
+def test_safe_release_keep_branch_and_doctor_through_the_binding(tmp_path):
+    import subprocess
+
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack)
+
+    with pytest.raises(TypeError):
+        switchyard.release(stack, "alpha", True)
+    with pytest.raises(TypeError):
+        switchyard.release(stack, "alpha", keep_branch=1)
+    with pytest.raises(TypeError):
+        switchyard.doctor(stack, True)
+    with pytest.raises(TypeError):
+        switchyard.doctor(stack, fix=1)
+
+    switchyard.claim(stack, "alpha")
+    wt = tmp_path / "stack" / "worktrees" / "alpha"
+    (wt / "dirty.txt").write_text("unsaved\n")
+
+    with pytest.raises(switchyard.RefusalError):
+        switchyard.release(stack, "alpha", safe=True)
+    assert wt.is_dir()
+
+    subprocess.run(["git", "-C", str(wt), "add", "dirty.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(wt), "config", "user.email", "py@example.invalid"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(wt), "config", "user.name", "py"], check=True)
+    subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", "saved"], check=True)
+
+    with pytest.raises(switchyard.RefusalError):
+        switchyard.release(stack, "alpha", safe=True)
+
+    released = switchyard.release(stack, "alpha", safe=True, keep_branch=True)
+    assert released["agent"] == "alpha"
+    assert not wt.exists()
+
+    (tmp_path / "stack" / ".tmp-stale").write_text("stale\n")
+    audit = switchyard.doctor(stack)
+    assert audit["ok"] is False
+    assert audit["fixed"] == 0
+    assert audit["kept_branches"] == ["switchyard/alpha"]
+    assert [i["kind"] for i in audit["issues"]] == ["stale_temp_file"]
+    assert audit["issues"][0]["fixed"] is False
+
+    repaired = switchyard.doctor(stack, fix=True)
+    assert repaired["ok"] is True
+    assert repaired["fixed"] == 1
+    assert repaired["kept_branches"] == ["switchyard/alpha"]
+    assert repaired["issues"][0]["fixed"] is True
+    assert not (tmp_path / "stack" / ".tmp-stale").exists()
+
+    (tmp_path / "stack" / "switchyard-config.json").write_text("{corrupt config\n")
+    with pytest.raises(switchyard.CorruptRegistryError):
+        switchyard.list(stack)
+    with pytest.raises(switchyard.CorruptRegistryError):
+        switchyard.doctor(stack)

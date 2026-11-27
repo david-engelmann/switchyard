@@ -31,6 +31,7 @@ use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 
 pub const REGISTRY_NAME: &str = "switchyard-registry.json";
+pub const CONFIG_NAME: &str = "switchyard-config.json";
 pub const ROUTING_LOG_NAME: &str = "switchyard-routing.jsonl";
 /// The queue log of obligation SY-23, an append-only evidence
 /// document that no command reads to decide anything.
@@ -42,7 +43,10 @@ pub const LOCK_NAME: &str = "switchyard.lock";
 pub const REPO_NAME: &str = "repo";
 pub const WORKTREES_NAME: &str = "worktrees";
 pub const ENV_NAME: &str = ".env.switchyard";
+pub const EMPTY_HOOKS_NAME: &str = ".switchyard-empty-hooks";
+pub const DEFAULT_BASE_BRANCH: &str = "main";
 pub const REGISTRY_VERSION: i64 = 1;
+pub const CONFIG_VERSION: i64 = 1;
 
 pub const DEFAULT_PORT_START: i64 = 20000;
 pub const DEFAULT_RANGE_SIZE: i64 = 10;
@@ -130,6 +134,76 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 fn corrupt(path: &Path, why: impl fmt::Display) -> Error {
     Error::Corrupt(format!("registry at {} is corrupt, {why}", path.display()))
+}
+
+fn corrupt_config(path: &Path, why: impl fmt::Display) -> Error {
+    Error::Corrupt(format!("config at {} is corrupt, {why}", path.display()))
+}
+
+fn is_switchyard_branch_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "switchyard" || lower.starts_with("switchyard/")
+}
+
+/// Whether `branch` is a safe git branch ref name outside the
+/// `switchyard/*` agent namespace, under obligation SY-27.
+pub fn is_valid_base_branch(branch: &str) -> bool {
+    let bytes = branch.as_bytes();
+    if bytes.is_empty() || bytes.len() > 255 {
+        return false;
+    }
+    let lower = branch.to_ascii_lowercase();
+    if branch == "@" || lower == "head" || is_switchyard_branch_name(branch) {
+        return false;
+    }
+    if matches!(bytes[0], b'-' | b'/' | b'.')
+        || matches!(bytes[bytes.len() - 1], b'/' | b'.')
+        || lower.ends_with(".lock")
+    {
+        return false;
+    }
+    if branch.contains("..") || branch.contains("//") || branch.contains("@{") {
+        return false;
+    }
+    if bytes.iter().any(|&b| {
+        b <= 0x20 || b == 0x7f || matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    }) {
+        return false;
+    }
+    branch.split('/').all(|part| {
+        !part.is_empty()
+            && part.len() <= 250
+            && !part.starts_with('.')
+            && !part.ends_with('.')
+            && !part.to_ascii_lowercase().ends_with(".lock")
+    })
+}
+
+/// Refuse a base branch name that is not a safe git branch ref name
+/// outside `switchyard/*`, under obligation SY-27.
+pub fn validate_base_branch(branch: &str) -> Result<()> {
+    if !is_valid_base_branch(branch) {
+        return Err(Error::plain(format!(
+            "invalid base branch {}, use a valid git branch name outside switchyard/*",
+            py_repr(branch)
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `source` spells a URL scheme or SCP-style remote target
+/// (`scheme://...` or `host:path` with `:` before any `/`), which
+/// offline `init --from` refuses before invoking git.
+fn is_remote_repo_spec(source: &Path) -> bool {
+    let bytes = source.as_os_str().as_bytes();
+    if bytes.windows(3).any(|window| window == b"://") {
+        return true;
+    }
+    let before_slash = match bytes.iter().position(|&b| b == b'/') {
+        Some(pos) => &bytes[..pos],
+        None => bytes,
+    };
+    before_slash.contains(&b':')
 }
 
 /// Quote a string the way Python's repr quotes it, for the error
@@ -1043,6 +1117,236 @@ fn save_registry_with_ops(stack: &Path, data: &Registry, ops: &dyn PublishOps) -
     Ok(())
 }
 
+const CONFIG_KEYS: [&str; 6] = [
+    "base_branch",
+    "env_template",
+    "probe_ports",
+    "seed_files",
+    "source_repo",
+    "version",
+];
+
+/// Stack-wide configuration written to `switchyard-config.json` when
+/// non-default `init` options (`--from` or `--branch`) stand, and
+/// omitted on bare `init`, under obligation SY-27.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackConfig {
+    pub version: i64,
+    pub base_branch: String,
+    pub source_repo: Option<String>,
+    pub probe_ports: bool,
+}
+
+/// Optional repository attachment and base branch arguments for
+/// `init_stack_with_options`, under obligation SY-27.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitOptions {
+    pub from_repo: Option<PathBuf>,
+    pub branch: Option<String>,
+}
+
+/// Optional branch-preservation and cleanliness-guard flags for
+/// `release_with_options`, under obligation SY-28.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReleaseOptions {
+    pub keep_branch: bool,
+    pub safe: bool,
+}
+
+/// One stack health issue reported by `doctor`, under obligation SY-29.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorIssue {
+    pub kind: String,
+    pub target: String,
+    pub detail: String,
+    pub fixed: bool,
+}
+
+/// Full stack health audit report returned by `doctor`, under
+/// obligation SY-29.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReport {
+    pub ok: bool,
+    pub fixed: usize,
+    pub issues: Vec<DoctorIssue>,
+    pub kept_branches: Vec<String>,
+}
+
+fn effective_base_branch(config: Option<&StackConfig>) -> &str {
+    config
+        .map(|cfg| cfg.base_branch.as_str())
+        .unwrap_or(DEFAULT_BASE_BRANCH)
+}
+
+fn validate_config(data: &JVal, path: &Path) -> Result<StackConfig> {
+    let pairs = match data {
+        JVal::Obj(pairs) => pairs,
+        _ => return Err(corrupt_config(path, "the top level is not an object")),
+    };
+    if !exact_keys(pairs, &CONFIG_KEYS) {
+        return Err(corrupt_config(
+            path,
+            "the top level fields are not exactly base_branch, env_template, probe_ports, seed_files, source_repo, and version",
+        ));
+    }
+    if data.get("version").and_then(JVal::as_int) != Some(CONFIG_VERSION) {
+        return Err(corrupt_config(
+            path,
+            "the version is missing or unsupported",
+        ));
+    }
+    let base_branch = match data.get("base_branch").and_then(JVal::as_str) {
+        Some(branch) if is_valid_base_branch(branch) => branch.to_string(),
+        _ => {
+            return Err(corrupt_config(
+                path,
+                "base_branch is missing or not a valid branch name",
+            ))
+        }
+    };
+    let source_repo = match data.get("source_repo") {
+        Some(JVal::Null) => None,
+        Some(JVal::Str(text)) if !text.is_empty() && Path::new(text).is_absolute() => {
+            Some(text.clone())
+        }
+        _ => {
+            return Err(corrupt_config(
+                path,
+                "source_repo must be an absolute path string or null",
+            ))
+        }
+    };
+    let probe_ports = match data.get("probe_ports") {
+        Some(JVal::Bool(false)) => false,
+        Some(JVal::Bool(true)) => {
+            return Err(corrupt_config(
+                path,
+                "probe_ports true is unsupported in this version",
+            ))
+        }
+        _ => return Err(corrupt_config(path, "probe_ports is not a boolean")),
+    };
+    match data.get("env_template") {
+        Some(JVal::Null) => {}
+        _ => return Err(corrupt_config(path, "env_template must be null")),
+    }
+    match data.get("seed_files") {
+        Some(JVal::Arr(items)) if items.is_empty() => {}
+        _ => return Err(corrupt_config(path, "seed_files must be an empty list")),
+    }
+    Ok(StackConfig {
+        version: CONFIG_VERSION,
+        base_branch,
+        source_repo,
+        probe_ports,
+    })
+}
+
+/// Read and strictly validate `switchyard-config.json` when present,
+/// returning `Ok(None)` when absent and `Error::Corrupt` when
+/// malformed, under obligation SY-27.
+pub fn load_config(stack: &Path) -> Result<Option<StackConfig>> {
+    let path = stack.join(CONFIG_NAME);
+    match path.symlink_metadata() {
+        Err(exc) if exc.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(exc) => return Err(corrupt_config(&path, format!("it cannot be read, {exc}"))),
+        Ok(_) => {}
+    }
+    if !path.is_file() {
+        return Err(corrupt_config(&path, "the config path is not a file"));
+    }
+    let raw = match fs::read(&path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(exc) => {
+                return Err(corrupt_config(
+                    &path,
+                    format!("it is not valid UTF-8 text, {exc}"),
+                ))
+            }
+        },
+        Err(exc) => return Err(corrupt_config(&path, format!("it cannot be read, {exc}"))),
+    };
+    let data: JVal = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(exc) => {
+            if exc.to_string().contains("recursion limit") {
+                return Err(corrupt_config(&path, "it nests too deeply to be read"));
+            }
+            return Err(corrupt_config(
+                &path,
+                format!("it is not valid JSON, {exc}"),
+            ));
+        }
+    };
+    if let Some(key) = first_duplicate_key(&data) {
+        return Err(corrupt_config(&path, format!("it repeats the key {key}")));
+    }
+    validate_config(&data, &path).map(Some)
+}
+
+fn config_value(config: &StackConfig) -> serde_json::Value {
+    let mut top = serde_json::Map::new();
+    top.insert("base_branch".to_string(), config.base_branch.clone().into());
+    top.insert("env_template".to_string(), serde_json::Value::Null);
+    top.insert("probe_ports".to_string(), config.probe_ports.into());
+    top.insert(
+        "seed_files".to_string(),
+        serde_json::Value::Array(Vec::new()),
+    );
+    top.insert(
+        "source_repo".to_string(),
+        match &config.source_repo {
+            Some(source) => source.clone().into(),
+            None => serde_json::Value::Null,
+        },
+    );
+    top.insert("version".to_string(), config.version.into());
+    serde_json::Value::Object(top)
+}
+
+/// Publish `switchyard-config.json` by exclusive sibling temporary
+/// file write, `sync_all`, rename, and best-effort stack directory
+/// sync, under obligation SY-27.
+pub fn save_config(stack: &Path, config: &StackConfig) -> Result<()> {
+    let path = stack.join(CONFIG_NAME);
+    let text = serde_json::to_string_pretty(&config_value(config)).unwrap() + "\n";
+    let fail = |exc: io::Error| {
+        Error::plain(format!(
+            "the config at {} cannot be written, {exc}",
+            path.display()
+        ))
+    };
+    let mut attempt = 0;
+    let (tmp, mut file) = loop {
+        attempt += 1;
+        let candidate = stack.join(format!("{CONFIG_NAME}.tmp-{}", random_suffix()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(exc) if exc.kind() == io::ErrorKind::AlreadyExists && attempt < 8 => continue,
+            Err(exc) => return Err(fail(exc)),
+        }
+    };
+    let staged = (|| -> io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &path)
+    })();
+    if let Err(exc) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(fail(exc));
+    }
+    if let Ok(dir) = fs::File::open(stack) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 /// The stack lock, held across the whole read and check and modify
 /// and write of the registry.
 ///
@@ -1147,6 +1451,7 @@ fn locked(stack: &Path) -> Result<Locked> {
 /// leaves a new lock file behind.
 fn recreate_lock(stack: &Path, lock_path: &Path) -> Result<fs::File> {
     load_registry(stack)?;
+    let _ = load_config(stack)?;
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
         .read(true)
@@ -1161,6 +1466,57 @@ fn recreate_lock(stack: &Path, lock_path: &Path) -> Result<fs::File> {
                 lock_path.display()
             ))
         })
+}
+
+fn locked_for_doctor(stack: &Path, fix: bool) -> Result<Option<Locked>> {
+    if fix {
+        return locked(stack).map(Some);
+    }
+    let lock_path = stack.join(LOCK_NAME);
+    for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(exc) if exc.kind() == io::ErrorKind::NotFound => {
+                let reg_path = stack.join(REGISTRY_NAME);
+                if !reg_path.exists() {
+                    return Err(Error::NotInitialised(format!(
+                        "no registry at {}, run switchyard init to create the stack",
+                        reg_path.display()
+                    )));
+                }
+                return Ok(None);
+            }
+            Err(exc) => {
+                return Err(Error::plain(format!(
+                    "the lock file at {} cannot be opened, {exc}",
+                    lock_path.display()
+                )));
+            }
+        };
+        file.lock().map_err(|exc| {
+            Error::plain(format!(
+                "the lock file at {} cannot be locked, {exc}",
+                lock_path.display()
+            ))
+        })?;
+        let held = Locked {
+            file,
+            lock_path: lock_path.clone(),
+        };
+        if held.verify_current().is_ok() {
+            return Ok(Some(held));
+        }
+    }
+    Err(Error::plain(format!(
+        "the lock file at {} kept being replaced while it was being locked, \
+         so nothing was changed",
+        lock_path.display()
+    )))
 }
 
 fn is_leap_year(year: i64) -> bool {
@@ -1787,6 +2143,8 @@ fn run_git(
         .args(args)
         .env_clear()
         .envs(env.iter().map(|(key, value)| (key, value)))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -1994,11 +2352,246 @@ pub fn init_stack(
     init_stack_with(stack, port_start, range_size, range_count, &ProcessGit)
 }
 
+/// Create a stack root with optional local repository attachment
+/// (`--from`) and base branch selection (`--branch`), under
+/// obligation SY-27.
+pub fn init_stack_with_options(
+    stack: &Path,
+    port_start: i128,
+    range_size: i128,
+    range_count: i128,
+    options: &InitOptions,
+) -> Result<Pool> {
+    init_stack_with_options_and_git(
+        stack,
+        port_start,
+        range_size,
+        range_count,
+        options,
+        &ProcessGit,
+    )
+}
+
 fn init_stack_with(
     stack: &Path,
     port_start: i128,
     range_size: i128,
     range_count: i128,
+    git: &dyn GitRunner,
+) -> Result<Pool> {
+    init_stack_with_options_and_git(
+        stack,
+        port_start,
+        range_size,
+        range_count,
+        &InitOptions::default(),
+        git,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceBranchOrigin {
+    LocalHead,
+    RemoteOrigin,
+}
+
+fn inspect_source_repo(
+    from_path: &Path,
+    explicit_branch: Option<&str>,
+    git: &dyn GitRunner,
+) -> Result<(PathBuf, String, String, SourceBranchOrigin)> {
+    if is_remote_repo_spec(from_path) {
+        return Err(Error::plain(format!(
+            "remote or URL repository {} is refused, switchyard operates offline on local paths only",
+            from_path.display()
+        )));
+    }
+    let canonical_src = fs::canonicalize(from_path).map_err(|exc| {
+        Error::plain(format!(
+            "source repository at {} cannot be accessed, {exc}",
+            from_path.display()
+        ))
+    })?;
+    let source_str = canonical_src
+        .to_str()
+        .ok_or_else(|| {
+            Error::plain(format!(
+                "source repository path at {} is not valid UTF-8 and cannot be recorded in {}",
+                canonical_src.display(),
+                CONFIG_NAME
+            ))
+        })?
+        .to_string();
+    let bare = git_result(
+        git,
+        &canonical_src,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "rev-parse",
+            "--is-bare-repository",
+        ],
+    )?;
+    if bare.code != 0 {
+        return Err(Error::plain(format!(
+            "source path at {} is not a git repository",
+            canonical_src.display()
+        )));
+    }
+    if bare.stdout.trim() == "true" {
+        let git_dir_out = git_result(
+            git,
+            &canonical_src,
+            &["-c", "core.quotePath=false", "rev-parse", "--git-dir"],
+        )?;
+        if git_dir_out.code != 0 {
+            return Err(Error::plain(format!(
+                "source path at {} is not a git repository",
+                canonical_src.display()
+            )));
+        }
+        let raw_dir = PathBuf::from(OsStr::from_bytes(trim_line_endings(
+            &git_dir_out.stdout_bytes,
+        )));
+        let actual_dir = if raw_dir.is_absolute() {
+            raw_dir
+        } else {
+            canonical_src.join(raw_dir)
+        };
+        if resolve_path(&actual_dir) != resolve_path(&canonical_src) {
+            return Err(Error::plain(format!(
+                "source path at {} is not a git repository root",
+                canonical_src.display()
+            )));
+        }
+    } else {
+        let top = git_result(
+            git,
+            &canonical_src,
+            &["-c", "core.quotePath=false", "rev-parse", "--show-toplevel"],
+        )?;
+        if top.code != 0 {
+            return Err(Error::plain(format!(
+                "source path at {} is not a git repository",
+                canonical_src.display()
+            )));
+        }
+        let top_path = Path::new(OsStr::from_bytes(trim_line_endings(&top.stdout_bytes)));
+        if resolve_path(top_path) != resolve_path(&canonical_src) {
+            return Err(Error::plain(format!(
+                "source path at {} is inside {}, pass the repository root instead",
+                canonical_src.display(),
+                top_path.display()
+            )));
+        }
+    }
+    let any_ref = git_result(
+        git,
+        &canonical_src,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(objectname)",
+            "refs/heads/",
+            "refs/remotes/origin/",
+        ],
+    )?;
+    let head_commit = git_result(
+        git,
+        &canonical_src,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )?;
+    if any_ref.stdout.trim().is_empty() && head_commit.code != 0 {
+        return Err(Error::plain(format!(
+            "source repository at {} has no commits",
+            canonical_src.display()
+        )));
+    }
+    let (base_branch, origin) = match explicit_branch {
+        Some(branch) => {
+            let local_check = git_result(
+                git,
+                &canonical_src,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}^{{commit}}"),
+                ],
+            )?;
+            if local_check.code == 0 {
+                (branch.to_string(), SourceBranchOrigin::LocalHead)
+            } else {
+                let remote_check = git_result(
+                    git,
+                    &canonical_src,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/remotes/origin/{branch}^{{commit}}"),
+                    ],
+                )?;
+                if remote_check.code == 0 {
+                    (branch.to_string(), SourceBranchOrigin::RemoteOrigin)
+                } else {
+                    return Err(Error::plain(format!(
+                        "branch {branch} does not exist in source repository at {}",
+                        canonical_src.display()
+                    )));
+                }
+            }
+        }
+        None => {
+            let sym = git_result(git, &canonical_src, &["symbolic-ref", "--quiet", "HEAD"])?;
+            if sym.code != 0 {
+                return Err(Error::plain(format!(
+                    "source repository at {} has a detached HEAD, pass --branch to name a base branch",
+                    canonical_src.display()
+                )));
+            }
+            let raw_ref =
+                std::str::from_utf8(trim_line_endings(&sym.stdout_bytes)).map_err(|_| {
+                    Error::plain(format!(
+                        "source repository at {} has a non-UTF-8 HEAD reference",
+                        canonical_src.display()
+                    ))
+                })?;
+            let Some(short) = raw_ref.strip_prefix("refs/heads/") else {
+                return Err(Error::plain(format!(
+                    "source repository at {} has an unsupported HEAD reference {raw_ref}",
+                    canonical_src.display()
+                )));
+            };
+            validate_base_branch(short)?;
+            let check = git_result(
+                git,
+                &canonical_src,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{short}^{{commit}}"),
+                ],
+            )?;
+            if check.code != 0 {
+                return Err(Error::plain(format!(
+                    "branch {short} has no commits in source repository at {}, pass --branch to name a committed branch",
+                    canonical_src.display()
+                )));
+            }
+            (short.to_string(), SourceBranchOrigin::LocalHead)
+        }
+    };
+    Ok((canonical_src, base_branch, source_str, origin))
+}
+
+fn init_stack_with_options_and_git(
+    stack: &Path,
+    port_start: i128,
+    range_size: i128,
+    range_count: i128,
+    options: &InitOptions,
     git: &dyn GitRunner,
 ) -> Result<Pool> {
     let stack = resolve_path(stack);
@@ -2023,6 +2616,17 @@ fn init_stack_with(
         Some(end) if end <= 65535 => {}
         _ => return Err(Error::plain("the port pool reaches past port 65535")),
     }
+    if let Some(branch) = &options.branch {
+        validate_base_branch(branch)?;
+    }
+    let source_plan = match &options.from_repo {
+        Some(from_path) => Some(inspect_source_repo(
+            from_path,
+            options.branch.as_deref(),
+            git,
+        )?),
+        None => None,
+    };
     // Every pool number is positive and the pool ends at or before
     // port 65535, so each number fits the recorded width exactly.
     let pool = Pool {
@@ -2034,8 +2638,10 @@ fn init_stack_with(
     let worktrees = stack.join(WORKTREES_NAME);
     let lock_path = stack.join(LOCK_NAME);
     let registry = stack.join(REGISTRY_NAME);
+    let config_path = stack.join(CONFIG_NAME);
     let watched: Vec<PathBuf> = vec![
         registry,
+        config_path.clone(),
         lock_path.clone(),
         repo.clone(),
         worktrees.clone(),
@@ -2055,7 +2661,7 @@ fn init_stack_with(
     // and a failed attempt removes the claim with the rest of
     // what it created, because the snapshot above predates the
     // claim and names the lock path among the created.
-    let stack_preexisting = preexisting[4];
+    let stack_preexisting = preexisting[5];
     fs::create_dir_all(&stack).map_err(|exc| {
         Error::plain(format!(
             "the stack at {} cannot be created, {exc}",
@@ -2103,6 +2709,15 @@ fn init_stack_with(
             let _ = fs::remove_dir(&stack);
         }
     };
+    if config_path.exists() || config_path.symlink_metadata().is_ok() {
+        drop_claim();
+        return Err(Error::plain(format!(
+            "init refuses the stack at {} because {} already exists, \
+             so nothing was changed",
+            stack.display(),
+            config_path.display()
+        )));
+    }
     if repo.exists() || repo.symlink_metadata().is_ok() {
         drop_claim();
         return Err(Error::plain(format!(
@@ -2124,35 +2739,286 @@ fn init_stack_with(
     }
     let attempt = (|| -> Result<Pool> {
         fs::create_dir_all(&worktrees).map_err(|exc| Error::Io(exc.to_string()))?;
-        fs::create_dir_all(&repo).map_err(|exc| Error::Io(exc.to_string()))?;
-        git_checked(
-            git,
-            &stack,
-            &[
-                OsStr::new("init"),
-                OsStr::new("-q"),
-                OsStr::new("-b"),
-                OsStr::new("main"),
-                repo.as_os_str(),
-            ],
-        )?;
-        git_checked(
-            git,
-            &repo,
-            &["config", "user.email", "switchyard@example.invalid"],
-        )?;
-        git_checked(git, &repo, &["config", "user.name", "switchyard"])?;
-        fs::write(
-            repo.join("README.md"),
-            "Synthetic stack repository created by switchyard init.\n",
-        )
-        .map_err(|exc| Error::Io(exc.to_string()))?;
-        git_checked(git, &repo, &["add", "README.md"])?;
-        git_checked(
-            git,
-            &repo,
-            &["commit", "-q", "-m", "Initialise the stack repository"],
-        )?;
+        if let Some((canonical_src, base_branch, source_str, branch_origin)) = source_plan {
+            use std::os::unix::ffi::OsStringExt;
+            let tmp_hooks = stack.join(format!(".tmp-init-hooks-{}", random_suffix()));
+            fs::create_dir(&tmp_hooks).map_err(|exc| Error::Io(exc.to_string()))?;
+            let clone_and_detach = (|| -> Result<()> {
+                let mut hooks_cfg = b"core.hooksPath=".to_vec();
+                hooks_cfg.extend_from_slice(tmp_hooks.as_os_str().as_bytes());
+                let hooks_cfg_os = std::ffi::OsString::from_vec(hooks_cfg);
+                let mut template_arg = b"--template=".to_vec();
+                template_arg.extend_from_slice(tmp_hooks.as_os_str().as_bytes());
+                let template_arg_os = std::ffi::OsString::from_vec(template_arg);
+                git_checked(
+                    git,
+                    &stack,
+                    &[
+                        OsStr::new("-c"),
+                        OsStr::new("protocol.file.allow=always"),
+                        OsStr::new("-c"),
+                        OsStr::new("protocol.allow=never"),
+                        OsStr::new("-c"),
+                        hooks_cfg_os.as_os_str(),
+                        OsStr::new("clone"),
+                        OsStr::new("--no-hardlinks"),
+                        OsStr::new("--no-checkout"),
+                        template_arg_os.as_os_str(),
+                        canonical_src.as_os_str(),
+                        repo.as_os_str(),
+                    ],
+                )?;
+                match branch_origin {
+                    SourceBranchOrigin::RemoteOrigin => {
+                        git_checked(
+                            git,
+                            &repo,
+                            &[
+                                OsStr::new("-c"),
+                                OsStr::new("protocol.file.allow=always"),
+                                OsStr::new("-c"),
+                                OsStr::new("protocol.allow=never"),
+                                OsStr::new("-c"),
+                                hooks_cfg_os.as_os_str(),
+                                OsStr::new("fetch"),
+                                OsStr::new("-q"),
+                                OsStr::new("--no-tags"),
+                                canonical_src.as_os_str(),
+                                OsStr::new(&format!(
+                                    "+refs/remotes/origin/{base_branch}:refs/heads/{base_branch}"
+                                )),
+                            ],
+                        )?;
+                    }
+                    SourceBranchOrigin::LocalHead => {
+                        let local_base = git_result(
+                            git,
+                            &repo,
+                            &[
+                                "show-ref",
+                                "--verify",
+                                "--quiet",
+                                &format!("refs/heads/{base_branch}"),
+                            ],
+                        )?;
+                        if local_base.code != 0 {
+                            git_checked(
+                                git,
+                                &repo,
+                                &[
+                                    OsStr::new("-c"),
+                                    hooks_cfg_os.as_os_str(),
+                                    OsStr::new("branch"),
+                                    OsStr::new("--"),
+                                    OsStr::new(&base_branch),
+                                    OsStr::new(&format!("refs/remotes/origin/{base_branch}")),
+                                ],
+                            )?;
+                        }
+                    }
+                }
+                let filter_out = git_result(
+                    git,
+                    &repo,
+                    &[
+                        "config",
+                        "--name-only",
+                        "--get-regexp",
+                        r"^filter\..*\.(smudge|process|required)$",
+                    ],
+                )?;
+                if filter_out.code != 0
+                    && !(filter_out.code == 1 && filter_out.stdout.trim().is_empty())
+                {
+                    return Err(Error::plain(format!(
+                        "git config --name-only --get-regexp failed with exit {}, {}",
+                        filter_out.code,
+                        git_detail(&filter_out)
+                    )));
+                }
+                if filter_out.code == 0 {
+                    let mut filter_names = BTreeSet::new();
+                    for raw_line in filter_out.stdout.lines() {
+                        let key = raw_line.trim_end_matches(&['\r', '\n'][..]);
+                        let Some(after_prefix) = key.strip_prefix("filter.") else {
+                            continue;
+                        };
+                        for suffix in [".smudge", ".process", ".required"] {
+                            if let Some(name) = after_prefix.strip_suffix(suffix) {
+                                if !name.is_empty() {
+                                    filter_names.insert(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                    for name in filter_names {
+                        git_checked(
+                            git,
+                            &repo,
+                            &["config", &format!("filter.{name}.smudge"), ""],
+                        )?;
+                        git_checked(
+                            git,
+                            &repo,
+                            &["config", &format!("filter.{name}.process"), ""],
+                        )?;
+                        git_checked(
+                            git,
+                            &repo,
+                            &["config", &format!("filter.{name}.required"), "false"],
+                        )?;
+                    }
+                }
+                git_checked(
+                    git,
+                    &repo,
+                    &[
+                        OsStr::new("-c"),
+                        hooks_cfg_os.as_os_str(),
+                        OsStr::new("checkout"),
+                        OsStr::new("-q"),
+                        OsStr::new("--detach"),
+                        OsStr::new(&format!("refs/heads/{base_branch}")),
+                    ],
+                )?;
+                Ok(())
+            })();
+            let _ = fs::remove_dir_all(&tmp_hooks);
+            clone_and_detach?;
+            let empty_hooks = repo.join(EMPTY_HOOKS_NAME);
+            if empty_hooks.exists() || empty_hooks.symlink_metadata().is_ok() {
+                return Err(Error::plain(format!(
+                    "source repository tracks reserved path {}, which switchyard reserves for hook isolation",
+                    EMPTY_HOOKS_NAME
+                )));
+            }
+            fs::create_dir(&empty_hooks).map_err(|exc| Error::Io(exc.to_string()))?;
+            let canonical_hooks =
+                fs::canonicalize(&empty_hooks).map_err(|exc| Error::Io(exc.to_string()))?;
+            git_checked(
+                git,
+                &repo,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("core.hooksPath"),
+                    canonical_hooks.as_os_str(),
+                ],
+            )?;
+            if git_result(git, &repo, &["remote", "get-url", "origin"])?.code == 0 {
+                git_checked(git, &repo, &["remote", "remove", "origin"])?;
+            }
+            let all_refs = git_checked(
+                git,
+                &repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/remotes/",
+                    "refs/heads/",
+                ],
+            )?;
+            for refname in all_refs
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                let should_delete = refname.starts_with("refs/remotes/")
+                    || refname
+                        .strip_prefix("refs/heads/")
+                        .is_some_and(is_switchyard_branch_name);
+                if should_delete {
+                    git_checked(git, &repo, &["update-ref", "-d", refname])?;
+                }
+            }
+            save_config(
+                &stack,
+                &StackConfig {
+                    version: CONFIG_VERSION,
+                    base_branch,
+                    source_repo: Some(source_str),
+                    probe_ports: false,
+                },
+            )?;
+        } else if let Some(base_branch) = &options.branch {
+            fs::create_dir_all(&repo).map_err(|exc| Error::Io(exc.to_string()))?;
+            git_checked(
+                git,
+                &stack,
+                &[
+                    OsStr::new("init"),
+                    OsStr::new("-q"),
+                    OsStr::new("-b"),
+                    OsStr::new(base_branch),
+                    repo.as_os_str(),
+                ],
+            )?;
+            git_checked(
+                git,
+                &repo,
+                &["config", "user.email", "switchyard@example.invalid"],
+            )?;
+            git_checked(git, &repo, &["config", "user.name", "switchyard"])?;
+            fs::write(
+                repo.join("README.md"),
+                "Synthetic stack repository created by switchyard init.\n",
+            )
+            .map_err(|exc| Error::Io(exc.to_string()))?;
+            git_checked(git, &repo, &["add", "README.md"])?;
+            git_checked(
+                git,
+                &repo,
+                &["commit", "-q", "-m", "Initialise the stack repository"],
+            )?;
+            git_checked(
+                git,
+                &repo,
+                &[
+                    "checkout",
+                    "-q",
+                    "--detach",
+                    &format!("refs/heads/{base_branch}"),
+                ],
+            )?;
+            save_config(
+                &stack,
+                &StackConfig {
+                    version: CONFIG_VERSION,
+                    base_branch: base_branch.clone(),
+                    source_repo: None,
+                    probe_ports: false,
+                },
+            )?;
+        } else {
+            fs::create_dir_all(&repo).map_err(|exc| Error::Io(exc.to_string()))?;
+            git_checked(
+                git,
+                &stack,
+                &[
+                    OsStr::new("init"),
+                    OsStr::new("-q"),
+                    OsStr::new("-b"),
+                    OsStr::new("main"),
+                    repo.as_os_str(),
+                ],
+            )?;
+            git_checked(
+                git,
+                &repo,
+                &["config", "user.email", "switchyard@example.invalid"],
+            )?;
+            git_checked(git, &repo, &["config", "user.name", "switchyard"])?;
+            fs::write(
+                repo.join("README.md"),
+                "Synthetic stack repository created by switchyard init.\n",
+            )
+            .map_err(|exc| Error::Io(exc.to_string()))?;
+            git_checked(git, &repo, &["add", "README.md"])?;
+            git_checked(
+                git,
+                &repo,
+                &["commit", "-q", "-m", "Initialise the stack repository"],
+            )?;
+        }
         fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -2283,12 +3149,53 @@ fn env_text(record: &Record) -> String {
 
 fn write_env_file(stack: &Path, env_rel: &str, record: &Record) -> Result<()> {
     let path = stack.join(env_rel);
-    fs::write(&path, env_text(record)).map_err(|exc| {
+    if let Ok(meta) = path.symlink_metadata() {
+        if !meta.file_type().is_file() {
+            return Err(Error::plain(format!(
+                "the env file at {} cannot be written because a non-regular entry already stands there",
+                path.display()
+            )));
+        }
+    }
+    let Some(parent) = path.parent() else {
+        return Err(Error::plain(format!(
+            "the env file at {} has no parent directory",
+            path.display()
+        )));
+    };
+    let text = env_text(record);
+    let fail = |exc: io::Error| {
         Error::plain(format!(
             "the env file at {} cannot be written, {exc}",
             path.display()
         ))
-    })
+    };
+    let mut attempt = 0;
+    let (tmp, mut file) = loop {
+        attempt += 1;
+        let candidate = parent.join(format!(".tmp-env-{}", random_suffix()));
+        use std::os::unix::fs::OpenOptionsExt;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(exc) if exc.kind() == io::ErrorKind::AlreadyExists && attempt < 8 => continue,
+            Err(exc) => return Err(fail(exc)),
+        }
+    };
+    let staged = (|| -> io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        drop(file);
+        fs::rename(&tmp, &path)
+    })();
+    if let Err(exc) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(fail(exc));
+    }
+    Ok(())
 }
 
 fn require_committed_head(git: &dyn GitRunner, repo: &Path) -> Result<()> {
@@ -2393,11 +3300,15 @@ pub fn claim(stack: &Path, agent: &str) -> Result<Record> {
 /// repository verified. The standing claim check stands apart
 /// because the third phase of a routed claim records that refusal
 /// before it returns it, where the other shapes return it bare.
-fn claim_prologue(stack: &Path, git: &dyn GitRunner) -> Result<(Locked, Registry)> {
+fn claim_prologue(
+    stack: &Path,
+    git: &dyn GitRunner,
+) -> Result<(Locked, Registry, Option<StackConfig>)> {
     let lock = locked(stack)?;
     let data = load_registry(stack)?;
+    let config = load_config(stack)?;
     verify_own_repo(git, stack)?;
-    Ok((lock, data))
+    Ok((lock, data, config))
 }
 
 /// The refusal of a claim whose agent already holds a claim in
@@ -2458,7 +3369,8 @@ fn claim_with(
 ) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
-    let (lock, mut data) = claim_prologue(&stack, git)?;
+    let (lock, mut data, config) = claim_prologue(&stack, git)?;
+    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     refuse_standing_position(&data, agent)?;
@@ -2466,6 +3378,7 @@ fn claim_with(
         stack: &stack,
         agent,
         draw: 1,
+        base_branch: &base_branch,
         data,
         lock: &lock,
         git,
@@ -2483,6 +3396,7 @@ struct AllocParts<'a> {
     stack: &'a Path,
     agent: &'a str,
     draw: i64,
+    base_branch: &'a str,
     data: Registry,
     lock: &'a Locked,
     git: &'a dyn GitRunner,
@@ -2546,6 +3460,7 @@ fn furnish_claim(
     stack: &Path,
     agent: &str,
     draw: i64,
+    base_branch: &str,
     claimed_at: &str,
     git: &dyn GitRunner,
 ) -> Result<Furnished> {
@@ -2581,6 +3496,20 @@ fn furnish_claim(
     let branch_preexisted = listed.code == 0 && !listed.stdout.trim().is_empty();
     let attempt = (|| -> Result<()> {
         require_committed_head(git, &repo)?;
+        if branch_preexisted {
+            return Err(Error::plain(format!(
+                "branch {branch} already exists in the stack repository, \
+                 delete or merge it before claiming {agent} again"
+            )));
+        }
+        let base_ref = format!("refs/heads/{base_branch}");
+        let base_check = git_result(git, &repo, &["rev-parse", "--verify", "--quiet", &base_ref])?;
+        if base_check.code != 0 {
+            return Err(Error::plain(format!(
+                "base branch {base_branch} does not exist in the stack repository at {}",
+                repo.display()
+            )));
+        }
         git_checked(
             git,
             &repo,
@@ -2590,6 +3519,7 @@ fn furnish_claim(
                 OsStr::new("-b"),
                 OsStr::new(&branch),
                 worktree.as_os_str(),
+                OsStr::new(&base_ref),
             ],
         )?;
         git_checked(
@@ -2633,6 +3563,7 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
         stack,
         agent,
         draw,
+        base_branch,
         mut data,
         lock,
         git,
@@ -2641,7 +3572,7 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
         expired,
         instant,
     } = parts;
-    let furnished = furnish_claim(&mut data, stack, agent, draw, &instant, git)?;
+    let furnished = furnish_claim(&mut data, stack, agent, draw, base_branch, &instant, git)?;
     let attempt = (|| -> Result<()> {
         append_leavings(stack, &instant, "expired", &expired, None)?;
         if let Some(line) = routing {
@@ -2718,6 +3649,7 @@ fn serve_offers(
     data: &mut Registry,
     stack: &Path,
     instant: &str,
+    base_branch: &str,
     git: &dyn GitRunner,
 ) -> Result<OfferOutcome> {
     let mut furnished: Vec<Wait> = Vec::new();
@@ -2729,7 +3661,7 @@ fn serve_offers(
         if free_run(data, draw).is_none() {
             continue;
         }
-        let done = match furnish_claim(data, stack, &wait.agent, draw, instant, git) {
+        let done = match furnish_claim(data, stack, &wait.agent, draw, base_branch, instant, git) {
             Ok(done) => done,
             Err(exc) => {
                 failures.push(FurnishingFailure {
@@ -2783,6 +3715,248 @@ fn rollback_offers(git: &dyn GitRunner, stack: &Path, offers: &[Furnished], exc:
     }
 }
 
+fn porcelain_z_has_non_env_entries(bytes: &[u8], include_ignored: bool) -> bool {
+    let mut at = 0;
+    while at < bytes.len() {
+        let Some(nul_offset) = bytes[at..].iter().position(|&b| b == 0) else {
+            return true;
+        };
+        let entry = &bytes[at..at + nul_offset];
+        at += nul_offset + 1;
+        if entry.len() < 4 || entry[2] != b' ' {
+            return true;
+        }
+        let x = entry[0];
+        let y = entry[1];
+        let path = &entry[3..];
+        if x == b'R' || x == b'C' {
+            return true;
+        }
+        let is_benign_env = path == ENV_NAME.as_bytes()
+            && (matches!((x, y), (b'?', b'?') | (b' ', b'M'))
+                || (include_ignored && (x, y) == (b'!', b'!')));
+        if !is_benign_env {
+            return true;
+        }
+    }
+    false
+}
+
+fn worktree_belongs_to_repo(git: &dyn GitRunner, worktree: &Path, repo: &Path) -> bool {
+    if !worktree
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_dir())
+    {
+        return false;
+    }
+    if !worktree
+        .join(".git")
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_file())
+    {
+        return false;
+    }
+    let Ok(top) = git_result(
+        git,
+        worktree,
+        &["-c", "core.quotePath=false", "rev-parse", "--show-toplevel"],
+    ) else {
+        return false;
+    };
+    if top.code != 0 {
+        return false;
+    }
+    let top_path = Path::new(OsStr::from_bytes(trim_line_endings(&top.stdout_bytes)));
+    if resolve_path(top_path) != resolve_path(worktree) {
+        return false;
+    }
+    let Ok(git_dir_out) = git_result(
+        git,
+        worktree,
+        &["-c", "core.quotePath=false", "rev-parse", "--git-dir"],
+    ) else {
+        return false;
+    };
+    if git_dir_out.code != 0 {
+        return false;
+    }
+    let printed_git_dir = PathBuf::from(OsStr::from_bytes(trim_line_endings(
+        &git_dir_out.stdout_bytes,
+    )));
+    let git_dir = resolve_path(&if printed_git_dir.is_absolute() {
+        printed_git_dir
+    } else {
+        worktree.join(printed_git_dir)
+    });
+    let Ok(common) = git_result(
+        git,
+        worktree,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "rev-parse",
+            "--git-common-dir",
+        ],
+    ) else {
+        return false;
+    };
+    if common.code != 0 {
+        return false;
+    }
+    let printed_common = PathBuf::from(OsStr::from_bytes(trim_line_endings(&common.stdout_bytes)));
+    let common_dir = resolve_path(&if printed_common.is_absolute() {
+        printed_common
+    } else {
+        worktree.join(printed_common)
+    });
+    git_dir != common_dir && common_dir == resolve_path(&repo.join(".git"))
+}
+
+fn collect_nested_git_dirs(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = fs::read_dir(dir).map_err(|exc| {
+        Error::plain(format!(
+            "worktree directory at {} cannot be read, {exc}",
+            dir.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|exc| {
+            Error::plain(format!(
+                "worktree directory at {} cannot be read, {exc}",
+                dir.display()
+            ))
+        })?;
+        let name = entry.file_name();
+        let path = entry.path();
+        if dir == root && name == OsStr::new(".git") {
+            continue;
+        }
+        if name == OsStr::new(".git") {
+            if let Ok(rel_parent) = dir.strip_prefix(root) {
+                out.push(rel_parent.to_path_buf());
+            }
+            continue;
+        }
+        let meta = path.symlink_metadata().map_err(|exc| {
+            Error::plain(format!(
+                "worktree entry at {} cannot be inspected, {exc}",
+                path.display()
+            ))
+        })?;
+        if meta.file_type().is_dir() {
+            collect_nested_git_dirs(&path, root, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn tracked_gitlinks(git: &dyn GitRunner, worktree: &Path) -> Result<BTreeSet<PathBuf>> {
+    let out = git_result(git, worktree, &["ls-files", "--stage", "-z"])?;
+    if out.code != 0 {
+        return Err(Error::plain(format!(
+            "git ls-files in {} failed with exit {}, {}",
+            worktree.display(),
+            out.code,
+            git_detail(&out)
+        )));
+    }
+    let mut links = BTreeSet::new();
+    for entry in out.stdout_bytes.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(tab) = entry.iter().position(|&b| b == b'\t') {
+            if entry[..tab].starts_with(b"160000 ") {
+                links.insert(PathBuf::from(OsStr::from_bytes(&entry[tab + 1..])));
+            }
+        }
+    }
+    Ok(links)
+}
+
+fn worktree_has_unsaved_changes(
+    git: &dyn GitRunner,
+    worktree: &Path,
+    include_ignored: bool,
+) -> Result<bool> {
+    let status_args: &[&str] = if include_ignored {
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "-uall",
+            "--ignore-submodules=none",
+            "--ignored=matching",
+        ]
+    } else {
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "-uall",
+            "--ignore-submodules=none",
+        ]
+    };
+    let out = git_result(git, worktree, status_args)?;
+    if out.code != 0 {
+        return Err(Error::plain(format!(
+            "git status in {} failed with exit {}, {}",
+            worktree.display(),
+            out.code,
+            git_detail(&out)
+        )));
+    }
+    if porcelain_z_has_non_env_entries(&out.stdout_bytes, include_ignored) {
+        return Ok(true);
+    }
+    let mut nested = Vec::new();
+    collect_nested_git_dirs(worktree, worktree, &mut nested)?;
+    if !nested.is_empty() {
+        let gitlinks = tracked_gitlinks(git, worktree)?;
+        for rel in nested {
+            if !gitlinks.contains(&rel) {
+                return Ok(true);
+            }
+            let sub = worktree.join(&rel);
+            let head = git_result(git, &sub, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+            if head.code != 0 {
+                return Ok(true);
+            }
+            let sub_status = git_result(git, &sub, status_args)?;
+            if sub_status.code != 0 || !sub_status.stdout_bytes.is_empty() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn commits_ahead_of_base_oid(
+    git: &dyn GitRunner,
+    repo: &Path,
+    base_branch: &str,
+    target_rev: &str,
+) -> Result<u64> {
+    let range = format!("refs/heads/{base_branch}..{target_rev}");
+    let out = git_checked(git, repo, &["rev-list", "--count", &range])?;
+    out.trim().parse::<u64>().map_err(|exc| {
+        Error::plain(format!(
+            "git rev-list --count {range} returned an unreadable count, {exc}"
+        ))
+    })
+}
+
+fn commits_ahead_of_base(
+    git: &dyn GitRunner,
+    repo: &Path,
+    base_branch: &str,
+    branch: &str,
+) -> Result<u64> {
+    commits_ahead_of_base_oid(git, repo, base_branch, &format!("refs/heads/{branch}"))
+}
+
 /// Return every resource a claim holds and remove its record, or
 /// cancel the wait of an agent who holds only a wait, under
 /// obligations SY-21 and SY-22. The sweep of expired waits stands
@@ -2791,6 +3965,19 @@ fn rollback_offers(git: &dyn GitRunner, stack: &Path, offers: &[Furnished], exc:
 /// offer the release makes publish in the one rename.
 pub fn release(stack: &Path, agent: &str) -> Result<ReleaseOutcome> {
     release_with(stack, agent, &ProcessGit, &save_registry)
+}
+
+/// Release an agent with optional `--keep-branch` and `--safe`
+/// modes, under obligation SY-28.
+pub fn release_with_options(
+    stack: &Path,
+    agent: &str,
+    options: ReleaseOptions,
+) -> Result<ReleaseOutcome> {
+    Ok(
+        release_report_with_options_and_git(stack, agent, options, &ProcessGit, &save_registry)?
+            .outcome,
+    )
 }
 
 fn release_with(
@@ -2811,6 +3998,9 @@ fn release_with(
 pub struct ReleaseReport {
     /// The outcome the plain release returns.
     pub outcome: ReleaseOutcome,
+    /// Whether `--keep-branch` stood and `refs/heads/<branch>`
+    /// stands in `<stack>/repo` at release completion.
+    pub branch_kept: bool,
     /// The waits the offers skipped because furnishing them
     /// failed, in offer order.
     pub furnishing_failures: Vec<FurnishingFailure>,
@@ -2825,9 +4015,30 @@ pub fn release_report(stack: &Path, agent: &str) -> Result<ReleaseReport> {
     release_report_with(stack, agent, &ProcessGit, &save_registry)
 }
 
+/// Release an agent with optional `--keep-branch` and `--safe`
+/// modes and return the full `ReleaseReport`, under obligations
+/// SY-25 and SY-28.
+pub fn release_report_with_options(
+    stack: &Path,
+    agent: &str,
+    options: ReleaseOptions,
+) -> Result<ReleaseReport> {
+    release_report_with_options_and_git(stack, agent, options, &ProcessGit, &save_registry)
+}
+
 fn release_report_with(
     stack: &Path,
     agent: &str,
+    git: &dyn GitRunner,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ReleaseReport> {
+    release_report_with_options_and_git(stack, agent, ReleaseOptions::default(), git, saver)
+}
+
+fn release_report_with_options_and_git(
+    stack: &Path,
+    agent: &str,
+    options: ReleaseOptions,
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ReleaseReport> {
@@ -2836,11 +4047,59 @@ fn release_report_with(
     let repo = stack.join(REPO_NAME);
     let lock = locked(&stack)?;
     let mut data = load_registry(&stack)?;
+    let config = load_config(&stack)?;
     verify_own_repo(git, &stack)?;
+    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     if let Some(record) = data.claims.get(agent).cloned() {
         let worktree = stack.join(&record.worktree);
+        if options.safe {
+            if !worktree_belongs_to_repo(git, &worktree, &repo) {
+                return Err(Error::plain(format!(
+                    "safe release of {agent} refused, worktree at {} is missing or invalid",
+                    worktree.display()
+                )));
+            }
+            let expected_ref = format!("refs/heads/{}", record.branch);
+            let sym = git_result(git, &worktree, &["symbolic-ref", "--quiet", "HEAD"])?;
+            let sym_ref = std::str::from_utf8(trim_line_endings(&sym.stdout_bytes)).ok();
+            if sym.code != 0 || sym_ref != Some(expected_ref.as_str()) {
+                return Err(Error::plain(format!(
+                    "safe release of {agent} refused, worktree at {} is not on branch {}",
+                    worktree.display(),
+                    record.branch
+                )));
+            }
+            let branch_check = git_result(
+                git,
+                &repo,
+                &["rev-parse", "--verify", "--quiet", &expected_ref],
+            )?;
+            if branch_check.code != 0 {
+                return Err(Error::plain(format!(
+                    "safe release of {agent} refused, branch {} does not resolve in {}",
+                    record.branch,
+                    repo.display()
+                )));
+            }
+            if worktree_has_unsaved_changes(git, &worktree, false)? {
+                return Err(Error::plain(format!(
+                    "safe release of {agent} refused, worktree at {} has uncommitted or untracked changes",
+                    worktree.display()
+                )));
+            }
+            if !options.keep_branch {
+                let ahead = commits_ahead_of_base(git, &repo, &base_branch, &record.branch)?;
+                if ahead > 0 {
+                    let noun = if ahead == 1 { "commit" } else { "commits" };
+                    return Err(Error::plain(format!(
+                        "safe release of {agent} refused, branch {} has {ahead} unmerged {noun} ahead of {base_branch}, pass --keep-branch to preserve the branch",
+                        record.branch
+                    )));
+                }
+            }
+        }
         if worktree.exists() {
             git_checked(
                 git,
@@ -2855,12 +4114,19 @@ fn release_report_with(
         } else {
             git_checked(git, &repo, &["worktree", "prune"])?;
         }
-        let listed = git_checked(git, &repo, &["branch", "--list", &record.branch])?;
-        if !listed.trim().is_empty() {
-            git_checked(git, &repo, &["branch", "-D", &record.branch])?;
-        }
+        let branch_kept = if options.keep_branch {
+            let full_ref = format!("refs/heads/{}", record.branch);
+            git_result(git, &repo, &["rev-parse", "--verify", "--quiet", &full_ref])?.code == 0
+        } else {
+            let listed = git_checked(git, &repo, &["branch", "--list", &record.branch])?;
+            if !listed.trim().is_empty() {
+                git_checked(git, &repo, &["branch", "-D", &record.branch])?;
+            }
+            false
+        };
         data.claims.remove(agent);
-        let (furnished, spans, offers, failures) = serve_offers(&mut data, &stack, &instant, git)?;
+        let (furnished, spans, offers, failures) =
+            serve_offers(&mut data, &stack, &instant, &base_branch, git)?;
         let published = (|| -> Result<()> {
             append_leavings(&stack, &instant, "expired", &expired, None)?;
             append_leavings(&stack, &instant, "furnished", &furnished, Some(&spans))?;
@@ -2873,6 +4139,7 @@ fn release_report_with(
         }
         return Ok(ReleaseReport {
             outcome: ReleaseOutcome::Claim(record),
+            branch_kept,
             furnishing_failures: failures,
         });
     }
@@ -2890,12 +4157,504 @@ fn release_report_with(
         saver(&stack, &data)?;
         return Ok(ReleaseReport {
             outcome: ReleaseOutcome::Wait(wait),
+            branch_kept: false,
             furnishing_failures: Vec::new(),
         });
     }
     Err(Error::plain(format!(
         "agent {agent} holds no claim in this stack"
     )))
+}
+
+fn prunable_worktrees(git: &dyn GitRunner, repo: &Path) -> Result<Vec<PathBuf>> {
+    let out = git_result(git, repo, &["worktree", "list", "--porcelain", "-z"])?;
+    if out.code != 0 {
+        return Err(Error::plain(format!(
+            "git worktree list --porcelain -z failed with exit {}, {}",
+            out.code,
+            git_detail(&out)
+        )));
+    }
+    let mut prunable = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_prunable = false;
+    for field in out.stdout_bytes.split(|&b| b == 0) {
+        if field.is_empty() {
+            if let Some(path) = current_path.take() {
+                if current_prunable {
+                    prunable.push(path);
+                }
+            }
+            current_prunable = false;
+            continue;
+        }
+        if let Some(rest) = field.strip_prefix(b"worktree ") {
+            current_path = Some(PathBuf::from(OsStr::from_bytes(rest)));
+        } else if field == b"prunable" || field.starts_with(b"prunable ") {
+            current_prunable = true;
+        }
+    }
+    if let Some(path) = current_path {
+        if current_prunable {
+            prunable.push(path);
+        }
+    }
+    Ok(prunable)
+}
+
+fn checked_out_switchyard_branches(git: &dyn GitRunner, repo: &Path) -> Result<BTreeSet<String>> {
+    let out = git_result(git, repo, &["worktree", "list", "--porcelain", "-z"])?;
+    if out.code != 0 {
+        return Err(Error::plain(format!(
+            "git worktree list --porcelain -z failed with exit {}, {}",
+            out.code,
+            git_detail(&out)
+        )));
+    }
+    let mut branches = BTreeSet::new();
+    let mut current_branch: Option<String> = None;
+    let mut current_prunable = false;
+    for field in out.stdout_bytes.split(|&b| b == 0) {
+        if field.is_empty() {
+            if let Some(branch) = current_branch.take() {
+                if !current_prunable {
+                    branches.insert(branch);
+                }
+            }
+            current_prunable = false;
+            continue;
+        }
+        if let Some(rest) = field.strip_prefix(b"branch refs/heads/") {
+            if let Ok(short) = std::str::from_utf8(rest) {
+                if short.starts_with("switchyard/") {
+                    current_branch = Some(short.to_string());
+                }
+            }
+        } else if field == b"prunable" || field.starts_with(b"prunable ") {
+            current_prunable = true;
+        }
+    }
+    if let Some(branch) = current_branch {
+        if !current_prunable {
+            branches.insert(branch);
+        }
+    }
+    Ok(branches)
+}
+
+fn prune_targeted_orphan_worktrees(
+    repo: &Path,
+    orphan_set: &BTreeSet<PathBuf>,
+    active_set: &BTreeSet<PathBuf>,
+) {
+    let admin_root = repo.join(".git").join("worktrees");
+    let Ok(entries) = fs::read_dir(&admin_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let admin_dir = entry.path();
+        if !admin_dir
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_dir())
+        {
+            continue;
+        }
+        if admin_dir.join("locked").symlink_metadata().is_ok() {
+            continue;
+        }
+        let Ok(raw_bytes) = fs::read(admin_dir.join("gitdir")) else {
+            continue;
+        };
+        let raw_path = PathBuf::from(OsStr::from_bytes(trim_line_endings(&raw_bytes)));
+        let full_gitdir = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            admin_dir.join(raw_path)
+        };
+        let Some(wt_dir) = full_gitdir.parent() else {
+            continue;
+        };
+        let resolved_wt = resolve_path(wt_dir);
+        if orphan_set.contains(&resolved_wt)
+            && !active_set.contains(&resolved_wt)
+            && !resolved_wt.exists()
+        {
+            let _ = fs::remove_dir_all(&admin_dir);
+        }
+    }
+}
+
+fn orphan_worktree_head_is_safe(
+    git: &dyn GitRunner,
+    worktree: &Path,
+    repo: &Path,
+    base_branch: &str,
+) -> bool {
+    let Ok(head) = git_result(git, worktree, &["rev-parse", "--verify", "--quiet", "HEAD"]) else {
+        return false;
+    };
+    if head.code != 0 {
+        return false;
+    }
+    if let Ok(sym) = git_result(git, worktree, &["symbolic-ref", "--quiet", "HEAD"]) {
+        if sym.code == 0 {
+            if let Ok(sym_ref) = std::str::from_utf8(trim_line_endings(&sym.stdout_bytes)) {
+                if let Some(sub) = sym_ref.strip_prefix("refs/heads/switchyard/") {
+                    if !sub.is_empty()
+                        && git_result(git, repo, &["rev-parse", "--verify", "--quiet", sym_ref])
+                            .is_ok_and(|res| res.code == 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    let range = format!("refs/heads/{base_branch}..HEAD");
+    match git_result(git, worktree, &["rev-list", "--count", &range]) {
+        Ok(out) if out.code == 0 => out.stdout.trim().parse::<u64>() == Ok(0),
+        _ => false,
+    }
+}
+
+fn is_stale_temp_name(name: &str) -> bool {
+    name.starts_with(".tmp-")
+        || name.starts_with(&format!("{REGISTRY_NAME}.tmp-"))
+        || name.starts_with(&format!("{CONFIG_NAME}.tmp-"))
+}
+
+fn dir_is_empty(path: &Path) -> bool {
+    match fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => false,
+    }
+}
+
+/// Audit stack health under `switchyard.lock` and optionally repair
+/// clean orphan residue when `fix` is true, under obligation SY-29.
+pub fn doctor(stack: &Path, fix: bool) -> Result<DoctorReport> {
+    doctor_with(stack, fix, &ProcessGit)
+}
+
+fn doctor_with(stack: &Path, fix: bool, git: &dyn GitRunner) -> Result<DoctorReport> {
+    let stack = resolve_path(stack);
+    let lock = locked_for_doctor(&stack, fix)?;
+    let data = load_registry(&stack)?;
+    let config = load_config(&stack)?;
+    verify_own_repo(git, &stack)?;
+    let repo = stack.join(REPO_NAME);
+    require_committed_head(git, &repo)?;
+    let base_branch = effective_base_branch(config.as_ref());
+    let base_ref = format!("refs/heads/{base_branch}");
+    let base_check = git_result(git, &repo, &["rev-parse", "--verify", "--quiet", &base_ref])?;
+    if base_check.code != 0 {
+        return Err(Error::plain(format!(
+            "base branch {base_branch} does not exist in the stack repository at {}",
+            repo.display()
+        )));
+    }
+    if fix {
+        if let Some(held) = &lock {
+            held.verify_current()?;
+        }
+    }
+
+    let mut issues: Vec<DoctorIssue> = Vec::new();
+    let mut kept_branches: Vec<String> = Vec::new();
+    let repo_resolved = resolve_path(&repo);
+    let active_worktree_paths: BTreeSet<PathBuf> = data
+        .claims
+        .values()
+        .map(|record| resolve_path(&stack.join(&record.worktree)))
+        .collect();
+
+    // 1. missing_worktree: active claims whose worktree directory does not exist.
+    for (agent, record) in &data.claims {
+        if !stack.join(&record.worktree).is_dir() {
+            issues.push(DoctorIssue {
+                kind: "missing_worktree".to_string(),
+                target: record.worktree.clone(),
+                detail: format!(
+                    "active claim {agent} is missing worktree directory {}",
+                    record.worktree
+                ),
+                fixed: false,
+            });
+        }
+    }
+
+    // 2. prunable_worktree: stale prunable git worktree entries for no active claim.
+    let all_prunable = prunable_worktrees(git, &repo)?;
+    let any_active_prunable = all_prunable
+        .iter()
+        .any(|wt_path| active_worktree_paths.contains(&resolve_path(wt_path)));
+    let mut orphan_prunable: Vec<(String, PathBuf)> = all_prunable
+        .into_iter()
+        .filter_map(|wt_path| {
+            let resolved = resolve_path(&wt_path);
+            if resolved == repo_resolved || active_worktree_paths.contains(&resolved) {
+                return None;
+            }
+            let target = match resolved.strip_prefix(&stack) {
+                Ok(rel) => rel.to_string_lossy().into_owned(),
+                Err(_) => wt_path.to_string_lossy().into_owned(),
+            };
+            Some((target, resolved))
+        })
+        .collect();
+    orphan_prunable.sort_by(|a, b| a.0.cmp(&b.0));
+    if !orphan_prunable.is_empty() {
+        let orphan_set: BTreeSet<PathBuf> =
+            orphan_prunable.iter().map(|(_, p)| p.clone()).collect();
+        let remaining_prunable: BTreeSet<PathBuf> = if fix {
+            if any_active_prunable {
+                prune_targeted_orphan_worktrees(&repo, &orphan_set, &active_worktree_paths);
+            } else {
+                let _ = git_result(git, &repo, &["worktree", "prune"])?;
+            }
+            prunable_worktrees(git, &repo)?
+                .into_iter()
+                .map(|p| resolve_path(&p))
+                .collect()
+        } else {
+            orphan_set
+        };
+        for (target, resolved) in orphan_prunable {
+            let was_fixed = fix && !remaining_prunable.contains(&resolved);
+            issues.push(DoctorIssue {
+                kind: "prunable_worktree".to_string(),
+                target: target.clone(),
+                detail: format!("stale prunable git worktree entry for {target}"),
+                fixed: was_fixed,
+            });
+        }
+    }
+
+    // 3. orphan_worktree_dir / dirty_orphan_worktree under <stack>/worktrees.
+    let worktrees_root = stack.join(WORKTREES_NAME);
+    if worktrees_root.is_dir() {
+        let mut entries: Vec<fs::DirEntry> = fs::read_dir(&worktrees_root)
+            .map_err(|exc| {
+                Error::plain(format!(
+                    "worktrees directory at {} cannot be read, {exc}",
+                    worktrees_root.display()
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|exc| {
+                Error::plain(format!(
+                    "worktrees directory at {} cannot be read, {exc}",
+                    worktrees_root.display()
+                ))
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if data.claims.contains_key(&name) {
+                continue;
+            }
+            let rel_target = format!("{WORKTREES_NAME}/{name}");
+            let entry_path = entry.path();
+            let Ok(meta) = entry_path.symlink_metadata() else {
+                continue;
+            };
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                if worktree_belongs_to_repo(git, &entry_path, &repo) {
+                    match worktree_has_unsaved_changes(git, &entry_path, true) {
+                        Ok(false)
+                            if orphan_worktree_head_is_safe(
+                                git,
+                                &entry_path,
+                                &repo,
+                                base_branch,
+                            ) =>
+                        {
+                            let mut was_fixed = false;
+                            if fix {
+                                let removed = git_result(
+                                    git,
+                                    &repo,
+                                    &[
+                                        OsStr::new("worktree"),
+                                        OsStr::new("remove"),
+                                        OsStr::new("--force"),
+                                        entry_path.as_os_str(),
+                                    ],
+                                )?;
+                                if removed.code == 0 {
+                                    was_fixed = true;
+                                }
+                            }
+                            issues.push(DoctorIssue {
+                                kind: "orphan_worktree_dir".to_string(),
+                                target: rel_target.clone(),
+                                detail: format!(
+                                    "unclaimed clean worktree directory at {rel_target}"
+                                ),
+                                fixed: was_fixed,
+                            });
+                        }
+                        Ok(false) => {
+                            issues.push(DoctorIssue {
+                                kind: "dirty_orphan_worktree".to_string(),
+                                target: rel_target.clone(),
+                                detail: format!(
+                                    "unclaimed worktree directory at {rel_target} holds detached or unreferenced commits ahead of {base_branch}"
+                                ),
+                                fixed: false,
+                            });
+                        }
+                        Ok(true) | Err(_) => {
+                            issues.push(DoctorIssue {
+                                kind: "dirty_orphan_worktree".to_string(),
+                                target: rel_target.clone(),
+                                detail: format!(
+                                    "unclaimed worktree directory at {rel_target} holds uncommitted, untracked, or ignored changes"
+                                ),
+                                fixed: false,
+                            });
+                        }
+                    }
+                } else if entry_path.join(".git").symlink_metadata().is_err()
+                    && dir_is_empty(&entry_path)
+                {
+                    let was_fixed = fix && fs::remove_dir(&entry_path).is_ok();
+                    issues.push(DoctorIssue {
+                        kind: "orphan_worktree_dir".to_string(),
+                        target: rel_target.clone(),
+                        detail: format!("unclaimed empty worktree directory at {rel_target}"),
+                        fixed: was_fixed,
+                    });
+                } else {
+                    issues.push(DoctorIssue {
+                        kind: "dirty_orphan_worktree".to_string(),
+                        target: rel_target.clone(),
+                        detail: format!(
+                            "unclaimed directory at {rel_target} holds untracked files"
+                        ),
+                        fixed: false,
+                    });
+                }
+            } else {
+                issues.push(DoctorIssue {
+                    kind: "dirty_orphan_worktree".to_string(),
+                    target: rel_target.clone(),
+                    detail: format!("unclaimed entry at {rel_target}"),
+                    fixed: false,
+                });
+            }
+        }
+    }
+
+    // 4. orphan_branch (0 ahead of base_branch) vs kept_branch (> 0 ahead of base_branch).
+    let checked_out_branches = if fix {
+        checked_out_switchyard_branches(git, &repo)?
+    } else {
+        BTreeSet::new()
+    };
+    let refs_out = git_checked(
+        git,
+        &repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/switchyard/",
+        ],
+    )?;
+    let mut switchyard_branches: Vec<String> = refs_out
+        .lines()
+        .filter_map(|line| {
+            line.trim_end_matches(&['\r', '\n'][..])
+                .strip_prefix("refs/heads/")
+                .map(str::to_string)
+        })
+        .collect();
+    switchyard_branches.sort();
+    let claimed_branches: BTreeSet<&str> = data
+        .claims
+        .values()
+        .map(|record| record.branch.as_str())
+        .collect();
+    for short_branch in switchyard_branches {
+        if claimed_branches.contains(short_branch.as_str()) {
+            continue;
+        }
+        let full_ref = format!("refs/heads/{short_branch}");
+        let rev_out = git_result(git, &repo, &["rev-parse", "--verify", "--quiet", &full_ref])?;
+        if rev_out.code != 0 {
+            continue;
+        }
+        let oid = String::from_utf8_lossy(trim_line_endings(&rev_out.stdout_bytes)).into_owned();
+        let ahead = commits_ahead_of_base_oid(git, &repo, base_branch, &oid)?;
+        if ahead > 0 {
+            kept_branches.push(short_branch);
+        } else {
+            let mut was_fixed = false;
+            if fix && !checked_out_branches.contains(short_branch.as_str()) {
+                let deleted = git_result(git, &repo, &["update-ref", "-d", &full_ref, &oid])?;
+                if deleted.code == 0 {
+                    was_fixed = true;
+                }
+            }
+            issues.push(DoctorIssue {
+                kind: "orphan_branch".to_string(),
+                target: short_branch.clone(),
+                detail: format!(
+                    "unclaimed branch {short_branch} has 0 commits ahead of {base_branch}"
+                ),
+                fixed: was_fixed,
+            });
+        }
+    }
+
+    // 5. stale_temp_file: any .tmp-* entry in <stack> while holding switchyard.lock.
+    let mut stack_entries: Vec<fs::DirEntry> = fs::read_dir(&stack)
+        .map_err(|exc| {
+            Error::plain(format!(
+                "stack directory at {} cannot be read, {exc}",
+                stack.display()
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|exc| {
+            Error::plain(format!(
+                "stack directory at {} cannot be read, {exc}",
+                stack.display()
+            ))
+        })?;
+    stack_entries.sort_by_key(|entry| entry.file_name());
+    for entry in stack_entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_stale_temp_name(&name) {
+            continue;
+        }
+        let entry_path = entry.path();
+        let mut was_fixed = false;
+        if fix {
+            if let Ok(meta) = entry_path.symlink_metadata() {
+                let ft = meta.file_type();
+                if (ft.is_file() || ft.is_symlink()) && fs::remove_file(&entry_path).is_ok() {
+                    was_fixed = true;
+                }
+            }
+        }
+        issues.push(DoctorIssue {
+            kind: "stale_temp_file".to_string(),
+            target: name.clone(),
+            detail: format!("stale temporary file {name} in stack root"),
+            fixed: was_fixed,
+        });
+    }
+
+    let _ = &lock;
+    let fixed_count = issues.iter().filter(|issue| issue.fixed).count();
+    let ok = issues.iter().all(|issue| issue.fixed);
+    Ok(DoctorReport {
+        ok,
+        fixed: fixed_count,
+        issues,
+        kept_branches,
+    })
 }
 
 /// The standing waits in offer order, derived only from the
@@ -2905,6 +4664,7 @@ fn release_report_with(
 pub fn list_waits(stack: &Path) -> Result<Vec<Wait>> {
     let stack = resolve_path(stack);
     let data = load_registry(&stack)?;
+    let _ = load_config(&stack)?;
     Ok(offer_order(&data.waits))
 }
 
@@ -2933,6 +4693,7 @@ pub fn offer_order(waits: &[Wait]) -> Vec<Wait> {
 pub fn list_claims(stack: &Path) -> Result<Vec<Record>> {
     let stack = resolve_path(stack);
     let data = load_registry(&stack)?;
+    let _ = load_config(&stack)?;
     Ok(data.claims.values().cloned().collect())
 }
 
@@ -3903,7 +5664,8 @@ fn claim_profile_with(
 ) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
-    let (lock, mut data) = claim_prologue(&stack, git)?;
+    let (lock, mut data, config) = claim_prologue(&stack, git)?;
+    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     refuse_standing_position(&data, agent)?;
@@ -3911,6 +5673,7 @@ fn claim_profile_with(
         stack: &stack,
         agent,
         draw: profile.draw(),
+        base_branch: &base_branch,
         data,
         lock: &lock,
         git,
@@ -3992,7 +5755,7 @@ fn claim_routed_with(
     validate_agent_name(agent)?;
     let model = transport.map(|_| ROUTING_MODEL.to_string());
     {
-        let (lock, mut data) = claim_prologue(&stack, git)?;
+        let (lock, mut data, _config) = claim_prologue(&stack, git)?;
         let _ = sweep_expired(&mut data, &now_stamp());
         refuse_standing_position(&data, agent)?;
         validate_description(description)?;
@@ -4028,6 +5791,7 @@ fn claim_routed_with(
             return Err(exc);
         }
     };
+    let config = load_config(&stack)?;
     if let Err(exc) = verify_own_repo(git, &stack) {
         refuse_after_consultation(
             &stack,
@@ -4041,6 +5805,7 @@ fn claim_routed_with(
         )?;
         return Err(exc);
     }
+    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
@@ -4084,6 +5849,7 @@ fn claim_routed_with(
         stack: &stack,
         agent,
         draw: settled.draw(),
+        base_branch: &base_branch,
         data,
         lock: &lock,
         git,
@@ -4303,6 +6069,7 @@ fn waiting_phase(
             return Err(exc);
         }
     };
+    let config = load_config(stack)?;
     if let Err(exc) = verify_own_repo(git, stack) {
         if let Some(routed) = routed {
             refuse_after_consultation(
@@ -4318,6 +6085,7 @@ fn waiting_phase(
         }
         return Err(exc);
     }
+    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     if let Err(exc) = refuse_standing_position(&data, agent) {
@@ -4359,6 +6127,7 @@ fn waiting_phase(
             stack,
             agent,
             draw,
+            base_branch: &base_branch,
             data,
             lock: &lock,
             git,
@@ -4475,7 +6244,7 @@ fn claim_routed_waiting_with(
     let model = transport.map(|_| ROUTING_MODEL.to_string());
     let mut pre_settled: Option<Profile> = None;
     {
-        let (_lock, mut data) = claim_prologue(&stack, git)?;
+        let (_lock, mut data, _config) = claim_prologue(&stack, git)?;
         let instant = now_stamp();
         let _ = sweep_expired(&mut data, &instant);
         refuse_standing_position(&data, agent)?;

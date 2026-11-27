@@ -18,9 +18,11 @@ use std::path::PathBuf;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyOverflowError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict};
+use pyo3::types::{PyBool, PyDict, PyList};
 
-use switchyard_core::{ClaimOutcome, Error, Record, ReleaseOutcome, Wait};
+use switchyard_core::{
+    ClaimOutcome, DoctorReport, Error, InitOptions, Record, ReleaseOptions, ReleaseOutcome, Wait,
+};
 
 create_exception!(switchyard, SwitchyardError, pyo3::exceptions::PyException);
 create_exception!(switchyard, RefusalError, SwitchyardError);
@@ -158,13 +160,15 @@ fn pool_argument(value: Option<&Bound<'_, PyAny>>, name: &str, default: i64) -> 
 /// pool arguments stand keyword-only, so no caller can place
 /// one in another's slot by position.
 #[pyfunction]
-#[pyo3(signature = (stack, *, port_start = None, range_size = None, range_count = None))]
+#[pyo3(signature = (stack, *, port_start = None, range_size = None, range_count = None, from_repo = None, branch = None))]
 fn init(
     py: Python<'_>,
     stack: PathBuf,
     port_start: Option<Bound<'_, PyAny>>,
     range_size: Option<Bound<'_, PyAny>>,
     range_count: Option<Bound<'_, PyAny>>,
+    from_repo: Option<PathBuf>,
+    branch: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let port_start = pool_argument(
         port_start.as_ref(),
@@ -181,8 +185,17 @@ fn init(
         "range_count",
         switchyard_core::DEFAULT_RANGE_COUNT,
     )?;
+    let options = InitOptions { from_repo, branch };
     let pool = py
-        .detach(|| switchyard_core::init_stack(&stack, port_start, range_size, range_count))
+        .detach(|| {
+            switchyard_core::init_stack_with_options(
+                &stack,
+                port_start,
+                range_size,
+                range_count,
+                &options,
+            )
+        })
         .map_err(to_py_error)?;
     let dict = PyDict::new(py);
     dict.set_item("port_start", pool.start)?;
@@ -377,16 +390,56 @@ fn claim_routed(
 /// Return every resource the agent holds in the stack at the
 /// given path and remove its record. Where the agent holds only
 /// a wait, the release cancels the wait and returns the wait
-/// record, under obligation SY-22.
+/// record, under obligation SY-22. Keyword-only `keep_branch`
+/// and `safe` flags expose the non-destructive workflows of
+/// obligation SY-28.
 #[pyfunction]
-fn release(py: Python<'_>, stack: PathBuf, agent: &str) -> PyResult<Py<PyDict>> {
+#[pyo3(signature = (stack, agent, *, keep_branch = false, safe = false))]
+fn release(
+    py: Python<'_>,
+    stack: PathBuf,
+    agent: &str,
+    keep_branch: bool,
+    safe: bool,
+) -> PyResult<Py<PyDict>> {
+    let options = ReleaseOptions { keep_branch, safe };
     let outcome = py
-        .detach(|| switchyard_core::release(&stack, agent))
+        .detach(|| switchyard_core::release_with_options(&stack, agent, options))
         .map_err(to_py_error)?;
     match &outcome {
         ReleaseOutcome::Claim(record) => record_dict(py, record),
         ReleaseOutcome::Wait(wait) => wait_dict(py, wait),
     }
+}
+
+fn doctor_dict(py: Python<'_>, report: &DoctorReport) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("ok", report.ok)?;
+    dict.set_item("fixed", report.fixed)?;
+    let issues = PyList::empty(py);
+    for issue in &report.issues {
+        let item = PyDict::new(py);
+        item.set_item("kind", &issue.kind)?;
+        item.set_item("target", &issue.target)?;
+        item.set_item("detail", &issue.detail)?;
+        item.set_item("fixed", issue.fixed)?;
+        issues.append(item)?;
+    }
+    dict.set_item("issues", issues)?;
+    dict.set_item("kept_branches", &report.kept_branches)?;
+    Ok(dict.unbind())
+}
+
+/// Audit stack health under `switchyard.lock` and optionally
+/// repair clean orphan residue when `fix` is True, under
+/// obligation SY-29.
+#[pyfunction]
+#[pyo3(signature = (stack, *, fix = false))]
+fn doctor(py: Python<'_>, stack: PathBuf, fix: bool) -> PyResult<Py<PyDict>> {
+    let report = py
+        .detach(|| switchyard_core::doctor(&stack, fix))
+        .map_err(to_py_error)?;
+    doctor_dict(py, &report)
 }
 
 /// List the recorded claims of the stack at the given path,
@@ -431,6 +484,7 @@ fn _switchyard(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(claim_profile, m)?)?;
     m.add_function(wrap_pyfunction!(claim_routed, m)?)?;
     m.add_function(wrap_pyfunction!(release, m)?)?;
+    m.add_function(wrap_pyfunction!(doctor, m)?)?;
     m.add_function(wrap_pyfunction!(list_claims, m)?)?;
     m.add_function(wrap_pyfunction!(queue, m)?)?;
     Ok(())
