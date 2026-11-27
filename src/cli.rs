@@ -1355,4 +1355,48 @@ mod tests {
         };
         assert!(error.contains("not valid UTF-8"), "{error}");
     }
+
+    #[test]
+    fn parse_preserves_non_utf8_bytes_for_env_template() {
+        let raw_tpl = OsString::from_vec(b"/tmp/tpl-\xff.env".to_vec());
+        let args = vec![
+            OsString::from("init"),
+            OsString::from("--stack"),
+            OsString::from("/tmp/stack"),
+            OsString::from("--env-template"),
+            raw_tpl.clone(),
+            OsString::from("--probe-ports"),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let parsed = match parse(&args, &mut out, &mut err).unwrap() {
+            Parsed::Run(parsed) => parsed,
+            Parsed::Exit(code) => panic!("unexpected exit {code}"),
+        };
+        assert!(parsed.probe_ports);
+        assert_eq!(
+            parsed.env_template.as_ref().map(|p| p.as_os_str()),
+            Some(raw_tpl.as_os_str())
+        );
+
+        let inline_args = vec![
+            OsString::from("init"),
+            OsString::from("--stack"),
+            OsString::from("/tmp/stack"),
+            OsString::from_vec(b"--env-template=/tmp/inline-tpl-\xff.env".to_vec()),
+        ];
+        let parsed_inline = match parse(&inline_args, &mut out, &mut err).unwrap() {
+            Parsed::Run(parsed) => parsed,
+            Parsed::Exit(code) => panic!("unexpected exit {code}"),
+        };
+        assert_eq!(
+            parsed_inline
+                .env_template
+                .as_ref()
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"/tmp/inline-tpl-\xff.env"
+        );
+    }
 }

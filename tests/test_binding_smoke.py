@@ -607,3 +607,319 @@ def test_safe_release_keep_branch_and_doctor_through_the_binding(tmp_path):
         switchyard.list(stack)
     with pytest.raises(switchyard.CorruptRegistryError):
         switchyard.doctor(stack)
+
+
+def _find_free_loopback_block(total_ports, start_hint=38000):
+    import errno
+    import socket
+
+    port = start_hint
+    while port + total_ports < 62000:
+        ok = True
+        for offset in range(total_ports):
+            candidate = port + offset
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s4:
+                s4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s4.bind(("127.0.0.1", candidate))
+                except OSError:
+                    ok = False
+                    break
+            try:
+                s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            except OSError:
+                continue
+            with s6:
+                s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s6.bind(("::1", candidate))
+                except OSError as exc:
+                    if exc.errno not in (
+                        errno.EADDRNOTAVAIL,
+                        errno.EAFNOSUPPORT,
+                        errno.EPROTONOSUPPORT,
+                    ):
+                        ok = False
+                        break
+        if ok:
+            return port
+        port += total_ports + 4
+    raise RuntimeError("could not locate free loopback port block")
+
+
+def test_probe_ports_across_init_and_claim_entrypoints_through_the_binding(tmp_path):
+    import json
+    import socket
+
+    stack = str(tmp_path / "stack")
+
+    with pytest.raises(TypeError):
+        switchyard.init(stack, probe_ports=1)
+    assert not (tmp_path / "stack").exists()
+
+    base = _find_free_loopback_block(16)
+    s4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s4.bind(("127.0.0.1", base + 2))
+    s4.listen(1)
+
+    s6 = None
+    try:
+        cand = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        cand.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        cand.bind(("::1", base + 5))
+        cand.listen(1)
+        s6 = cand
+    except OSError:
+        s6 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s6.bind(("127.0.0.1", base + 5))
+        s6.listen(1)
+
+    try:
+        switchyard.init(stack, port_start=base, range_size=4, range_count=4)
+
+        with pytest.raises(TypeError):
+            switchyard.claim(stack, "alpha", probe_ports=1)
+        with pytest.raises(TypeError):
+            switchyard.claim_profile(stack, "alpha", "lean", probe_ports="yes")
+        with pytest.raises(TypeError):
+            switchyard.claim_routed(
+                stack, "alpha", "Run one server.", "lean", probe_ports=1
+            )
+
+        alpha = switchyard.claim(stack, "alpha", probe_ports=True)
+        assert (alpha["port_start"], alpha["port_end"]) == (base + 8, base + 11)
+
+        beta = switchyard.claim_profile(stack, "beta", "lean", probe_ports=True)
+        assert (beta["port_start"], beta["port_end"]) == (base + 12, base + 15)
+
+        with pytest.raises(switchyard.RefusalError) as busy:
+            switchyard.claim_routed(
+                stack, "gamma", "Run one server.", "lean", probe_ports=True
+            )
+        assert "host loopback ports are occupied" in str(busy.value)
+
+        wait = switchyard.claim(stack, "waiter", wait=True, probe_ports=True)
+        assert wait["agent"] == "waiter"
+        assert wait["profile"] == "plain"
+
+        cfg_stack = str(tmp_path / "cfg_stack")
+        switchyard.init(
+            cfg_stack,
+            port_start=base,
+            range_size=4,
+            range_count=3,
+            probe_ports=True,
+        )
+        cfg = json.loads((tmp_path / "cfg_stack" / "switchyard-config.json").read_text())
+        assert cfg["probe_ports"] is True
+        auto = switchyard.claim(cfg_stack, "alpha")
+        assert (auto["port_start"], auto["port_end"]) == (base + 8, base + 11)
+    finally:
+        s4.close()
+        s6.close()
+
+
+def test_enriched_env_and_env_template_through_the_binding(tmp_path):
+    bad_tpl = tmp_path / "bad.tpl"
+    bad_tpl.write_text("SWITCHYARD_PORT_0=9999\n")
+    with pytest.raises(switchyard.RefusalError) as reserved:
+        switchyard.init(str(tmp_path / "bad_stack"), env_template=bad_tpl)
+    assert "SWITCHYARD_" in str(reserved.value)
+    assert not (tmp_path / "bad_stack").exists()
+
+    tpl = tmp_path / "good.tpl"
+    tpl.write_text(
+        "# custom app template\n"
+        "PORT={{port_3}}\n"
+        "APP_URL=http://127.0.0.1:{{port_1}}/{{agent}}\n"
+        "LOCAL_DB={{worktree_abs}}/state.sqlite\n"
+    )
+
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack, range_size=4, range_count=2, env_template=tpl)
+    rec = switchyard.claim(stack, "alpha")
+    assert (rec["port_start"], rec["port_end"]) == (20000, 20003)
+
+    wt = (tmp_path / "stack" / "worktrees" / "alpha").resolve()
+    env_lines = (wt / ".env.switchyard").read_text().splitlines()
+    assert env_lines[0] == "# Written by switchyard. This file dies with the worktree."
+    assert env_lines[1] == "SWITCHYARD_AGENT=alpha"
+    assert env_lines[6] == "PORT=20003"
+    assert f"SWITCHYARD_WORKTREE_ABS={wt}" in env_lines
+    assert "SWITCHYARD_PORT_COUNT=4" in env_lines
+    assert "SWITCHYARD_PORT_0=20000" in env_lines
+    assert "SWITCHYARD_PORT_3=20003" in env_lines
+    assert f"SQLITE_PATH={wt}/.switchyard.db" in env_lines
+    assert env_lines[-2] == "APP_URL=http://127.0.0.1:20001/alpha"
+    assert env_lines[-1] == f"LOCAL_DB={wt}/state.sqlite"
+
+
+def test_worktreeinclude_seeding_safe_release_and_doctor_through_the_binding(tmp_path):
+    import json
+    import subprocess
+
+    src = tmp_path / "src_repo"
+    src.mkdir()
+    subprocess.run(["git", "-C", str(src), "init", "-q", "-b", "main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(src), "config", "user.email", "py@example.invalid"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(src), "config", "user.name", "py"], check=True)
+    (src / ".gitignore").write_text(".env.local\n")
+    (src / "README.md").write_text("seed test\n")
+    subprocess.run(["git", "-C", str(src), "add", ".gitignore", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(src), "commit", "-q", "-m", "init"], check=True)
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n")
+    (src / "evil_link.env").symlink_to(outside)
+    (src / ".worktreeinclude").write_text("evil_link.env\n")
+    with pytest.raises(switchyard.RefusalError):
+        switchyard.init(str(tmp_path / "sym_stack"), from_repo=src)
+    assert not (tmp_path / "sym_stack").exists()
+    (src / "evil_link.env").unlink()
+
+    (src / ".env.local").write_text("API_KEY=synthetic\n")
+    (src / "nested").mkdir()
+    (src / "nested" / "seed.txt").write_text("seeded-body\n")
+    (src / ".worktreeinclude").write_text(".env.local\nnested/seed.txt\n")
+
+    stack = str(tmp_path / "stack")
+    switchyard.init(stack, from_repo=src)
+    cfg = json.loads((tmp_path / "stack" / "switchyard-config.json").read_text())
+    assert [entry["path"] for entry in cfg["seed_files"]] == [
+        ".env.local",
+        "nested/seed.txt",
+    ]
+
+    switchyard.claim(stack, "alpha")
+    alpha_wt = tmp_path / "stack" / "worktrees" / "alpha"
+    assert (alpha_wt / ".env.local").read_text() == "API_KEY=synthetic\n"
+    assert (alpha_wt / "nested" / "seed.txt").read_text() == "seeded-body\n"
+
+    released = switchyard.release(stack, "alpha", safe=True)
+    assert released["agent"] == "alpha"
+
+    switchyard.claim(stack, "clean-orphan")
+    switchyard.claim(stack, "dirty-orphan")
+    dirty_wt = tmp_path / "stack" / "worktrees" / "dirty-orphan"
+    (dirty_wt / ".env.local").write_text("API_KEY=edited\n")
+    with pytest.raises(switchyard.RefusalError):
+        switchyard.release(stack, "dirty-orphan", safe=True)
+
+    reg_path = tmp_path / "stack" / "switchyard-registry.json"
+    reg = json.loads(reg_path.read_text())
+    reg["claims"] = {}
+    reg_path.write_text(json.dumps(reg, indent=2) + "\n")
+
+    report = switchyard.doctor(stack, fix=True)
+    assert report["ok"] is False
+    by_target = {
+        item["target"]: (item["kind"], item["fixed"])
+        for item in report["issues"]
+        if item["target"].startswith("worktrees/")
+    }
+    assert by_target["worktrees/clean-orphan"] == ("orphan_worktree_dir", True)
+    assert by_target["worktrees/dirty-orphan"] == ("dirty_orphan_worktree", False)
+    assert not (tmp_path / "stack" / "worktrees" / "clean-orphan").exists()
+    assert (dirty_wt / ".env.local").read_text() == "API_KEY=edited\n"
+
+
+def test_s3_keyword_only_type_errors_and_corrupt_config_through_the_binding(tmp_path):
+    import inspect
+    import json
+
+    sig_init = inspect.signature(switchyard.init)
+    assert (
+        sig_init.parameters["probe_ports"].kind is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert sig_init.parameters["probe_ports"].default is False
+    assert (
+        sig_init.parameters["env_template"].kind is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert sig_init.parameters["env_template"].default is None
+
+    for fn in (
+        switchyard.claim,
+        switchyard.claim_profile,
+        switchyard.claim_routed,
+    ):
+        sig = inspect.signature(fn)
+        assert sig.parameters["probe_ports"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert sig.parameters["probe_ports"].default is False
+
+    class Truthy:
+        def __bool__(self):
+            return True
+
+    stack = str(tmp_path / "stack")
+
+    with pytest.raises(TypeError):
+        switchyard.init(stack, False)
+    with pytest.raises(TypeError):
+        switchyard.init(stack, probe_ports=None)
+    with pytest.raises(TypeError):
+        switchyard.init(stack, probe_ports=Truthy())
+    with pytest.raises(TypeError):
+        switchyard.init(stack, env_template=123)
+    assert not (tmp_path / "stack").exists()
+
+    switchyard.init(stack, probe_ports=True)
+
+    with pytest.raises(TypeError):
+        switchyard.claim(stack, "alpha", True)
+    with pytest.raises(TypeError):
+        switchyard.claim(stack, "alpha", probe_ports=Truthy())
+    with pytest.raises(TypeError):
+        switchyard.claim_profile(stack, "alpha", "lean", True)
+    with pytest.raises(TypeError):
+        switchyard.claim_profile(stack, "alpha", "lean", probe_ports=Truthy())
+    with pytest.raises(TypeError):
+        switchyard.claim_routed(
+            stack, "alpha", "Run one server.", "lean", True
+        )
+    with pytest.raises(TypeError):
+        switchyard.claim_routed(
+            stack, "alpha", "Run one server.", "lean", probe_ports=Truthy()
+        )
+
+    cfg_path = tmp_path / "stack" / "switchyard-config.json"
+    bad_configs = [
+        {
+            "base_branch": "main",
+            "env_template": [{"key": "APP_PORT", "template": "{port_0}"}],
+            "probe_ports": False,
+            "seed_files": [],
+            "source_repo": None,
+            "version": 1,
+        },
+        {
+            "base_branch": "main",
+            "env_template": [{"key": "SWITCHYARD_X", "template": "1"}],
+            "probe_ports": False,
+            "seed_files": [],
+            "source_repo": None,
+            "version": 1,
+        },
+        {
+            "base_branch": "main",
+            "env_template": None,
+            "probe_ports": False,
+            "seed_files": [
+                {"path": "Foo.env", "sha256": "a" * 64},
+                {"path": "foo.env", "sha256": "a" * 64},
+            ],
+            "source_repo": None,
+            "version": 1,
+        },
+    ]
+    for payload in bad_configs:
+        cfg_path.write_text(json.dumps(payload, indent=2) + "\n")
+        with pytest.raises(switchyard.CorruptRegistryError):
+            switchyard.list(stack)
+        with pytest.raises(switchyard.CorruptRegistryError):
+            switchyard.doctor(stack)
+

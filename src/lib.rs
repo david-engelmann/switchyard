@@ -9275,4 +9275,81 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn select_span_skips_probing_isolated_short_free_slots() {
+        use std::cell::RefCell;
+
+        struct RecordingProber {
+            probed: RefCell<Vec<u16>>,
+        }
+
+        impl PortProber for RecordingProber {
+            fn is_port_free(&self, port: u16) -> bool {
+                self.probed.borrow_mut().push(port);
+                true
+            }
+        }
+
+        let (dir, stack) = unit_stack("select-span-short-gap");
+        init_stack(&stack.join("sub"), 20_000, 4, 4).unwrap();
+        let sub = stack.join("sub");
+        // Occupy slot 1 (20004..=20007), leaving isolated 1-slot gap [0] and 2-slot run [2, 3].
+        let mut reg = load_registry(&sub).unwrap();
+        reg.claims.insert(
+            "holder".to_string(),
+            Record {
+                agent: "holder".to_string(),
+                branch: "switchyard/holder".to_string(),
+                worktree: "worktrees/holder".to_string(),
+                port_start: 20_004,
+                port_end: 20_007,
+                database: "switchyard_holder".to_string(),
+                env_file: "worktrees/holder/.env.switchyard".to_string(),
+                claimed_at: "2026-11-27T00:00:00+00:00".to_string(),
+            },
+        );
+        let prober = RecordingProber {
+            probed: RefCell::new(Vec::new()),
+        };
+        let span = select_span(&reg, 2, true, &prober).unwrap();
+        assert_eq!(span, (20_008, 20_015));
+        assert_eq!(
+            *prober.probed.borrow(),
+            (20_008..=20_015).collect::<Vec<u16>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ipv6_bind_error_means_disabled_distinguishes_disabled_family_from_in_use_errors() {
+        assert!(ipv6_bind_error_means_disabled(&io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "ipv6 loopback disabled"
+        )));
+        assert!(ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)
+        ));
+        assert!(ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EAFNOSUPPORT)
+        ));
+        assert!(ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EPROTONOSUPPORT)
+        ));
+
+        assert!(!ipv6_bind_error_means_disabled(&io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "port bound"
+        )));
+        assert!(!ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EADDRINUSE)
+        ));
+        assert!(!ipv6_bind_error_means_disabled(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "permission denied"
+        )));
+        assert!(!ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EACCES)
+        ));
+    }
 }
