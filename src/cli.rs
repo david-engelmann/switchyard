@@ -17,9 +17,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::{
-    active_child_group, claim, claim_profile, claim_profile_waiting, claim_routed,
-    claim_routed_waiting, claim_waiting, doctor, init_stack_with_options, list_claims, list_waits,
-    profile_named, release_report_with_options, resolve_path, ClaimOutcome, DoctorReport,
+    active_child_group, claim_profile_waiting_with_options, claim_profile_with_options,
+    claim_routed_waiting_with_options, claim_routed_with_options, claim_waiting_with_options,
+    claim_with_options, doctor, init_stack_with_options, list_claims, list_waits, profile_named,
+    release_report_with_options, resolve_path, ClaimOptions, ClaimOutcome, DoctorReport,
     InitOptions, JudgeTransport, Record, ReleaseOptions, ReleaseOutcome, Result, Wait,
     DEFAULT_PORT_START, DEFAULT_RANGE_COUNT, DEFAULT_RANGE_SIZE, JUDGE_TIMEOUT_SECONDS,
 };
@@ -51,6 +52,10 @@ init options:
                            the stack repository
   --branch NAME            base branch for claims, resolved from the
                            source HEAD by default or main without --from
+  --probe-ports            probe 127.0.0.1 and ::1 before allocating a
+                           port span, recorded in switchyard-config.json
+  --env-template FILE      validate and record KEY=TEMPLATE lines for
+                           .env.switchyard in switchyard-config.json
 
 claim options:
   --profile NAME           allocate under a declared profile, one of
@@ -70,6 +75,8 @@ claim options:
                            creating nothing and taking no port span
   --wait-for SECONDS       bound the wait by a positive number of
                            seconds, named beside --wait
+  --probe-ports            probe 127.0.0.1 and ::1 before allocating a
+                           port span for this claim
 
 list options:
   --queue                  print the standing waits in offer order
@@ -108,6 +115,8 @@ struct Args {
     range_count: i128,
     from_repo: Option<PathBuf>,
     branch: Option<OsString>,
+    probe_ports: bool,
+    env_template: Option<PathBuf>,
     describe: Option<String>,
     default_profile: Option<String>,
     profile: Option<String>,
@@ -206,6 +215,7 @@ fn is_known_claim_option(bytes: &[u8]) -> bool {
             | b"--judge-arg"
             | b"--wait"
             | b"--wait-for"
+            | b"--probe-ports"
     )
 }
 
@@ -240,6 +250,8 @@ fn parse(
     let mut range_count: i128 = DEFAULT_RANGE_COUNT as i128;
     let mut from_repo: Option<PathBuf> = None;
     let mut branch: Option<OsString> = None;
+    let mut probe_ports = false;
+    let mut env_template: Option<PathBuf> = None;
     let mut describe: Option<String> = None;
     let mut default_profile: Option<String> = None;
     let mut profile: Option<String> = None;
@@ -258,6 +270,11 @@ fn parse(
         let token = raw.to_string_lossy();
         if raw == "-h" || raw == "--help" {
             return Ok(print_help(out, err));
+        }
+        if raw == "--probe-ports" && (command == "init" || command == "claim") {
+            probe_ports = true;
+            index += 1;
+            continue;
         }
         if raw == "--wait" && command == "claim" {
             wait = true;
@@ -300,7 +317,13 @@ fn parse(
         };
         let known_option = matches!(
             option.as_str(),
-            "--stack" | "--port-start" | "--range-size" | "--range-count" | "--from" | "--branch"
+            "--stack"
+                | "--port-start"
+                | "--range-size"
+                | "--range-count"
+                | "--from"
+                | "--branch"
+                | "--env-template"
         ) && (option == "--stack" || command == "init")
             || matches!(
                 option.as_str(),
@@ -338,6 +361,7 @@ fn parse(
                 "--range-count" => range_count = int_option(&option, &value.to_string_lossy())?,
                 "--from" => from_repo = Some(PathBuf::from(value)),
                 "--branch" => branch = Some(value),
+                "--env-template" => env_template = Some(PathBuf::from(value)),
                 "--describe" => {
                     describe = Some(match value.into_string() {
                         Ok(text) => text,
@@ -444,6 +468,8 @@ fn parse(
         range_count,
         from_repo,
         branch,
+        probe_ports,
+        env_template,
         describe,
         default_profile,
         profile,
@@ -505,19 +531,20 @@ fn run_judge_command_within(
     timeout: Duration,
 ) -> std::result::Result<String, String> {
     let display = Path::new(program).display();
+    let deadline = Instant::now() + timeout;
     // The child leads a new process group, so the deadline below
     // can stop the whole group and not only the judge itself.
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
+        .process_group(0);
+    let mut child = crate::spawn_with_etxtbsy_retry(&mut command)
         .map_err(|exc| format!("the judge command {display} could not be started, {exc}"))?;
     let pid = child.id();
     let group_guard = crate::ActiveChildGuard::new(pid);
-    let deadline = Instant::now() + timeout;
     let mut stdin = child.stdin.take().unwrap();
     let payload = request.as_bytes().to_vec();
     let (writer_out, writer_in) = std::sync::mpsc::channel();
@@ -535,7 +562,8 @@ fn run_judge_command_within(
         let read = stdout.read_to_end(&mut bytes);
         let _ = reader_out.send((read, bytes));
     });
-    let status = match crate::await_child(child, timeout, &group_guard) {
+    let wait_budget = deadline.saturating_duration_since(Instant::now());
+    let status = match crate::await_child(child, wait_budget, &group_guard) {
         crate::ChildWait::Exited(status) => status,
         crate::ChildWait::TimedOut => {
             return Err(format!(
@@ -622,6 +650,9 @@ fn wait_bound(parsed: &Args) -> Option<i64> {
 /// recording a wait where it does not.
 fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<()> {
     let agent = parsed.agent.as_deref().unwrap();
+    let options = ClaimOptions {
+        probe_ports: parsed.probe_ports,
+    };
     let transport = parsed
         .judge_command
         .as_ref()
@@ -635,39 +666,48 @@ fn claim_from_args(stack: &Path, parsed: &Args, out: &mut dyn Write) -> Result<(
     if let Some(name) = &parsed.profile {
         let profile = profile_named(name)?;
         if parsed.wait {
-            let outcome =
-                claim_profile_waiting(stack, agent, profile, wait_bound(parsed), transport_ref)?;
+            let outcome = claim_profile_waiting_with_options(
+                stack,
+                agent,
+                profile,
+                wait_bound(parsed),
+                transport_ref,
+                options,
+            )?;
             print_outcome(out, &outcome).map_err(output_error)?;
             return Ok(());
         }
-        let record = claim_profile(stack, agent, profile)?;
+        let record = claim_profile_with_options(stack, agent, profile, options)?;
         print_claim(out, &record).map_err(output_error)?;
         return Ok(());
     }
     if let Some(description) = &parsed.describe {
         let default = profile_named(parsed.default_profile.as_deref().unwrap())?;
         if parsed.wait {
-            let outcome = claim_routed_waiting(
+            let outcome = claim_routed_waiting_with_options(
                 stack,
                 agent,
                 description,
                 default,
                 wait_bound(parsed),
                 transport_ref,
+                options,
             )?;
             print_outcome(out, &outcome).map_err(output_error)?;
             return Ok(());
         }
-        let record = claim_routed(stack, agent, description, default, transport_ref)?;
+        let record =
+            claim_routed_with_options(stack, agent, description, default, transport_ref, options)?;
         print_claim(out, &record).map_err(output_error)?;
         return Ok(());
     }
     if parsed.wait {
-        let outcome = claim_waiting(stack, agent, wait_bound(parsed), transport_ref)?;
+        let outcome =
+            claim_waiting_with_options(stack, agent, wait_bound(parsed), transport_ref, options)?;
         print_outcome(out, &outcome).map_err(output_error)?;
         return Ok(());
     }
-    let record = claim(stack, agent)?;
+    let record = claim_with_options(stack, agent, options)?;
     print_claim(out, &record).map_err(output_error)?;
     Ok(())
 }
@@ -843,6 +883,8 @@ fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             let options = InitOptions {
                 from_repo: parsed.from_repo,
                 branch,
+                probe_ports: parsed.probe_ports,
+                env_template: parsed.env_template,
             };
             init_stack_with_options(
                 &stack,
@@ -1312,5 +1354,49 @@ mod tests {
             Ok(_) => panic!("non UTF-8 describe must refuse"),
         };
         assert!(error.contains("not valid UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn parse_preserves_non_utf8_bytes_for_env_template() {
+        let raw_tpl = OsString::from_vec(b"/tmp/tpl-\xff.env".to_vec());
+        let args = vec![
+            OsString::from("init"),
+            OsString::from("--stack"),
+            OsString::from("/tmp/stack"),
+            OsString::from("--env-template"),
+            raw_tpl.clone(),
+            OsString::from("--probe-ports"),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let parsed = match parse(&args, &mut out, &mut err).unwrap() {
+            Parsed::Run(parsed) => parsed,
+            Parsed::Exit(code) => panic!("unexpected exit {code}"),
+        };
+        assert!(parsed.probe_ports);
+        assert_eq!(
+            parsed.env_template.as_ref().map(|p| p.as_os_str()),
+            Some(raw_tpl.as_os_str())
+        );
+
+        let inline_args = vec![
+            OsString::from("init"),
+            OsString::from("--stack"),
+            OsString::from("/tmp/stack"),
+            OsString::from_vec(b"--env-template=/tmp/inline-tpl-\xff.env".to_vec()),
+        ];
+        let parsed_inline = match parse(&inline_args, &mut out, &mut err).unwrap() {
+            Parsed::Run(parsed) => parsed,
+            Parsed::Exit(code) => panic!("unexpected exit {code}"),
+        };
+        assert_eq!(
+            parsed_inline
+                .env_template
+                .as_ref()
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"/tmp/inline-tpl-\xff.env"
+        );
     }
 }

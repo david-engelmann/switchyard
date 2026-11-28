@@ -21,7 +21,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList};
 
 use switchyard_core::{
-    ClaimOutcome, DoctorReport, Error, InitOptions, Record, ReleaseOptions, ReleaseOutcome, Wait,
+    ClaimOptions, ClaimOutcome, DoctorReport, Error, InitOptions, Record, ReleaseOptions,
+    ReleaseOutcome, Wait,
 };
 
 create_exception!(switchyard, SwitchyardError, pyo3::exceptions::PyException);
@@ -152,6 +153,18 @@ fn pool_argument(value: Option<&Bound<'_, PyAny>>, name: &str, default: i64) -> 
     }
 }
 
+fn default_false() -> Py<PyAny> {
+    Python::attach(|py| PyBool::new(py, false).to_owned().into_any().unbind())
+}
+
+fn bool_argument(py: Python<'_>, value: &Py<PyAny>, name: &str) -> PyResult<bool> {
+    let bound = value.bind(py);
+    if !bound.is_exact_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(format!("{name} must be a boolean")));
+    }
+    bound.extract::<bool>()
+}
+
 /// Create a stack at the given path and return its port pool.
 ///
 /// The pool arguments default to the values the library records
@@ -159,8 +172,22 @@ fn pool_argument(value: Option<&Bound<'_, PyAny>>, name: &str, default: i64) -> 
 /// DEFAULT_RANGE_COUNT, resolved from the library itself. The
 /// pool arguments stand keyword-only, so no caller can place
 /// one in another's slot by position.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (stack, *, port_start = None, range_size = None, range_count = None, from_repo = None, branch = None))]
+#[pyo3(
+    signature = (
+        stack,
+        *,
+        port_start = None,
+        range_size = None,
+        range_count = None,
+        from_repo = None,
+        branch = None,
+        probe_ports = default_false(),
+        env_template = None
+    ),
+    text_signature = "(stack, *, port_start=None, range_size=None, range_count=None, from_repo=None, branch=None, probe_ports=False, env_template=None)"
+)]
 fn init(
     py: Python<'_>,
     stack: PathBuf,
@@ -169,7 +196,10 @@ fn init(
     range_count: Option<Bound<'_, PyAny>>,
     from_repo: Option<PathBuf>,
     branch: Option<String>,
+    probe_ports: Py<PyAny>,
+    env_template: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
+    let probe_ports = bool_argument(py, &probe_ports, "probe_ports")?;
     let port_start = pool_argument(
         port_start.as_ref(),
         "port_start",
@@ -185,7 +215,12 @@ fn init(
         "range_count",
         switchyard_core::DEFAULT_RANGE_COUNT,
     )?;
-    let options = InitOptions { from_repo, branch };
+    let options = InitOptions {
+        from_repo,
+        branch,
+        probe_ports,
+        env_template,
+    };
     let pool = py
         .detach(|| {
             switchyard_core::init_stack_with_options(
@@ -216,7 +251,18 @@ fn init(
 /// arguments stand keyword-only, as in every claim function of
 /// this binding, so no caller can place one in another's slot.
 #[pyfunction]
-#[pyo3(signature = (stack, agent, *, wait = false, wait_for = None, transport = None))]
+#[pyo3(
+    signature = (
+        stack,
+        agent,
+        *,
+        wait = false,
+        wait_for = None,
+        transport = None,
+        probe_ports = default_false()
+    ),
+    text_signature = "(stack, agent, *, wait=False, wait_for=None, transport=None, probe_ports=False)"
+)]
 fn claim(
     py: Python<'_>,
     stack: PathBuf,
@@ -224,20 +270,31 @@ fn claim(
     wait: bool,
     wait_for: Option<Bound<'_, PyAny>>,
     transport: Option<Py<PyAny>>,
+    probe_ports: Py<PyAny>,
 ) -> PyResult<Py<PyDict>> {
+    let probe_ports = bool_argument(py, &probe_ports, "probe_ports")?;
     let bound = wait_bound(wait, wait_for.as_ref())?;
     if !wait && transport.is_some() {
         return Err(RefusalError::new_err("transport stands only beside wait"));
     }
+    let options = ClaimOptions { probe_ports };
     if !wait {
         let record = py
-            .detach(|| switchyard_core::claim(&stack, agent))
+            .detach(|| switchyard_core::claim_with_options(&stack, agent, options))
             .map_err(to_py_error)?;
         return record_dict(py, &record);
     }
     let transport = wrapped_transport(transport);
     let outcome = py
-        .detach(|| switchyard_core::claim_waiting(&stack, agent, bound, lent_transport(&transport)))
+        .detach(|| {
+            switchyard_core::claim_waiting_with_options(
+                &stack,
+                agent,
+                bound,
+                lent_transport(&transport),
+                options,
+            )
+        })
         .map_err(to_py_error)?;
     outcome_dict(py, &outcome)
 }
@@ -250,8 +307,21 @@ fn claim(
 /// claim with --wait waits. A transport supplied beside a claim
 /// that does not wait is refused by name, as in claim. The
 /// optional arguments stand keyword-only, as in claim.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (stack, agent, profile, *, wait = false, wait_for = None, transport = None))]
+#[pyo3(
+    signature = (
+        stack,
+        agent,
+        profile,
+        *,
+        wait = false,
+        wait_for = None,
+        transport = None,
+        probe_ports = default_false()
+    ),
+    text_signature = "(stack, agent, profile, *, wait=False, wait_for=None, transport=None, probe_ports=False)"
+)]
 fn claim_profile(
     py: Python<'_>,
     stack: PathBuf,
@@ -260,27 +330,31 @@ fn claim_profile(
     wait: bool,
     wait_for: Option<Bound<'_, PyAny>>,
     transport: Option<Py<PyAny>>,
+    probe_ports: Py<PyAny>,
 ) -> PyResult<Py<PyDict>> {
+    let probe_ports = bool_argument(py, &probe_ports, "probe_ports")?;
     let bound = wait_bound(wait, wait_for.as_ref())?;
     if !wait && transport.is_some() {
         return Err(RefusalError::new_err("transport stands only beside wait"));
     }
     let profile = switchyard_core::profile_named(profile).map_err(to_py_error)?;
+    let options = ClaimOptions { probe_ports };
     if !wait {
         let record = py
-            .detach(|| switchyard_core::claim_profile(&stack, agent, profile))
+            .detach(|| switchyard_core::claim_profile_with_options(&stack, agent, profile, options))
             .map_err(to_py_error)?;
         return record_dict(py, &record);
     }
     let transport = wrapped_transport(transport);
     let outcome = py
         .detach(|| {
-            switchyard_core::claim_profile_waiting(
+            switchyard_core::claim_profile_waiting_with_options(
                 &stack,
                 agent,
                 profile,
                 bound,
                 lent_transport(&transport),
+                options,
             )
         })
         .map_err(to_py_error)?;
@@ -344,7 +418,20 @@ fn lent_transport(
 /// binding, transport included, though it keeps its fifth place.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (stack, agent, description, default_profile, *, transport = None, wait = false, wait_for = None))]
+#[pyo3(
+    signature = (
+        stack,
+        agent,
+        description,
+        default_profile,
+        *,
+        transport = None,
+        wait = false,
+        wait_for = None,
+        probe_ports = default_false()
+    ),
+    text_signature = "(stack, agent, description, default_profile, *, transport=None, wait=False, wait_for=None, probe_ports=False)"
+)]
 fn claim_routed(
     py: Python<'_>,
     stack: PathBuf,
@@ -354,20 +441,24 @@ fn claim_routed(
     transport: Option<Py<PyAny>>,
     wait: bool,
     wait_for: Option<Bound<'_, PyAny>>,
+    probe_ports: Py<PyAny>,
 ) -> PyResult<Py<PyDict>> {
+    let probe_ports = bool_argument(py, &probe_ports, "probe_ports")?;
     let bound = wait_bound(wait, wait_for.as_ref())?;
     let default = switchyard_core::profile_named(default_profile).map_err(to_py_error)?;
+    let options = ClaimOptions { probe_ports };
     let transport = wrapped_transport(transport);
     if wait {
         let outcome = py
             .detach(|| {
-                switchyard_core::claim_routed_waiting(
+                switchyard_core::claim_routed_waiting_with_options(
                     &stack,
                     agent,
                     description,
                     default,
                     bound,
                     lent_transport(&transport),
+                    options,
                 )
             })
             .map_err(to_py_error)?;
@@ -375,12 +466,13 @@ fn claim_routed(
     }
     let record = py
         .detach(|| {
-            switchyard_core::claim_routed(
+            switchyard_core::claim_routed_with_options(
                 &stack,
                 agent,
                 description,
                 default,
                 lent_transport(&transport),
+                options,
             )
         })
         .map_err(to_py_error)?;

@@ -831,7 +831,10 @@ fn corrupt_switchyard_config_refuses_every_command_at_exit_2_without_mutating_di
         r#"{"base_branch":"main.LOCK","env_template":null,"probe_ports":false,"seed_files":[],"source_repo":null,"version":1}"#.to_string(),
         r#"{"base_branch":"../bad","env_template":null,"probe_ports":false,"seed_files":[],"source_repo":null,"version":1}"#.to_string(),
         r#"{"base_branch":"main","env_template":null,"probe_ports":"false","seed_files":[],"source_repo":null,"version":1}"#.to_string(),
-        r#"{"base_branch":"main","env_template":null,"probe_ports":true,"seed_files":[],"source_repo":null,"version":1}"#.to_string(),
+        // Updated under SY-30 as a mechanical consequence of amending SY-27 to
+        // accept boolean `probe_ports: true`: pin non-boolean integer `1` so
+        // `probe_ports` type corruption stays covered here.
+        r#"{"base_branch":"main","env_template":null,"probe_ports":1,"seed_files":[],"source_repo":null,"version":1}"#.to_string(),
         r#"{"base_branch":"main","env_template":{"PORT":"20000"},"probe_ports":false,"seed_files":[],"source_repo":null,"version":1}"#.to_string(),
         r#"{"base_branch":"main","env_template":null,"probe_ports":false,"seed_files":["README.md"],"source_repo":null,"version":1}"#.to_string(),
         r#"{"base_branch":"main","env_template":null,"probe_ports":false,"seed_files":[],"source_repo":"","version":1}"#.to_string(),

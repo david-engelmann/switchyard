@@ -42,11 +42,19 @@ pub const QUEUE_BOUND: usize = 64;
 pub const LOCK_NAME: &str = "switchyard.lock";
 pub const REPO_NAME: &str = "repo";
 pub const WORKTREES_NAME: &str = "worktrees";
+pub const SEED_DIR_NAME: &str = "seed";
 pub const ENV_NAME: &str = ".env.switchyard";
+pub const WORKTREEINCLUDE_NAME: &str = ".worktreeinclude";
 pub const EMPTY_HOOKS_NAME: &str = ".switchyard-empty-hooks";
 pub const DEFAULT_BASE_BRANCH: &str = "main";
 pub const REGISTRY_VERSION: i64 = 1;
 pub const CONFIG_VERSION: i64 = 1;
+pub const ENV_TEMPLATE_MAX_BYTES: u64 = 64 * 1024;
+pub const WORKTREEINCLUDE_MAX_BYTES: u64 = 64 * 1024;
+pub const SEED_FILE_MAX_COUNT: usize = 256;
+pub const SEED_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const SEED_TOTAL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const ENV_PORT_VAR_CAP: usize = 40;
 
 pub const DEFAULT_PORT_START: i64 = 20000;
 pub const DEFAULT_RANGE_SIZE: i64 = 10;
@@ -1126,23 +1134,86 @@ const CONFIG_KEYS: [&str; 6] = [
     "version",
 ];
 
+const ENV_TEMPLATE_ENTRY_KEYS: [&str; 2] = ["key", "template"];
+const SEED_FILE_KEYS: [&str; 2] = ["path", "sha256"];
+
+/// One validated `KEY=TEMPLATE` entry stored under `env_template` in
+/// `switchyard-config.json`, under obligation SY-31.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvTemplateEntry {
+    pub key: String,
+    pub template: String,
+}
+
+/// One `.worktreeinclude` seed file snapshot recorded under
+/// `seed_files` in `switchyard-config.json`, under obligation SY-31.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedFile {
+    pub path: String,
+    pub sha256: String,
+}
+
 /// Stack-wide configuration written to `switchyard-config.json` when
-/// non-default `init` options (`--from` or `--branch`) stand, and
-/// omitted on bare `init`, under obligation SY-27.
+/// non-default `init` options (`--from`, `--branch`, `--probe-ports`,
+/// or `--env-template`) stand, and omitted on bare `init`, under
+/// obligations SY-27, SY-30, and SY-31.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackConfig {
     pub version: i64,
     pub base_branch: String,
     pub source_repo: Option<String>,
     pub probe_ports: bool,
+    pub env_template: Option<Vec<EnvTemplateEntry>>,
+    pub seed_files: Vec<SeedFile>,
 }
 
-/// Optional repository attachment and base branch arguments for
-/// `init_stack_with_options`, under obligation SY-27.
+/// Optional repository attachment, base branch, port probing, and env
+/// template arguments for `init_stack_with_options`, under obligations
+/// SY-27, SY-30, and SY-31.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InitOptions {
     pub from_repo: Option<PathBuf>,
     pub branch: Option<String>,
+    pub probe_ports: bool,
+    pub env_template: Option<PathBuf>,
+}
+
+/// Optional per-call claim flags for `claim_with_options` and its
+/// profiled, routed, and waiting siblings, under obligation SY-30.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClaimOptions {
+    pub probe_ports: bool,
+}
+
+/// Seam for point-in-time loopback port probing, under obligation SY-30.
+pub trait PortProber {
+    fn is_port_free(&self, port: u16) -> bool;
+}
+
+fn ipv6_bind_error_means_disabled(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::AddrNotAvailable
+        || err.raw_os_error() == Some(libc::EAFNOSUPPORT)
+        || err.raw_os_error() == Some(libc::EPROTONOSUPPORT)
+}
+
+/// Real host loopback prober testing both IPv4 `127.0.0.1` and IPv6 `::1`,
+/// treating IPv6-disabled hosts (`AddrNotAvailable` / `EAFNOSUPPORT` /
+/// `EPROTONOSUPPORT` on `::1`) as clean while rejecting `AddrInUse` or
+/// other bind errors on either family.
+pub struct LoopbackProber;
+
+impl PortProber for LoopbackProber {
+    fn is_port_free(&self, port: u16) -> bool {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, TcpListener};
+        if TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_err() {
+            return false;
+        }
+        match TcpListener::bind(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)) {
+            Ok(_) => true,
+            Err(exc) if ipv6_bind_error_means_disabled(&exc) => true,
+            Err(_) => false,
+        }
+    }
 }
 
 /// Optional branch-preservation and cleanliness-guard flags for
@@ -1176,6 +1247,238 @@ fn effective_base_branch(config: Option<&StackConfig>) -> &str {
     config
         .map(|cfg| cfg.base_branch.as_str())
         .unwrap_or(DEFAULT_BASE_BRANCH)
+}
+
+fn validate_env_template_key_shape(key: &str) -> std::result::Result<(), String> {
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > 128 {
+        return Err(format!(
+            "env template key {} must be 1 to 128 ASCII identifier bytes",
+            py_repr(key)
+        ));
+    }
+    let valid_head = bytes[0].is_ascii_alphabetic() || bytes[0] == b'_';
+    let valid_tail = bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_');
+    if !valid_head || !valid_tail {
+        return Err(format!(
+            "env template key {} is not a valid [A-Za-z_][A-Za-z0-9_]* identifier",
+            py_repr(key)
+        ));
+    }
+    if key.starts_with("SWITCHYARD_") {
+        return Err(format!(
+            "env template key {} starts with reserved prefix SWITCHYARD_",
+            py_repr(key)
+        ));
+    }
+    Ok(())
+}
+
+fn parse_env_port_placeholder_index(name: &str) -> Option<usize> {
+    let idx_str = name.strip_prefix("port_")?;
+    if idx_str.is_empty()
+        || idx_str.len() > 2
+        || !idx_str.bytes().all(|b| b.is_ascii_digit())
+        || (idx_str != "0" && idx_str.starts_with('0'))
+    {
+        return None;
+    }
+    let idx = idx_str.parse::<usize>().ok()?;
+    (idx < ENV_PORT_VAR_CAP).then_some(idx)
+}
+
+fn is_valid_env_placeholder(name: &str) -> bool {
+    matches!(
+        name,
+        "agent"
+            | "branch"
+            | "worktree"
+            | "worktree_abs"
+            | "database"
+            | "port_start"
+            | "port_end"
+            | "port_count"
+    ) || parse_env_port_placeholder_index(name).is_some()
+}
+
+fn validate_env_template_value(template: &str) -> std::result::Result<(), String> {
+    if template.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("contains forbidden ASCII control character".to_string());
+    }
+    let bytes = template.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'{' => {
+                if bytes.get(at + 1) != Some(&b'{') {
+                    return Err("contains single or unclosed '{' brace".to_string());
+                }
+                let start = at + 2;
+                let Some(rel_close) = template[start..].find("}}") else {
+                    return Err("contains unclosed '{{' placeholder".to_string());
+                };
+                let inner = &template[start..start + rel_close];
+                if inner.bytes().any(|b| b == b'{' || b == b'}') {
+                    return Err(
+                        "contains nested or stray brace inside '{{...}}' placeholder".to_string(),
+                    );
+                }
+                if !is_valid_env_placeholder(inner) {
+                    return Err(format!("contains unknown placeholder '{{{{{inner}}}}}'"));
+                }
+                at = start + rel_close + 2;
+            }
+            b'}' => {
+                return Err("contains stray closing '}' brace".to_string());
+            }
+            _ => {
+                at += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct SeedCollisionTracker {
+    dir_spellings: BTreeMap<String, String>,
+    leaf_paths: BTreeMap<String, String>,
+}
+
+impl SeedCollisionTracker {
+    fn insert(&mut self, rel: &str) -> std::result::Result<(), String> {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let mut exact_prefix = String::new();
+        let mut lower_prefix = String::new();
+        for parent in &parts[..parts.len() - 1] {
+            if !exact_prefix.is_empty() {
+                exact_prefix.push('/');
+                lower_prefix.push('/');
+            }
+            exact_prefix.push_str(parent);
+            lower_prefix.push_str(&parent.to_ascii_lowercase());
+            if let Some(leaf) = self.leaf_paths.get(&lower_prefix) {
+                return Err(format!(
+                    "seed path {} conflicts with seed file {} standing as a directory prefix",
+                    py_repr(rel),
+                    py_repr(leaf)
+                ));
+            }
+            match self.dir_spellings.get(&lower_prefix) {
+                Some(existing) if existing != &exact_prefix => {
+                    return Err(format!(
+                        "seed path {} collides in directory casing ({} vs {})",
+                        py_repr(rel),
+                        py_repr(&exact_prefix),
+                        py_repr(existing)
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    self.dir_spellings
+                        .insert(lower_prefix.clone(), exact_prefix.clone());
+                }
+            }
+        }
+        let lower_full = rel.to_ascii_lowercase();
+        if let Some(dir_exact) = self.dir_spellings.get(&lower_full) {
+            return Err(format!(
+                "seed path {} conflicts with directory prefix {}",
+                py_repr(rel),
+                py_repr(dir_exact)
+            ));
+        }
+        if let Some(existing) = self.leaf_paths.get(&lower_full) {
+            if existing == rel {
+                return Err(format!("repeats path {}", py_repr(rel)));
+            }
+            return Err(format!(
+                "seed path {} collides ASCII-case-insensitively with {}",
+                py_repr(rel),
+                py_repr(existing)
+            ));
+        }
+        self.leaf_paths.insert(lower_full, rel.to_string());
+        Ok(())
+    }
+}
+
+fn validate_seed_rel_path(rel: &str) -> std::result::Result<(), String> {
+    if rel.is_empty() || rel.len() > 512 {
+        return Err(format!("seed path {} must be 1 to 512 bytes", py_repr(rel)));
+    }
+    if rel.starts_with('/') || rel.ends_with('/') {
+        return Err(format!(
+            "seed path {} must be a relative file path without leading or trailing slashes",
+            py_repr(rel)
+        ));
+    }
+    for b in rel.bytes() {
+        if b < 0x20
+            || b == 0x7f
+            || matches!(b, b'\\' | b':' | b'*' | b'?' | b'[' | b']' | b'{' | b'}')
+        {
+            return Err(format!(
+                "seed path {} contains a forbidden control, separator, or glob character",
+                py_repr(rel)
+            ));
+        }
+    }
+    if rel
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(ENV_NAME))
+    {
+        return Err(format!(
+            "seed path {} targets reserved {}",
+            py_repr(rel),
+            ENV_NAME
+        ));
+    }
+    for part in rel.split('/') {
+        if part.is_empty() {
+            return Err(format!(
+                "seed path {} contains consecutive slashes",
+                py_repr(rel)
+            ));
+        }
+        if part == "." || part == ".." {
+            return Err(format!(
+                "seed path {} contains traversal component {}",
+                py_repr(rel),
+                py_repr(part)
+            ));
+        }
+        if part.len() > 250 {
+            return Err(format!(
+                "seed path {} contains a component exceeding 250 bytes",
+                py_repr(rel)
+            ));
+        }
+        if part.eq_ignore_ascii_case(".git") {
+            return Err(format!(
+                "seed path {} targets reserved .git metadata",
+                py_repr(rel)
+            ));
+        }
+        if part.eq_ignore_ascii_case(EMPTY_HOOKS_NAME) {
+            return Err(format!(
+                "seed path {} targets reserved {}",
+                py_repr(rel),
+                EMPTY_HOOKS_NAME
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_lower_hex64(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn validate_config(data: &JVal, path: &Path) -> Result<StackConfig> {
@@ -1217,28 +1520,133 @@ fn validate_config(data: &JVal, path: &Path) -> Result<StackConfig> {
         }
     };
     let probe_ports = match data.get("probe_ports") {
-        Some(JVal::Bool(false)) => false,
-        Some(JVal::Bool(true)) => {
-            return Err(corrupt_config(
-                path,
-                "probe_ports true is unsupported in this version",
-            ))
-        }
+        Some(JVal::Bool(flag)) => *flag,
         _ => return Err(corrupt_config(path, "probe_ports is not a boolean")),
     };
-    match data.get("env_template") {
-        Some(JVal::Null) => {}
-        _ => return Err(corrupt_config(path, "env_template must be null")),
-    }
-    match data.get("seed_files") {
-        Some(JVal::Arr(items)) if items.is_empty() => {}
-        _ => return Err(corrupt_config(path, "seed_files must be an empty list")),
-    }
+    let env_template = match data.get("env_template") {
+        Some(JVal::Null) => None,
+        Some(JVal::Arr(items)) => {
+            let mut entries = Vec::with_capacity(items.len());
+            let mut seen_keys = BTreeSet::new();
+            for item in items {
+                let JVal::Obj(item_pairs) = item else {
+                    return Err(corrupt_config(
+                        path,
+                        "an env_template entry is not an object",
+                    ));
+                };
+                if !exact_keys(item_pairs, &ENV_TEMPLATE_ENTRY_KEYS) {
+                    return Err(corrupt_config(
+                        path,
+                        "an env_template entry does not carry exactly key and template",
+                    ));
+                }
+                let Some(key) = item.get("key").and_then(JVal::as_str) else {
+                    return Err(corrupt_config(
+                        path,
+                        "an env_template entry key is not a string",
+                    ));
+                };
+                if let Err(why) = validate_env_template_key_shape(key) {
+                    return Err(corrupt_config(path, why));
+                }
+                if !seen_keys.insert(key.to_string()) {
+                    return Err(corrupt_config(
+                        path,
+                        format!("env_template repeats key {key}"),
+                    ));
+                }
+                let Some(tpl) = item.get("template").and_then(JVal::as_str) else {
+                    return Err(corrupt_config(
+                        path,
+                        "an env_template entry template is not a string",
+                    ));
+                };
+                if let Err(why) = validate_env_template_value(tpl) {
+                    return Err(corrupt_config(
+                        path,
+                        format!("env_template entry {key} {why}"),
+                    ));
+                }
+                entries.push(EnvTemplateEntry {
+                    key: key.to_string(),
+                    template: tpl.to_string(),
+                });
+            }
+            Some(entries)
+        }
+        _ => return Err(corrupt_config(path, "env_template must be a list or null")),
+    };
+    let seed_files = match data.get("seed_files") {
+        Some(JVal::Arr(items)) => {
+            if items.len() > SEED_FILE_MAX_COUNT {
+                return Err(corrupt_config(
+                    path,
+                    format!("seed_files exceeds the {SEED_FILE_MAX_COUNT} file limit"),
+                ));
+            }
+            let mut seeds = Vec::with_capacity(items.len());
+            let mut prev_path: Option<&str> = None;
+            let mut collisions = SeedCollisionTracker::default();
+            for item in items {
+                let JVal::Obj(item_pairs) = item else {
+                    return Err(corrupt_config(path, "a seed_files entry is not an object"));
+                };
+                if !exact_keys(item_pairs, &SEED_FILE_KEYS) {
+                    return Err(corrupt_config(
+                        path,
+                        "a seed_files entry does not carry exactly path and sha256",
+                    ));
+                }
+                let Some(rel) = item.get("path").and_then(JVal::as_str) else {
+                    return Err(corrupt_config(
+                        path,
+                        "a seed_files entry path is not a string",
+                    ));
+                };
+                if let Err(why) = validate_seed_rel_path(rel) {
+                    return Err(corrupt_config(path, why));
+                }
+                if let Some(prev) = prev_path {
+                    if rel <= prev {
+                        return Err(corrupt_config(
+                            path,
+                            "seed_files must be sorted strictly ascending by path with no duplicates",
+                        ));
+                    }
+                }
+                if let Err(why) = collisions.insert(rel) {
+                    return Err(corrupt_config(path, why));
+                }
+                prev_path = Some(rel);
+                let Some(digest) = item.get("sha256").and_then(JVal::as_str) else {
+                    return Err(corrupt_config(
+                        path,
+                        "a seed_files entry sha256 is not a string",
+                    ));
+                };
+                if !is_lower_hex64(digest) {
+                    return Err(corrupt_config(
+                        path,
+                        "a seed_files entry sha256 is not 64 lowercase hex characters",
+                    ));
+                }
+                seeds.push(SeedFile {
+                    path: rel.to_string(),
+                    sha256: digest.to_string(),
+                });
+            }
+            seeds
+        }
+        _ => return Err(corrupt_config(path, "seed_files must be a list")),
+    };
     Ok(StackConfig {
         version: CONFIG_VERSION,
         base_branch,
         source_repo,
         probe_ports,
+        env_template,
+        seed_files,
     })
 }
 
@@ -1288,11 +1696,38 @@ pub fn load_config(stack: &Path) -> Result<Option<StackConfig>> {
 fn config_value(config: &StackConfig) -> serde_json::Value {
     let mut top = serde_json::Map::new();
     top.insert("base_branch".to_string(), config.base_branch.clone().into());
-    top.insert("env_template".to_string(), serde_json::Value::Null);
+    top.insert(
+        "env_template".to_string(),
+        match &config.env_template {
+            None => serde_json::Value::Null,
+            Some(entries) => serde_json::Value::Array(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("key".to_string(), entry.key.clone().into());
+                        obj.insert("template".to_string(), entry.template.clone().into());
+                        serde_json::Value::Object(obj)
+                    })
+                    .collect(),
+            ),
+        },
+    );
     top.insert("probe_ports".to_string(), config.probe_ports.into());
     top.insert(
         "seed_files".to_string(),
-        serde_json::Value::Array(Vec::new()),
+        serde_json::Value::Array(
+            config
+                .seed_files
+                .iter()
+                .map(|seed| {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("path".to_string(), seed.path.clone().into());
+                    obj.insert("sha256".to_string(), seed.sha256.clone().into());
+                    serde_json::Value::Object(obj)
+                })
+                .collect(),
+        ),
     );
     top.insert(
         "source_repo".to_string(),
@@ -2127,6 +2562,27 @@ fn format_git_args(args: &[&OsStr]) -> String {
         .join(" ")
 }
 
+/// Spawn a child command with a bounded retry on ETXTBSY.
+///
+/// Setting process_group(0) forces Unix stdlib to take fork and
+/// exec rather than posix_spawn, so a concurrent fork on another
+/// thread can briefly inherit an open write descriptor to a newly
+/// written script between fork and exec, making exec return
+/// ETXTBSY until the sibling completes its exec.
+pub(crate) fn spawn_with_etxtbsy_retry(command: &mut Command) -> io::Result<std::process::Child> {
+    let mut attempts = 0usize;
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn run_git(
     repo: &Path,
     args: &[&OsStr],
@@ -2148,8 +2604,7 @@ fn run_git(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut child = command
-        .spawn()
+    let mut child = spawn_with_etxtbsy_retry(&mut command)
         .map_err(|exc| Error::plain(format!("git {joined} could not be started, {exc}")))?;
     let pid = child.id();
     let group_guard = ActiveChildGuard::new(pid);
@@ -2586,6 +3041,422 @@ fn inspect_source_repo(
     Ok((canonical_src, base_branch, source_str, origin))
 }
 
+#[derive(Debug, Clone)]
+struct PlannedSeed {
+    path: String,
+    bytes: Vec<u8>,
+    sha256: String,
+    executable: bool,
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<(Vec<u8>, fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let sym_meta = path.symlink_metadata().map_err(|exc| {
+        Error::plain(format!(
+            "{label} at {} cannot be read, {exc}",
+            path.display()
+        ))
+    })?;
+    if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
+        return Err(Error::plain(format!(
+            "{label} at {} is not a regular file",
+            path.display()
+        )));
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|exc| {
+            Error::plain(format!(
+                "{label} at {} cannot be read, {exc}",
+                path.display()
+            ))
+        })?;
+    let meta = file.metadata().map_err(|exc| {
+        Error::plain(format!(
+            "{label} at {} cannot be read, {exc}",
+            path.display()
+        ))
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(Error::plain(format!(
+            "{label} at {} is not a regular file",
+            path.display()
+        )));
+    }
+    if meta.len() > max_bytes {
+        return Err(Error::plain(format!(
+            "{label} at {} exceeds the {max_bytes} byte limit",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|exc| {
+            Error::plain(format!(
+                "{label} at {} cannot be read, {exc}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Error::plain(format!(
+            "{label} at {} exceeds the {max_bytes} byte limit",
+            path.display()
+        )));
+    }
+    Ok((bytes, meta))
+}
+
+fn load_env_template_file(path: &Path) -> Result<Vec<EnvTemplateEntry>> {
+    let (raw, _) = read_bounded_regular_file(path, ENV_TEMPLATE_MAX_BYTES, "env template")?;
+    let text = String::from_utf8(raw).map_err(|_| {
+        Error::plain(format!(
+            "env template at {} is not valid UTF-8 text",
+            path.display()
+        ))
+    })?;
+    let mut entries = Vec::new();
+    let mut seen_keys = BTreeSet::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((key, template)) = line.split_once('=') else {
+            return Err(Error::plain(format!(
+                "env template at {} line {line_no} is missing '=' in KEY=TEMPLATE",
+                path.display()
+            )));
+        };
+        if let Err(why) = validate_env_template_key_shape(key) {
+            return Err(Error::plain(format!(
+                "env template at {} line {line_no} is invalid, {why}",
+                path.display()
+            )));
+        }
+        if !seen_keys.insert(key.to_string()) {
+            return Err(Error::plain(format!(
+                "env template at {} line {line_no} repeats key {key}",
+                path.display()
+            )));
+        }
+        if let Err(why) = validate_env_template_value(template) {
+            return Err(Error::plain(format!(
+                "env template at {} line {line_no} for key {key} {why}",
+                path.display()
+            )));
+        }
+        entries.push(EnvTemplateEntry {
+            key: key.to_string(),
+            template: template.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+fn verify_symlink_free_seed_source(
+    root: &Path,
+    rel: &str,
+    label: &str,
+    mut exact_case_cache: Option<&mut BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>>>,
+) -> Result<PathBuf> {
+    let mut cursor = root.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for (idx, part) in parts.iter().enumerate() {
+        let parent = cursor.clone();
+        cursor.push(part);
+        let meta = cursor.symlink_metadata().map_err(|exc| {
+            Error::plain(format!(
+                "{label} cannot be read at {}, {exc}",
+                cursor.display()
+            ))
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::plain(format!(
+                "{label} traverses symlink at {}, symlinks are refused",
+                cursor.display()
+            )));
+        }
+        if let Some(cache) = exact_case_cache.as_deref_mut() {
+            if !cache.contains_key(&parent) {
+                let mut names = BTreeSet::new();
+                let entries = fs::read_dir(&parent).map_err(|exc| {
+                    Error::plain(format!(
+                        "{label} parent directory {} cannot be read, {exc}",
+                        parent.display()
+                    ))
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|exc| {
+                        Error::plain(format!(
+                            "{label} parent directory {} cannot be read, {exc}",
+                            parent.display()
+                        ))
+                    })?;
+                    names.insert(entry.file_name());
+                }
+                cache.insert(parent.clone(), names);
+            }
+            if !cache[&parent].contains(OsStr::new(part)) {
+                return Err(Error::plain(format!(
+                    "{label} component {} does not match exact on-disk casing under {}",
+                    py_repr(part),
+                    parent.display()
+                )));
+            }
+        }
+        let is_leaf = idx + 1 == parts.len();
+        if is_leaf {
+            if !meta.file_type().is_file() {
+                return Err(Error::plain(format!(
+                    "{label} at {} is not a regular file",
+                    cursor.display()
+                )));
+            }
+        } else if !meta.file_type().is_dir() {
+            return Err(Error::plain(format!(
+                "{label} parent at {} is not a directory",
+                cursor.display()
+            )));
+        }
+    }
+    Ok(cursor)
+}
+
+fn verify_base_branch_seed_casing(
+    git: &dyn GitRunner,
+    repo: &Path,
+    base_branch: &str,
+    planned: &[PlannedSeed],
+) -> Result<()> {
+    if planned.is_empty() {
+        return Ok(());
+    }
+    let mut seed_dirs: BTreeMap<String, String> = BTreeMap::new();
+    let mut seed_leaves: BTreeMap<String, String> = BTreeMap::new();
+    for item in planned {
+        let parts: Vec<&str> = item.path.split('/').collect();
+        let mut exact = String::new();
+        let mut lower = String::new();
+        for parent in &parts[..parts.len() - 1] {
+            if !exact.is_empty() {
+                exact.push('/');
+                lower.push('/');
+            }
+            exact.push_str(parent);
+            lower.push_str(&parent.to_ascii_lowercase());
+            seed_dirs.insert(lower.clone(), exact.clone());
+        }
+        seed_leaves.insert(item.path.to_ascii_lowercase(), item.path.clone());
+    }
+    let base_ref = format!("refs/heads/{base_branch}");
+    let out = git_result(
+        git,
+        repo,
+        &["ls-tree", "-r", "--name-only", "-z", &base_ref],
+    )?;
+    if out.code != 0 {
+        return Err(Error::plain(format!(
+            "git ls-tree on {base_ref} failed with exit {}, {}",
+            out.code,
+            git_detail(&out)
+        )));
+    }
+    for raw_entry in out.stdout_bytes.split(|&b| b == 0) {
+        if raw_entry.is_empty() {
+            continue;
+        }
+        let raw_parts: Vec<&[u8]> = raw_entry.split(|&b| b == b'/').collect();
+        let mut t_exact = String::new();
+        let mut t_lower = String::new();
+        for (idx, raw_part) in raw_parts.iter().enumerate() {
+            let Ok(part) = std::str::from_utf8(raw_part) else {
+                break;
+            };
+            if !t_exact.is_empty() {
+                t_exact.push('/');
+                t_lower.push('/');
+            }
+            t_exact.push_str(part);
+            t_lower.push_str(&part.to_ascii_lowercase());
+            let is_leaf = idx + 1 == raw_parts.len();
+            if let Some(seed_dir_exact) = seed_dirs.get(&t_lower) {
+                if seed_dir_exact != &t_exact {
+                    return Err(Error::plain(format!(
+                        "{} seed directory {} mismatches tracked path {} on branch {base_branch}",
+                        WORKTREEINCLUDE_NAME,
+                        py_repr(seed_dir_exact),
+                        py_repr(&t_exact)
+                    )));
+                }
+            }
+            if let Some(seed_leaf_exact) = seed_leaves.get(&t_lower) {
+                if seed_leaf_exact != &t_exact || !is_leaf {
+                    return Err(Error::plain(format!(
+                        "{} seed path {} conflicts with tracked entry {} on branch {base_branch}",
+                        WORKTREEINCLUDE_NAME,
+                        py_repr(seed_leaf_exact),
+                        py_repr(&t_exact)
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_worktreeinclude(canonical_src: &Path) -> Result<Vec<PlannedSeed>> {
+    use std::os::unix::fs::PermissionsExt;
+    let wti_path = canonical_src.join(WORKTREEINCLUDE_NAME);
+    match wti_path.symlink_metadata() {
+        Err(exc) if exc.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(exc) => {
+            return Err(Error::plain(format!(
+                "{} at {} cannot be read, {exc}",
+                WORKTREEINCLUDE_NAME,
+                wti_path.display()
+            )))
+        }
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err(Error::plain(format!(
+                    "{} at {} is not a regular file",
+                    WORKTREEINCLUDE_NAME,
+                    wti_path.display()
+                )));
+            }
+        }
+    }
+    let (raw, _) =
+        read_bounded_regular_file(&wti_path, WORKTREEINCLUDE_MAX_BYTES, WORKTREEINCLUDE_NAME)?;
+    let text = String::from_utf8(raw).map_err(|_| {
+        Error::plain(format!(
+            "{} at {} is not valid UTF-8 text",
+            WORKTREEINCLUDE_NAME,
+            wti_path.display()
+        ))
+    })?;
+    let mut ordered_paths = BTreeSet::new();
+    let mut collisions = SeedCollisionTracker::default();
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Err(why) = validate_seed_rel_path(line) {
+            return Err(Error::plain(format!(
+                "{} at {} line {line_no} is invalid, {why}",
+                WORKTREEINCLUDE_NAME,
+                wti_path.display()
+            )));
+        }
+        if let Err(why) = collisions.insert(line) {
+            return Err(Error::plain(format!(
+                "{} at {} line {line_no} {why}",
+                WORKTREEINCLUDE_NAME,
+                wti_path.display()
+            )));
+        }
+        ordered_paths.insert(line.to_string());
+        if ordered_paths.len() > SEED_FILE_MAX_COUNT {
+            return Err(Error::plain(format!(
+                "{} at {} exceeds the {SEED_FILE_MAX_COUNT} file limit",
+                WORKTREEINCLUDE_NAME,
+                wti_path.display()
+            )));
+        }
+    }
+    let mut total_bytes: u64 = 0;
+    let mut planned = Vec::with_capacity(ordered_paths.len());
+    let mut exact_case_cache: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> = BTreeMap::new();
+    for rel in ordered_paths {
+        let label = format!("{} entry {}", WORKTREEINCLUDE_NAME, py_repr(&rel));
+        let cursor = verify_symlink_free_seed_source(
+            canonical_src,
+            &rel,
+            &label,
+            Some(&mut exact_case_cache),
+        )?;
+        let (bytes, meta) = read_bounded_regular_file(&cursor, SEED_FILE_MAX_BYTES, &label)?;
+        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        if total_bytes > SEED_TOTAL_MAX_BYTES {
+            return Err(Error::plain(format!(
+                "{} at {} exceeds the {SEED_TOTAL_MAX_BYTES} byte total seed limit",
+                WORKTREEINCLUDE_NAME,
+                wti_path.display()
+            )));
+        }
+        let sha256 = sha256_hex(&bytes);
+        let executable = (meta.permissions().mode() & 0o100) != 0;
+        planned.push(PlannedSeed {
+            path: rel,
+            bytes,
+            sha256,
+            executable,
+        });
+    }
+    Ok(planned)
+}
+
+fn populate_seed_dir(stack: &Path, planned: &[PlannedSeed]) -> Result<Vec<SeedFile>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let seed_root = stack.join(SEED_DIR_NAME);
+    fs::create_dir(&seed_root).map_err(|exc| Error::Io(exc.to_string()))?;
+    let mut out = Vec::with_capacity(planned.len());
+    for item in planned {
+        let parts: Vec<&str> = item.path.split('/').collect();
+        let mut dir = seed_root.clone();
+        for parent in &parts[..parts.len() - 1] {
+            dir.push(parent);
+            match dir.symlink_metadata() {
+                Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(Error::plain(format!(
+                        "seed directory parent at {} is not a directory",
+                        dir.display()
+                    )))
+                }
+                Err(exc) if exc.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&dir).map_err(|e| Error::Io(e.to_string()))?;
+                }
+                Err(exc) => return Err(Error::Io(exc.to_string())),
+            }
+        }
+        let dest = dir.join(parts[parts.len() - 1]);
+        let mode = if item.executable { 0o700 } else { 0o600 };
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&dest)
+            .map_err(|exc| Error::Io(exc.to_string()))?;
+        file.write_all(&item.bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|exc| Error::Io(exc.to_string()))?;
+        drop(file);
+        if let Ok(dir_handle) = fs::File::open(&dir) {
+            let _ = dir_handle.sync_all();
+        }
+        out.push(SeedFile {
+            path: item.path.clone(),
+            sha256: item.sha256.clone(),
+        });
+    }
+    if let Ok(seed_handle) = fs::File::open(&seed_root) {
+        let _ = seed_handle.sync_all();
+    }
+    Ok(out)
+}
+
 fn init_stack_with_options_and_git(
     stack: &Path,
     port_start: i128,
@@ -2619,13 +3490,17 @@ fn init_stack_with_options_and_git(
     if let Some(branch) = &options.branch {
         validate_base_branch(branch)?;
     }
-    let source_plan = match &options.from_repo {
-        Some(from_path) => Some(inspect_source_repo(
-            from_path,
-            options.branch.as_deref(),
-            git,
-        )?),
+    let env_template = match &options.env_template {
+        Some(tpl_path) => Some(load_env_template_file(tpl_path)?),
         None => None,
+    };
+    let (source_plan, planned_seeds) = match &options.from_repo {
+        Some(from_path) => {
+            let plan = inspect_source_repo(from_path, options.branch.as_deref(), git)?;
+            let seeds = inspect_worktreeinclude(&plan.0)?;
+            (Some(plan), seeds)
+        }
+        None => (None, Vec::new()),
     };
     // Every pool number is positive and the pool ends at or before
     // port 65535, so each number fits the recorded width exactly.
@@ -2636,6 +3511,7 @@ fn init_stack_with_options_and_git(
     };
     let repo = stack.join(REPO_NAME);
     let worktrees = stack.join(WORKTREES_NAME);
+    let seed_dir = stack.join(SEED_DIR_NAME);
     let lock_path = stack.join(LOCK_NAME);
     let registry = stack.join(REGISTRY_NAME);
     let config_path = stack.join(CONFIG_NAME);
@@ -2718,6 +3594,15 @@ fn init_stack_with_options_and_git(
             config_path.display()
         )));
     }
+    if !planned_seeds.is_empty() && (seed_dir.exists() || seed_dir.symlink_metadata().is_ok()) {
+        drop_claim();
+        return Err(Error::plain(format!(
+            "init refuses the stack at {} because {} already exists, \
+             so nothing was changed",
+            stack.display(),
+            seed_dir.display()
+        )));
+    }
     if repo.exists() || repo.symlink_metadata().is_ok() {
         drop_claim();
         return Err(Error::plain(format!(
@@ -2737,6 +3622,7 @@ fn init_stack_with_options_and_git(
             worktrees.display()
         )));
     }
+    let mut created_seed_dir = false;
     let attempt = (|| -> Result<Pool> {
         fs::create_dir_all(&worktrees).map_err(|exc| Error::Io(exc.to_string()))?;
         if let Some((canonical_src, base_branch, source_str, branch_origin)) = source_plan {
@@ -2930,13 +3816,20 @@ fn init_stack_with_options_and_git(
                     git_checked(git, &repo, &["update-ref", "-d", refname])?;
                 }
             }
+            if !planned_seeds.is_empty() {
+                created_seed_dir = true;
+            }
+            let seed_files = populate_seed_dir(&stack, &planned_seeds)?;
+            verify_base_branch_seed_casing(git, &repo, &base_branch, &planned_seeds)?;
             save_config(
                 &stack,
                 &StackConfig {
                     version: CONFIG_VERSION,
                     base_branch,
                     source_repo: Some(source_str),
-                    probe_ports: false,
+                    probe_ports: options.probe_ports,
+                    env_template,
+                    seed_files,
                 },
             )?;
         } else if let Some(base_branch) = &options.branch {
@@ -2985,7 +3878,9 @@ fn init_stack_with_options_and_git(
                     version: CONFIG_VERSION,
                     base_branch: base_branch.clone(),
                     source_repo: None,
-                    probe_ports: false,
+                    probe_ports: options.probe_ports,
+                    env_template,
+                    seed_files: Vec::new(),
                 },
             )?;
         } else {
@@ -3018,6 +3913,19 @@ fn init_stack_with_options_and_git(
                 &repo,
                 &["commit", "-q", "-m", "Initialise the stack repository"],
             )?;
+            if options.probe_ports || env_template.is_some() {
+                save_config(
+                    &stack,
+                    &StackConfig {
+                        version: CONFIG_VERSION,
+                        base_branch: DEFAULT_BASE_BRANCH.to_string(),
+                        source_repo: None,
+                        probe_ports: options.probe_ports,
+                        env_template,
+                        seed_files: Vec::new(),
+                    },
+                )?;
+            }
         }
         fs::OpenOptions::new()
             .create(true)
@@ -3037,12 +3945,15 @@ fn init_stack_with_options_and_git(
     match attempt {
         Ok(pool) => Ok(pool),
         Err(exc) => {
-            let created: Vec<PathBuf> = watched
+            let mut created: Vec<PathBuf> = watched
                 .iter()
                 .zip(preexisting.iter())
                 .filter(|(_, already)| !**already)
                 .map(|(path, _)| path.clone())
                 .collect();
+            if created_seed_dir {
+                created.insert(0, seed_dir);
+            }
             let problems = remove_created(&created);
             if !problems.is_empty() {
                 return Err(Error::plain(format!(
@@ -3064,6 +3975,39 @@ fn init_stack_with_options_and_git(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanShortage {
+    Pool,
+    HostPortsBusy,
+}
+
+fn taken_slots(data: &Registry) -> BTreeSet<i64> {
+    let pool = &data.port_pool;
+    let mut taken = BTreeSet::new();
+    for record in data.claims.values() {
+        let first = (record.port_start - pool.start) / pool.range_size;
+        let last = (record.port_end - pool.start) / pool.range_size;
+        for index in first..=last {
+            taken.insert(index);
+        }
+    }
+    taken
+}
+
+fn slot_ports_free(pool: &Pool, slot: i64, prober: &dyn PortProber) -> bool {
+    let start = pool.start + slot * pool.range_size;
+    let end = start + pool.range_size - 1;
+    for port in start..=end {
+        let Ok(port_u16) = u16::try_from(port) else {
+            return false;
+        };
+        if !prober.is_port_free(port_u16) {
+            return false;
+        }
+    }
+    true
+}
+
 /// The first run of consecutive free ranges of the given length,
 /// as its first port and its last port. A draw is made whole or
 /// not at all, so a pool where single ranges stand free but no run
@@ -3073,14 +4017,7 @@ fn free_run(data: &Registry, ranges: i64) -> Option<(i64, i64)> {
     if ranges < 1 || ranges > pool.range_count {
         return None;
     }
-    let mut taken: BTreeSet<i64> = BTreeSet::new();
-    for record in data.claims.values() {
-        let first = (record.port_start - pool.start) / pool.range_size;
-        let last = (record.port_end - pool.start) / pool.range_size;
-        for index in first..=last {
-            taken.insert(index);
-        }
-    }
+    let taken = taken_slots(data);
     let mut run: i64 = 0;
     for index in 0..pool.range_count {
         if taken.contains(&index) {
@@ -3097,20 +4034,55 @@ fn free_run(data: &Registry, ranges: i64) -> Option<(i64, i64)> {
     None
 }
 
+fn select_span(
+    data: &Registry,
+    ranges: i64,
+    probe_ports: bool,
+    prober: &dyn PortProber,
+) -> std::result::Result<(i64, i64), SpanShortage> {
+    let Some(first_unprobed) = free_run(data, ranges) else {
+        return Err(SpanShortage::Pool);
+    };
+    if !probe_ports {
+        return Ok(first_unprobed);
+    }
+    let pool = &data.port_pool;
+    let taken = taken_slots(data);
+    let mut run: i64 = 0;
+    let mut index: i64 = 0;
+    while index < pool.range_count {
+        let needed = ranges - run;
+        if index + needed > pool.range_count {
+            break;
+        }
+        if let Some(blocked_offset) = (0..needed).find(|off| taken.contains(&(index + off))) {
+            run = 0;
+            index += blocked_offset + 1;
+            continue;
+        }
+        if !slot_ports_free(pool, index, prober) {
+            run = 0;
+            index += 1;
+            continue;
+        }
+        run += 1;
+        if run == ranges {
+            let start = pool.start + (index - ranges + 1) * pool.range_size;
+            let end = start + ranges * pool.range_size - 1;
+            return Ok((start, end));
+        }
+        index += 1;
+    }
+    Err(SpanShortage::HostPortsBusy)
+}
+
 /// The lengths of the free runs standing in the pool, in pool
 /// order, as the count of ranges each maximal run of untenanted
 /// ranges holds. The scoring vignette of obligation SY-20 states
 /// these lengths and nothing else about the pool's shape.
 fn free_runs(data: &Registry) -> Vec<i64> {
     let pool = &data.port_pool;
-    let mut taken: BTreeSet<i64> = BTreeSet::new();
-    for record in data.claims.values() {
-        let first = (record.port_start - pool.start) / pool.range_size;
-        let last = (record.port_end - pool.start) / pool.range_size;
-        for index in first..=last {
-            taken.insert(index);
-        }
-    }
+    let taken = taken_slots(data);
     let mut runs: Vec<i64> = Vec::new();
     let mut current: i64 = 0;
     for index in 0..pool.range_count {
@@ -3129,25 +4101,199 @@ fn free_runs(data: &Registry) -> Vec<i64> {
     runs
 }
 
-fn env_text(record: &Record) -> String {
-    let lines = [
-        "# Written by switchyard. This file dies with the worktree.".to_string(),
-        format!("SWITCHYARD_AGENT={}", record.agent),
-        format!("SWITCHYARD_BRANCH={}", record.branch),
-        format!("SWITCHYARD_WORKTREE={}", record.worktree),
-        format!("SWITCHYARD_PORT_START={}", record.port_start),
-        format!("SWITCHYARD_PORT_END={}", record.port_end),
-        format!("PORT={}", record.port_start),
-        format!("SWITCHYARD_DATABASE={}", record.database),
-        format!(
-            "DATABASE_URL=postgres://127.0.0.1:{}/{}",
-            record.port_start, record.database
-        ),
-    ];
-    lines.join("\n") + "\n"
+fn expand_env_template_bytes(
+    key: &str,
+    template: &str,
+    record: &Record,
+    abs_worktree_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let port_count = (record.port_end - record.port_start + 1) as usize;
+    let mut out = Vec::with_capacity(template.len() + 32);
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.extend_from_slice(&rest.as_bytes()[..open]);
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            return Err(Error::plain(format!(
+                "env template key {key} contains unclosed '{{' placeholder"
+            )));
+        };
+        let placeholder = &after_open[..close];
+        match placeholder {
+            "agent" => out.extend_from_slice(record.agent.as_bytes()),
+            "branch" => out.extend_from_slice(record.branch.as_bytes()),
+            "worktree" => out.extend_from_slice(record.worktree.as_bytes()),
+            "worktree_abs" => out.extend_from_slice(abs_worktree_bytes),
+            "database" => out.extend_from_slice(record.database.as_bytes()),
+            "port_start" => out.extend_from_slice(record.port_start.to_string().as_bytes()),
+            "port_end" => out.extend_from_slice(record.port_end.to_string().as_bytes()),
+            "port_count" => out.extend_from_slice(port_count.to_string().as_bytes()),
+            other => {
+                if let Some(idx) = parse_env_port_placeholder_index(other) {
+                    if idx >= port_count {
+                        let noun = if port_count == 1 { "port" } else { "ports" };
+                        return Err(Error::plain(format!(
+                            "env template key {key} references {{{{port_{idx}}}}}, which exceeds the claimed span of {port_count} {noun}"
+                        )));
+                    }
+                    let port_val = record.port_start + idx as i64;
+                    out.extend_from_slice(port_val.to_string().as_bytes());
+                    rest = &after_open[close + 2..];
+                    continue;
+                }
+                return Err(Error::plain(format!(
+                    "env template key {key} contains unknown placeholder '{{{{{other}}}}}'"
+                )));
+            }
+        }
+        rest = &after_open[close + 2..];
+    }
+    out.extend_from_slice(rest.as_bytes());
+    if out.iter().any(|&b| b == b'\n' || b == b'\r' || b == 0) {
+        return Err(Error::plain(format!(
+            "env template key {key} expanded to forbidden newline or control bytes"
+        )));
+    }
+    Ok(out)
 }
 
-fn write_env_file(stack: &Path, env_rel: &str, record: &Record) -> Result<()> {
+fn push_env_kv(buf: &mut Vec<u8>, key: &str, value: &[u8]) {
+    buf.extend_from_slice(key.as_bytes());
+    buf.push(b'=');
+    buf.extend_from_slice(value);
+    buf.push(b'\n');
+}
+
+fn env_bytes(
+    record: &Record,
+    abs_worktree_bytes: &[u8],
+    env_template: Option<&[EnvTemplateEntry]>,
+) -> Result<Vec<u8>> {
+    let port_count = (record.port_end - record.port_start + 1) as usize;
+    let mut port_override: Option<Vec<u8>> = None;
+    let mut db_url_override: Option<Vec<u8>> = None;
+    let mut sqlite_override: Option<Vec<u8>> = None;
+    let mut custom_lines: Vec<(String, Vec<u8>)> = Vec::new();
+
+    if let Some(entries) = env_template {
+        for entry in entries {
+            let expanded =
+                expand_env_template_bytes(&entry.key, &entry.template, record, abs_worktree_bytes)?;
+            match entry.key.as_str() {
+                "PORT" => port_override = Some(expanded),
+                "DATABASE_URL" => db_url_override = Some(expanded),
+                "SQLITE_PATH" => sqlite_override = Some(expanded),
+                _ => custom_lines.push((entry.key.clone(), expanded)),
+            }
+        }
+    }
+
+    let mut buf = Vec::with_capacity(512);
+    buf.extend_from_slice(b"# Written by switchyard. This file dies with the worktree.\n");
+    push_env_kv(&mut buf, "SWITCHYARD_AGENT", record.agent.as_bytes());
+    push_env_kv(&mut buf, "SWITCHYARD_BRANCH", record.branch.as_bytes());
+    push_env_kv(&mut buf, "SWITCHYARD_WORKTREE", record.worktree.as_bytes());
+    push_env_kv(
+        &mut buf,
+        "SWITCHYARD_PORT_START",
+        record.port_start.to_string().as_bytes(),
+    );
+    push_env_kv(
+        &mut buf,
+        "SWITCHYARD_PORT_END",
+        record.port_end.to_string().as_bytes(),
+    );
+    match port_override {
+        Some(val) => push_env_kv(&mut buf, "PORT", &val),
+        None => push_env_kv(&mut buf, "PORT", record.port_start.to_string().as_bytes()),
+    }
+    push_env_kv(&mut buf, "SWITCHYARD_DATABASE", record.database.as_bytes());
+    match db_url_override {
+        Some(val) => push_env_kv(&mut buf, "DATABASE_URL", &val),
+        None => {
+            let default_db_url = format!(
+                "postgres://127.0.0.1:{}/{}",
+                record.port_start, record.database
+            );
+            push_env_kv(&mut buf, "DATABASE_URL", default_db_url.as_bytes());
+        }
+    }
+    push_env_kv(&mut buf, "SWITCHYARD_WORKTREE_ABS", abs_worktree_bytes);
+    push_env_kv(
+        &mut buf,
+        "SWITCHYARD_PORT_COUNT",
+        port_count.to_string().as_bytes(),
+    );
+    let indexed_cap = port_count.min(ENV_PORT_VAR_CAP);
+    for offset in 0..indexed_cap {
+        let key = format!("SWITCHYARD_PORT_{offset}");
+        let port = record.port_start + offset as i64;
+        push_env_kv(&mut buf, &key, port.to_string().as_bytes());
+    }
+    match sqlite_override {
+        Some(val) => push_env_kv(&mut buf, "SQLITE_PATH", &val),
+        None => {
+            let mut default_sqlite = Vec::with_capacity(abs_worktree_bytes.len() + 16);
+            default_sqlite.extend_from_slice(abs_worktree_bytes);
+            default_sqlite.extend_from_slice(b"/.switchyard.db");
+            push_env_kv(&mut buf, "SQLITE_PATH", &default_sqlite);
+        }
+    }
+    for (key, val) in custom_lines {
+        push_env_kv(&mut buf, &key, &val);
+    }
+    Ok(buf)
+}
+
+fn publish_atomic_sibling_file(
+    parent: &Path,
+    dest: &Path,
+    tmp_prefix: &str,
+    mode: u32,
+    bytes: &[u8],
+    label: &str,
+) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let fail = |exc: io::Error| {
+        Error::plain(format!(
+            "{label} at {} cannot be written, {exc}",
+            dest.display()
+        ))
+    };
+    let mut attempt = 0;
+    let (tmp, mut file) = loop {
+        attempt += 1;
+        let candidate = parent.join(format!("{tmp_prefix}{}", random_suffix()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(exc) if exc.kind() == io::ErrorKind::AlreadyExists && attempt < 8 => continue,
+            Err(exc) => return Err(fail(exc)),
+        }
+    };
+    let staged = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, dest)
+    })();
+    if let Err(exc) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(fail(exc));
+    }
+    Ok(())
+}
+
+fn write_env_file(
+    stack: &Path,
+    env_rel: &str,
+    record: &Record,
+    env_template: Option<&[EnvTemplateEntry]>,
+) -> Result<()> {
     let path = stack.join(env_rel);
     if let Ok(meta) = path.symlink_metadata() {
         if !meta.file_type().is_file() {
@@ -3163,37 +4309,135 @@ fn write_env_file(stack: &Path, env_rel: &str, record: &Record) -> Result<()> {
             path.display()
         )));
     };
-    let text = env_text(record);
-    let fail = |exc: io::Error| {
-        Error::plain(format!(
-            "the env file at {} cannot be written, {exc}",
+    let abs_worktree = resolve_path(&stack.join(&record.worktree));
+    let abs_worktree_bytes = abs_worktree.as_os_str().as_bytes();
+    if abs_worktree_bytes
+        .iter()
+        .any(|&b| b == b'\n' || b == b'\r' || b == 0)
+    {
+        return Err(Error::plain(format!(
+            "the env file at {} cannot be written because the worktree path contains a newline or control byte",
             path.display()
+        )));
+    }
+    let rendered = env_bytes(record, abs_worktree_bytes, env_template)?;
+    publish_atomic_sibling_file(parent, &path, ".tmp-env-", 0o600, &rendered, "the env file")
+}
+
+fn write_seed_files(stack: &Path, worktree: &Path, seed_files: &[SeedFile]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if seed_files.is_empty() {
+        return Ok(());
+    }
+    let seed_root = stack.join(SEED_DIR_NAME);
+    let root_meta = seed_root.symlink_metadata().map_err(|exc| {
+        Error::plain(format!(
+            "seed directory at {} cannot be read, {exc}",
+            seed_root.display()
         ))
-    };
-    let mut attempt = 0;
-    let (tmp, mut file) = loop {
-        attempt += 1;
-        let candidate = parent.join(format!(".tmp-env-{}", random_suffix()));
-        use std::os::unix::fs::OpenOptionsExt;
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&candidate)
-        {
-            Ok(file) => break (candidate, file),
-            Err(exc) if exc.kind() == io::ErrorKind::AlreadyExists && attempt < 8 => continue,
-            Err(exc) => return Err(fail(exc)),
+    })?;
+    if root_meta.file_type().is_symlink() || !root_meta.file_type().is_dir() {
+        return Err(Error::plain(format!(
+            "seed directory at {} is not a real directory",
+            seed_root.display()
+        )));
+    }
+    let wt_meta = worktree.symlink_metadata().map_err(|exc| {
+        Error::plain(format!(
+            "worktree directory at {} cannot be inspected, {exc}",
+            worktree.display()
+        ))
+    })?;
+    if wt_meta.file_type().is_symlink() || !wt_meta.file_type().is_dir() {
+        return Err(Error::plain(format!(
+            "worktree directory at {} is not a real directory",
+            worktree.display()
+        )));
+    }
+
+    let mut exact_case_cache: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> = BTreeMap::new();
+    for seed in seed_files {
+        let label = format!("seed file {}", py_repr(&seed.path));
+        let src_cursor = verify_symlink_free_seed_source(
+            &seed_root,
+            &seed.path,
+            &label,
+            Some(&mut exact_case_cache),
+        )?;
+        let (bytes, src_meta) =
+            read_bounded_regular_file(&src_cursor, SEED_FILE_MAX_BYTES, &label)?;
+        let actual_sha = sha256_hex(&bytes);
+        if actual_sha != seed.sha256 {
+            return Err(Error::plain(format!(
+                "seed file {} at {} fails SHA-256 verification",
+                py_repr(&seed.path),
+                src_cursor.display()
+            )));
         }
-    };
-    let staged = (|| -> io::Result<()> {
-        file.write_all(text.as_bytes())?;
-        drop(file);
-        fs::rename(&tmp, &path)
-    })();
-    if let Err(exc) = staged {
-        let _ = fs::remove_file(&tmp);
-        return Err(fail(exc));
+        let executable = (src_meta.permissions().mode() & 0o100) != 0;
+
+        let parts: Vec<&str> = seed.path.split('/').collect();
+        let mut dst_dir = worktree.to_path_buf();
+        for parent in &parts[..parts.len() - 1] {
+            dst_dir.push(parent);
+            match dst_dir.symlink_metadata() {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(Error::plain(format!(
+                            "seed file {} cannot be written because parent {} in worktree is a symlink",
+                            py_repr(&seed.path),
+                            dst_dir.display()
+                        )));
+                    }
+                    if !meta.file_type().is_dir() {
+                        return Err(Error::plain(format!(
+                            "seed file {} cannot be written because parent {} in worktree is not a directory",
+                            py_repr(&seed.path),
+                            dst_dir.display()
+                        )));
+                    }
+                }
+                Err(exc) if exc.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&dst_dir).map_err(|e| {
+                        Error::plain(format!(
+                            "seed file {} parent directory {} cannot be created, {e}",
+                            py_repr(&seed.path),
+                            dst_dir.display()
+                        ))
+                    })?;
+                }
+                Err(exc) => {
+                    return Err(Error::plain(format!(
+                        "seed file {} parent directory {} cannot be inspected, {exc}",
+                        py_repr(&seed.path),
+                        dst_dir.display()
+                    )));
+                }
+            }
+        }
+
+        let dest = dst_dir.join(parts[parts.len() - 1]);
+        match dest.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
+                return Err(Error::plain(format!(
+                    "seed file {} cannot be written because a non-regular entry already stands at {}",
+                    py_repr(&seed.path),
+                    dest.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(exc) if exc.kind() == io::ErrorKind::NotFound => {}
+            Err(exc) => {
+                return Err(Error::plain(format!(
+                    "seed file {} destination {} cannot be inspected, {exc}",
+                    py_repr(&seed.path),
+                    dest.display()
+                )));
+            }
+        }
+
+        let mode = if executable { 0o700 } else { 0o600 };
+        publish_atomic_sibling_file(&dst_dir, &dest, ".tmp-seed-", mode, &bytes, &label)?;
     }
     Ok(())
 }
@@ -3294,6 +4538,23 @@ pub fn claim(stack: &Path, agent: &str) -> Result<Record> {
     claim_with(stack, agent, &ProcessGit, &save_registry)
 }
 
+/// Allocate a plain claim with per-call options such as
+/// `--probe-ports`, under obligation SY-30.
+pub fn claim_with_options(stack: &Path, agent: &str, options: ClaimOptions) -> Result<Record> {
+    claim_with_prober(stack, agent, options, &LoopbackProber)
+}
+
+/// Allocate a plain claim with an explicit `PortProber` seam, under
+/// obligation SY-30.
+pub fn claim_with_prober(
+    stack: &Path,
+    agent: &str,
+    options: ClaimOptions,
+    prober: &dyn PortProber,
+) -> Result<Record> {
+    claim_with_full(stack, agent, options, &ProcessGit, prober, &save_registry)
+}
+
 /// The opening every claim shape shares once the stack stands
 /// resolved and the agent name checked, in the landed order. The
 /// lock is taken, the registry loaded under it, and the stack
@@ -3367,10 +4628,27 @@ fn claim_with(
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<Record> {
+    claim_with_full(
+        stack,
+        agent,
+        ClaimOptions::default(),
+        git,
+        &LoopbackProber,
+        saver,
+    )
+}
+
+fn claim_with_full(
+    stack: &Path,
+    agent: &str,
+    options: ClaimOptions,
+    git: &dyn GitRunner,
+    prober: &dyn PortProber,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     let (lock, mut data, config) = claim_prologue(&stack, git)?;
-    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     refuse_standing_position(&data, agent)?;
@@ -3378,7 +4656,10 @@ fn claim_with(
         stack: &stack,
         agent,
         draw: 1,
-        base_branch: &base_branch,
+        config: config.as_ref(),
+        probe_ports: options.probe_ports,
+        preselected_span: None,
+        prober,
         data,
         lock: &lock,
         git,
@@ -3396,7 +4677,10 @@ struct AllocParts<'a> {
     stack: &'a Path,
     agent: &'a str,
     draw: i64,
-    base_branch: &'a str,
+    config: Option<&'a StackConfig>,
+    probe_ports: bool,
+    preselected_span: Option<(i64, i64)>,
+    prober: &'a dyn PortProber,
     data: Registry,
     lock: &'a Locked,
     git: &'a dyn GitRunner,
@@ -3448,6 +4732,23 @@ fn rollback_or_report(
     }
 }
 
+fn plain_span_error(draw: i64, shortage: SpanShortage) -> Error {
+    match (draw, shortage) {
+        (1, SpanShortage::Pool) => {
+            Error::plain("the port pool is exhausted, every range is held")
+        }
+        (_, SpanShortage::Pool) => Error::plain(format!(
+            "the port pool cannot furnish a draw of {draw} consecutive ranges"
+        )),
+        (1, SpanShortage::HostPortsBusy) => Error::plain(
+            "cannot furnish claim, host loopback ports are occupied across every free range in the port pool",
+        ),
+        (_, SpanShortage::HostPortsBusy) => Error::plain(format!(
+            "cannot furnish a draw of {draw} consecutive ranges, host loopback ports are occupied across every free candidate span in the port pool"
+        )),
+    }
+}
+
 /// Furnish one claim inside a loaded registry whose lock the
 /// caller holds, performing the landed allocation side effects
 /// without publishing. The pool refusals are the landed
@@ -3455,33 +4756,55 @@ fn rollback_or_report(
 /// names, which is the instant of the locked act the claim
 /// stands in. A failure rolls the furnishing itself back and
 /// returns the error, and the caller publishes nothing.
+#[allow(clippy::too_many_arguments)]
 fn furnish_claim(
     data: &mut Registry,
     stack: &Path,
     agent: &str,
     draw: i64,
-    base_branch: &str,
+    config: Option<&StackConfig>,
+    probe_ports: bool,
+    preselected_span: Option<(i64, i64)>,
+    prober: &dyn PortProber,
     claimed_at: &str,
     git: &dyn GitRunner,
 ) -> Result<Furnished> {
+    let (port_start, port_end) = match preselected_span {
+        Some(span) => span,
+        None => {
+            let effective_probe = probe_ports || config.is_some_and(|cfg| cfg.probe_ports);
+            select_span(data, draw, effective_probe, prober)
+                .map_err(|shortage| plain_span_error(draw, shortage))?
+        }
+    };
+    furnish_claim_on_span(
+        data,
+        stack,
+        agent,
+        (port_start, port_end),
+        config,
+        claimed_at,
+        git,
+    )
+}
+
+fn furnish_claim_on_span(
+    data: &mut Registry,
+    stack: &Path,
+    agent: &str,
+    (port_start, port_end): (i64, i64),
+    config: Option<&StackConfig>,
+    claimed_at: &str,
+    git: &dyn GitRunner,
+) -> Result<Furnished> {
+    let base_branch = effective_base_branch(config);
+    let env_template = config.and_then(|cfg| cfg.env_template.as_deref());
+    let seed_files = config.map(|cfg| cfg.seed_files.as_slice()).unwrap_or(&[]);
     let repo = stack.join(REPO_NAME);
     let branch = branch_name(agent);
     let worktree_rel = format!("{WORKTREES_NAME}/{agent}");
     let worktree = stack.join(&worktree_rel);
     let env_rel = format!("{worktree_rel}/{ENV_NAME}");
-    let (port_start, port_end) = match free_run(data, draw) {
-        Some(range) => range,
-        None if draw == 1 => {
-            return Err(Error::plain(
-                "the port pool is exhausted, every range is held",
-            ))
-        }
-        None => {
-            return Err(Error::plain(format!(
-                "the port pool cannot furnish a draw of {draw} consecutive ranges"
-            )))
-        }
-    };
     let record = Record {
         agent: agent.to_string(),
         branch: branch.clone(),
@@ -3527,7 +4850,8 @@ fn furnish_claim(
             &repo,
             &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
         )?;
-        write_env_file(stack, &env_rel, &record)?;
+        write_seed_files(stack, &worktree, seed_files)?;
+        write_env_file(stack, &env_rel, &record, env_template)?;
         data.claims.insert(agent.to_string(), record.clone());
         Ok(())
     })();
@@ -3563,7 +4887,10 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
         stack,
         agent,
         draw,
-        base_branch,
+        config,
+        probe_ports,
+        preselected_span,
+        prober,
         mut data,
         lock,
         git,
@@ -3572,7 +4899,18 @@ fn allocate_locked(parts: AllocParts) -> Result<Record> {
         expired,
         instant,
     } = parts;
-    let furnished = furnish_claim(&mut data, stack, agent, draw, base_branch, &instant, git)?;
+    let furnished = furnish_claim(
+        &mut data,
+        stack,
+        agent,
+        draw,
+        config,
+        probe_ports,
+        preselected_span,
+        prober,
+        &instant,
+        git,
+    )?;
     let attempt = (|| -> Result<()> {
         append_leavings(stack, &instant, "expired", &expired, None)?;
         if let Some(line) = routing {
@@ -3629,39 +4967,27 @@ type OfferOutcome = (
 
 /// Serve the standing waits of a release whose claim's removal
 /// already stands computed in the registry, in offer order, under
-/// obligation SY-21. A wait whose whole draw stands free at its
-/// turn is furnished whole through the landed allocation path of
-/// its kind, its claim record carrying the instant of the
-/// release, and a wait whose draw does not stand free is skipped
-/// and does not block the waits behind it. A wait whose
-/// furnishing itself fails is skipped the same way, the
-/// furnishing having rolled itself back, so one unfurnishable
-/// wait can never wedge the release or the queue behind it, and
-/// the failure is returned beside the furnishings under SY-25,
-/// naming the agent and the failure the furnishing returned, so
-/// the skip stands told from a skip for a draw that did not
-/// stand free. Returns the waits furnished, in offer order, with
-/// the span each furnished claim took and the furnishings
-/// themselves, for the caller's rollback if a later step of the
-/// release fails, and the registry carries every furnishing at
-/// once, for the caller's one publish.
+/// obligations SY-21 and SY-30.
 fn serve_offers(
     data: &mut Registry,
     stack: &Path,
     instant: &str,
-    base_branch: &str,
+    config: Option<&StackConfig>,
     git: &dyn GitRunner,
+    prober: &dyn PortProber,
 ) -> Result<OfferOutcome> {
+    let effective_probe = config.is_some_and(|cfg| cfg.probe_ports);
     let mut furnished: Vec<Wait> = Vec::new();
     let mut offers: Vec<Furnished> = Vec::new();
     let mut spans: BTreeMap<String, (i64, i64)> = BTreeMap::new();
     let mut failures: Vec<FurnishingFailure> = Vec::new();
     for wait in offer_order(&data.waits) {
         let draw = settled_draw(&wait.profile);
-        if free_run(data, draw).is_none() {
+        let Ok(span) = select_span(data, draw, effective_probe, prober) else {
             continue;
-        }
-        let done = match furnish_claim(data, stack, &wait.agent, draw, base_branch, instant, git) {
+        };
+        let done = match furnish_claim_on_span(data, stack, &wait.agent, span, config, instant, git)
+        {
             Ok(done) => done,
             Err(exc) => {
                 failures.push(FurnishingFailure {
@@ -3715,31 +5041,195 @@ fn rollback_offers(git: &dyn GitRunner, stack: &Path, offers: &[Furnished], exc:
     }
 }
 
-fn porcelain_z_has_non_env_entries(bytes: &[u8], include_ignored: bool) -> bool {
+fn seed_file_stands_unmodified(
+    worktree: &Path,
+    seed_root: &Path,
+    rel: &str,
+    expected_sha256: &str,
+) -> Result<Option<bool>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let parts: Vec<&str> = rel.split('/').collect();
+    let mut cursor = worktree.to_path_buf();
+    for (idx, part) in parts.iter().enumerate() {
+        cursor.push(part);
+        let is_leaf = idx + 1 == parts.len();
+        match cursor.symlink_metadata() {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Ok(Some(false));
+                }
+                if is_leaf {
+                    if !meta.file_type().is_file() || meta.len() > SEED_FILE_MAX_BYTES {
+                        return Ok(Some(false));
+                    }
+                    let Ok(seed_meta) = seed_root.join(rel).symlink_metadata() else {
+                        return Ok(Some(false));
+                    };
+                    if seed_meta.file_type().is_symlink() || !seed_meta.file_type().is_file() {
+                        return Ok(Some(false));
+                    }
+                    let wt_exec = (meta.permissions().mode() & 0o100) != 0;
+                    let seed_exec = (seed_meta.permissions().mode() & 0o100) != 0;
+                    if wt_exec != seed_exec {
+                        return Ok(Some(false));
+                    }
+                    let Ok(file) = fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(&cursor)
+                    else {
+                        return Ok(Some(false));
+                    };
+                    let mut bytes = Vec::new();
+                    if file
+                        .take(SEED_FILE_MAX_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .is_err()
+                        || (bytes.len() as u64) > SEED_FILE_MAX_BYTES
+                    {
+                        return Ok(Some(false));
+                    }
+                    return Ok(Some(sha256_hex(&bytes) == expected_sha256));
+                } else if !meta.file_type().is_dir() {
+                    return Ok(Some(false));
+                }
+            }
+            Err(exc) if exc.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(exc) => {
+                return Err(Error::plain(format!(
+                    "worktree entry at {} cannot be inspected, {exc}",
+                    cursor.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn ignored_dir_holds_only_unmodified_seeds(
+    worktree: &Path,
+    seed_root: &Path,
+    rel_dir_no_slash: &str,
+    seed_map: &BTreeMap<&str, &str>,
+) -> Result<bool> {
+    let dir_path = worktree.join(rel_dir_no_slash);
+    let meta = dir_path.symlink_metadata().map_err(|exc| {
+        Error::plain(format!(
+            "worktree directory at {} cannot be inspected, {exc}",
+            dir_path.display()
+        ))
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Ok(false);
+    }
+    let entries = fs::read_dir(&dir_path).map_err(|exc| {
+        Error::plain(format!(
+            "worktree directory at {} cannot be read, {exc}",
+            dir_path.display()
+        ))
+    })?;
+    let mut saw_any = false;
+    for entry in entries {
+        saw_any = true;
+        let entry = entry.map_err(|exc| {
+            Error::plain(format!(
+                "worktree directory at {} cannot be read, {exc}",
+                dir_path.display()
+            ))
+        })?;
+        let name_os = entry.file_name();
+        let Some(name_str) = name_os.to_str() else {
+            return Ok(false);
+        };
+        let child_rel = format!("{rel_dir_no_slash}/{name_str}");
+        let child_meta = entry.path().symlink_metadata().map_err(|exc| {
+            Error::plain(format!(
+                "worktree entry at {} cannot be inspected, {exc}",
+                entry.path().display()
+            ))
+        })?;
+        if child_meta.file_type().is_symlink() {
+            return Ok(false);
+        }
+        if child_meta.file_type().is_dir() {
+            let prefix = format!("{child_rel}/");
+            if !seed_map.keys().any(|k| k.starts_with(&prefix)) {
+                return Ok(false);
+            }
+            if !ignored_dir_holds_only_unmodified_seeds(worktree, seed_root, &child_rel, seed_map)?
+            {
+                return Ok(false);
+            }
+        } else if child_meta.file_type().is_file() {
+            let Some(&expected_sha) = seed_map.get(child_rel.as_str()) else {
+                return Ok(false);
+            };
+            if seed_file_stands_unmodified(worktree, seed_root, &child_rel, expected_sha)?
+                != Some(true)
+            {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(saw_any)
+}
+
+fn porcelain_z_has_non_env_entries(
+    worktree: &Path,
+    seed_root: &Path,
+    bytes: &[u8],
+    include_ignored: bool,
+    seed_map: &BTreeMap<&str, &str>,
+) -> Result<bool> {
     let mut at = 0;
     while at < bytes.len() {
         let Some(nul_offset) = bytes[at..].iter().position(|&b| b == 0) else {
-            return true;
+            return Ok(true);
         };
         let entry = &bytes[at..at + nul_offset];
         at += nul_offset + 1;
         if entry.len() < 4 || entry[2] != b' ' {
-            return true;
+            return Ok(true);
         }
         let x = entry[0];
         let y = entry[1];
         let path = &entry[3..];
         if x == b'R' || x == b'C' {
-            return true;
+            return Ok(true);
         }
         let is_benign_env = path == ENV_NAME.as_bytes()
             && (matches!((x, y), (b'?', b'?') | (b' ', b'M'))
                 || (include_ignored && (x, y) == (b'!', b'!')));
-        if !is_benign_env {
-            return true;
+        if is_benign_env {
+            continue;
         }
+        let Ok(path_str) = std::str::from_utf8(path) else {
+            return Ok(true);
+        };
+        if let Some(&expected_sha) = seed_map.get(path_str) {
+            let allowed_status = matches!((x, y), (b'?', b'?') | (b' ', b'M'))
+                || (include_ignored && (x, y) == (b'!', b'!'));
+            if allowed_status
+                && seed_file_stands_unmodified(worktree, seed_root, path_str, expected_sha)?
+                    == Some(true)
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+        if include_ignored && (x, y) == (b'!', b'!') && path_str.ends_with('/') {
+            let trimmed = &path_str[..path_str.len() - 1];
+            if seed_map.keys().any(|k| k.starts_with(path_str))
+                && ignored_dir_holds_only_unmodified_seeds(worktree, seed_root, trimmed, seed_map)?
+            {
+                continue;
+            }
+        }
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 fn worktree_belongs_to_repo(git: &dyn GitRunner, worktree: &Path, repo: &Path) -> bool {
@@ -3876,9 +5366,23 @@ fn tracked_gitlinks(git: &dyn GitRunner, worktree: &Path) -> Result<BTreeSet<Pat
 
 fn worktree_has_unsaved_changes(
     git: &dyn GitRunner,
+    stack: &Path,
     worktree: &Path,
     include_ignored: bool,
+    seed_files: &[SeedFile],
 ) -> Result<bool> {
+    let seed_root = stack.join(SEED_DIR_NAME);
+    let seed_map: BTreeMap<&str, &str> = seed_files
+        .iter()
+        .map(|seed| (seed.path.as_str(), seed.sha256.as_str()))
+        .collect();
+    for seed in seed_files {
+        if seed_file_stands_unmodified(worktree, &seed_root, &seed.path, &seed.sha256)?
+            == Some(false)
+        {
+            return Ok(true);
+        }
+    }
     let status_args: &[&str] = if include_ignored {
         &[
             "--no-optional-locks",
@@ -3908,7 +5412,13 @@ fn worktree_has_unsaved_changes(
             git_detail(&out)
         )));
     }
-    if porcelain_z_has_non_env_entries(&out.stdout_bytes, include_ignored) {
+    if porcelain_z_has_non_env_entries(
+        worktree,
+        &seed_root,
+        &out.stdout_bytes,
+        include_ignored,
+        &seed_map,
+    )? {
         return Ok(true);
     }
     let mut nested = Vec::new();
@@ -3974,10 +5484,15 @@ pub fn release_with_options(
     agent: &str,
     options: ReleaseOptions,
 ) -> Result<ReleaseOutcome> {
-    Ok(
-        release_report_with_options_and_git(stack, agent, options, &ProcessGit, &save_registry)?
-            .outcome,
-    )
+    Ok(release_report_with_options_and_git(
+        stack,
+        agent,
+        options,
+        &ProcessGit,
+        &LoopbackProber,
+        &save_registry,
+    )?
+    .outcome)
 }
 
 fn release_with(
@@ -4023,7 +5538,25 @@ pub fn release_report_with_options(
     agent: &str,
     options: ReleaseOptions,
 ) -> Result<ReleaseReport> {
-    release_report_with_options_and_git(stack, agent, options, &ProcessGit, &save_registry)
+    release_report_with_options_and_git(
+        stack,
+        agent,
+        options,
+        &ProcessGit,
+        &LoopbackProber,
+        &save_registry,
+    )
+}
+
+/// Release an agent with an explicit `PortProber` seam for
+/// `serve_offers`, under obligation SY-30.
+pub fn release_report_with_prober(
+    stack: &Path,
+    agent: &str,
+    options: ReleaseOptions,
+    prober: &dyn PortProber,
+) -> Result<ReleaseReport> {
+    release_report_with_options_and_git(stack, agent, options, &ProcessGit, prober, &save_registry)
 }
 
 fn release_report_with(
@@ -4032,7 +5565,14 @@ fn release_report_with(
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ReleaseReport> {
-    release_report_with_options_and_git(stack, agent, ReleaseOptions::default(), git, saver)
+    release_report_with_options_and_git(
+        stack,
+        agent,
+        ReleaseOptions::default(),
+        git,
+        &LoopbackProber,
+        saver,
+    )
 }
 
 fn release_report_with_options_and_git(
@@ -4040,6 +5580,7 @@ fn release_report_with_options_and_git(
     agent: &str,
     options: ReleaseOptions,
     git: &dyn GitRunner,
+    prober: &dyn PortProber,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ReleaseReport> {
     let stack = resolve_path(stack);
@@ -4050,6 +5591,10 @@ fn release_report_with_options_and_git(
     let config = load_config(&stack)?;
     verify_own_repo(git, &stack)?;
     let base_branch = effective_base_branch(config.as_ref()).to_string();
+    let seed_files = config
+        .as_ref()
+        .map(|cfg| cfg.seed_files.as_slice())
+        .unwrap_or(&[]);
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     if let Some(record) = data.claims.get(agent).cloned() {
@@ -4083,7 +5628,7 @@ fn release_report_with_options_and_git(
                     repo.display()
                 )));
             }
-            if worktree_has_unsaved_changes(git, &worktree, false)? {
+            if worktree_has_unsaved_changes(git, &stack, &worktree, false, seed_files)? {
                 return Err(Error::plain(format!(
                     "safe release of {agent} refused, worktree at {} has uncommitted or untracked changes",
                     worktree.display()
@@ -4126,7 +5671,7 @@ fn release_report_with_options_and_git(
         };
         data.claims.remove(agent);
         let (furnished, spans, offers, failures) =
-            serve_offers(&mut data, &stack, &instant, &base_branch, git)?;
+            serve_offers(&mut data, &stack, &instant, config.as_ref(), git, prober)?;
         let published = (|| -> Result<()> {
             append_leavings(&stack, &instant, "expired", &expired, None)?;
             append_leavings(&stack, &instant, "furnished", &furnished, Some(&spans))?;
@@ -4431,6 +5976,10 @@ fn doctor_with(stack: &Path, fix: bool, git: &dyn GitRunner) -> Result<DoctorRep
     }
 
     // 3. orphan_worktree_dir / dirty_orphan_worktree under <stack>/worktrees.
+    let seed_files = config
+        .as_ref()
+        .map(|cfg| cfg.seed_files.as_slice())
+        .unwrap_or(&[]);
     let worktrees_root = stack.join(WORKTREES_NAME);
     if worktrees_root.is_dir() {
         let mut entries: Vec<fs::DirEntry> = fs::read_dir(&worktrees_root)
@@ -4460,7 +6009,7 @@ fn doctor_with(stack: &Path, fix: bool, git: &dyn GitRunner) -> Result<DoctorRep
             };
             if meta.is_dir() && !meta.file_type().is_symlink() {
                 if worktree_belongs_to_repo(git, &entry_path, &repo) {
-                    match worktree_has_unsaved_changes(git, &entry_path, true) {
+                    match worktree_has_unsaved_changes(git, &stack, &entry_path, true, seed_files) {
                         Ok(false)
                             if orphan_worktree_head_is_safe(
                                 git,
@@ -5655,6 +7204,37 @@ pub fn claim_profile(stack: &Path, agent: &str, profile: Profile) -> Result<Reco
     claim_profile_with(stack, agent, profile, &ProcessGit, &save_registry)
 }
 
+/// Allocate a profiled claim with per-call options such as
+/// `--probe-ports`, under obligation SY-30.
+pub fn claim_profile_with_options(
+    stack: &Path,
+    agent: &str,
+    profile: Profile,
+    options: ClaimOptions,
+) -> Result<Record> {
+    claim_profile_with_prober(stack, agent, profile, options, &LoopbackProber)
+}
+
+/// Allocate a profiled claim with an explicit `PortProber` seam, under
+/// obligation SY-30.
+pub fn claim_profile_with_prober(
+    stack: &Path,
+    agent: &str,
+    profile: Profile,
+    options: ClaimOptions,
+    prober: &dyn PortProber,
+) -> Result<Record> {
+    claim_profile_with_full(
+        stack,
+        agent,
+        profile,
+        options,
+        &ProcessGit,
+        prober,
+        &save_registry,
+    )
+}
+
 fn claim_profile_with(
     stack: &Path,
     agent: &str,
@@ -5662,10 +7242,29 @@ fn claim_profile_with(
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<Record> {
+    claim_profile_with_full(
+        stack,
+        agent,
+        profile,
+        ClaimOptions::default(),
+        git,
+        &LoopbackProber,
+        saver,
+    )
+}
+
+fn claim_profile_with_full(
+    stack: &Path,
+    agent: &str,
+    profile: Profile,
+    options: ClaimOptions,
+    git: &dyn GitRunner,
+    prober: &dyn PortProber,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     let (lock, mut data, config) = claim_prologue(&stack, git)?;
-    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     refuse_standing_position(&data, agent)?;
@@ -5673,7 +7272,10 @@ fn claim_profile_with(
         stack: &stack,
         agent,
         draw: profile.draw(),
-        base_branch: &base_branch,
+        config: config.as_ref(),
+        probe_ports: options.probe_ports,
+        preselected_span: None,
+        prober,
         data,
         lock: &lock,
         git,
@@ -5715,6 +7317,29 @@ pub fn claim_routed(
     )
 }
 
+/// Allocate a routed claim with per-call options such as
+/// `--probe-ports`, under obligation SY-30.
+pub fn claim_routed_with_options(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    default_profile: Profile,
+    transport: Option<&dyn JudgeTransport>,
+    options: ClaimOptions,
+) -> Result<Record> {
+    claim_routed_with_full(
+        stack,
+        agent,
+        description,
+        default_profile,
+        transport,
+        options,
+        &ProcessGit,
+        &LoopbackProber,
+        &save_registry,
+    )
+}
+
 /// Append the routing line of a routed claim refused under the
 /// lock again in the third phase of the envelope of obligation
 /// SY-13, after its consultation stood. The line carries the
@@ -5751,25 +7376,59 @@ fn claim_routed_with(
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<Record> {
+    claim_routed_with_full(
+        stack,
+        agent,
+        description,
+        default_profile,
+        transport,
+        ClaimOptions::default(),
+        git,
+        &LoopbackProber,
+        saver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_routed_with_full(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    default_profile: Profile,
+    transport: Option<&dyn JudgeTransport>,
+    options: ClaimOptions,
+    git: &dyn GitRunner,
+    prober: &dyn PortProber,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<Record> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     let model = transport.map(|_| ROUTING_MODEL.to_string());
     {
-        let (lock, mut data, _config) = claim_prologue(&stack, git)?;
+        let (lock, mut data, config) = claim_prologue(&stack, git)?;
         let _ = sweep_expired(&mut data, &now_stamp());
         refuse_standing_position(&data, agent)?;
         validate_description(description)?;
-        if !PROFILES
+        let effective_probe =
+            options.probe_ports || config.as_ref().is_some_and(|cfg| cfg.probe_ports);
+        let any_unprobed = PROFILES
             .iter()
-            .any(|profile| free_run(&data, profile.draw()).is_some())
+            .any(|profile| free_run(&data, profile.draw()).is_some());
+        if !any_unprobed
+            || (effective_probe
+                && !PROFILES
+                    .iter()
+                    .any(|profile| select_span(&data, profile.draw(), true, prober).is_ok()))
         {
             let mut line = RoutingLine::new(agent, description, model.clone());
             line.fallback = Fallback::NoConsultation;
             line.refusal = Some("pool".to_string());
             line.append(&stack)?;
-            return Err(Error::plain(
-                "the port pool is exhausted, no declared profile can be furnished",
-            ));
+            return Err(Error::plain(if !any_unprobed {
+                "the port pool is exhausted, no declared profile can be furnished"
+            } else {
+                "no declared profile can be furnished, host loopback ports are occupied across every free range in the port pool"
+            }));
         }
         drop(lock);
     }
@@ -5805,7 +7464,6 @@ fn claim_routed_with(
         )?;
         return Err(exc);
     }
-    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     if data.claims.contains_key(agent) || data.waits.iter().any(|wait| wait.agent == agent) {
@@ -5821,25 +7479,36 @@ fn claim_routed_with(
         )?;
         return Err(standing_claim_error(agent));
     }
-    if free_run(&data, settled.draw()).is_none() {
-        let mut line = RoutingLine::new(agent, description, model.clone());
-        line.verdict = verdict.clone();
-        line.confidence = confidence;
-        line.fallback = fallback;
-        line.refusal = Some("pool".to_string());
-        line.append(&stack)?;
-        return Err(Error::plain(if fallback == Fallback::None {
-            format!(
-                "profile {} cannot be furnished, its draw does not stand free in the port pool",
-                settled.name()
-            )
-        } else {
-            format!(
-                "the default profile {} cannot be furnished, its draw does not stand free in the port pool",
-                settled.name()
-            )
-        }));
-    }
+    let effective_probe = options.probe_ports || config.as_ref().is_some_and(|cfg| cfg.probe_ports);
+    let span = match select_span(&data, settled.draw(), effective_probe, prober) {
+        Ok(span) => span,
+        Err(shortage) => {
+            let mut line = RoutingLine::new(agent, description, model.clone());
+            line.verdict = verdict.clone();
+            line.confidence = confidence;
+            line.fallback = fallback;
+            line.refusal = Some("pool".to_string());
+            line.append(&stack)?;
+            return Err(Error::plain(match (fallback == Fallback::None, shortage) {
+                (true, SpanShortage::Pool) => format!(
+                    "profile {} cannot be furnished, its draw does not stand free in the port pool",
+                    settled.name()
+                ),
+                (false, SpanShortage::Pool) => format!(
+                    "the default profile {} cannot be furnished, its draw does not stand free in the port pool",
+                    settled.name()
+                ),
+                (true, SpanShortage::HostPortsBusy) => format!(
+                    "profile {} cannot be furnished, host loopback ports are occupied across every free candidate span in the port pool",
+                    settled.name()
+                ),
+                (false, SpanShortage::HostPortsBusy) => format!(
+                    "the default profile {} cannot be furnished, host loopback ports are occupied across every free candidate span in the port pool",
+                    settled.name()
+                ),
+            }));
+        }
+    };
     let mut line = RoutingLine::new(agent, description, model);
     line.verdict = verdict;
     line.confidence = confidence;
@@ -5849,7 +7518,10 @@ fn claim_routed_with(
         stack: &stack,
         agent,
         draw: settled.draw(),
-        base_branch: &base_branch,
+        config: config.as_ref(),
+        probe_ports: options.probe_ports,
+        preselected_span: Some(span),
+        prober,
         data,
         lock: &lock,
         git,
@@ -5891,6 +7563,30 @@ pub fn claim_waiting(
     )
 }
 
+/// Allocate a plain waiting claim with per-call options such as
+/// `--probe-ports`, under obligations SY-19 and SY-30.
+pub fn claim_waiting_with_options(
+    stack: &Path,
+    agent: &str,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+    options: ClaimOptions,
+) -> Result<ClaimOutcome> {
+    claim_waiting_core(
+        stack,
+        agent,
+        "plain",
+        1,
+        None,
+        wait_for,
+        transport,
+        options,
+        &ProcessGit,
+        &LoopbackProber,
+        &save_registry,
+    )
+}
+
 fn claim_waiting_with(
     stack: &Path,
     agent: &str,
@@ -5900,7 +7596,17 @@ fn claim_waiting_with(
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ClaimOutcome> {
     claim_waiting_core(
-        stack, agent, "plain", 1, None, wait_for, transport, git, saver,
+        stack,
+        agent,
+        "plain",
+        1,
+        None,
+        wait_for,
+        transport,
+        ClaimOptions::default(),
+        git,
+        &LoopbackProber,
+        saver,
     )
 }
 
@@ -5924,6 +7630,31 @@ pub fn claim_profile_waiting(
     )
 }
 
+/// Allocate a profiled waiting claim with per-call options such as
+/// `--probe-ports`, under obligations SY-19 and SY-30.
+pub fn claim_profile_waiting_with_options(
+    stack: &Path,
+    agent: &str,
+    profile: Profile,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+    options: ClaimOptions,
+) -> Result<ClaimOutcome> {
+    claim_waiting_core(
+        stack,
+        agent,
+        profile.name(),
+        profile.draw(),
+        None,
+        wait_for,
+        transport,
+        options,
+        &ProcessGit,
+        &LoopbackProber,
+        &save_registry,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn claim_profile_waiting_with(
     stack: &Path,
@@ -5942,7 +7673,9 @@ fn claim_profile_waiting_with(
         None,
         wait_for,
         transport,
+        ClaimOptions::default(),
         git,
+        &LoopbackProber,
         saver,
     )
 }
@@ -5962,13 +7695,24 @@ fn claim_waiting_core(
     description: Option<&str>,
     wait_for: Option<i64>,
     transport: Option<&dyn JudgeTransport>,
+    options: ClaimOptions,
     git: &dyn GitRunner,
+    prober: &dyn PortProber,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ClaimOutcome> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     validate_wait_bound(wait_for)?;
-    let snapshot = match waiting_phase(&stack, agent, draw, None, git, saver)? {
+    let snapshot = match waiting_phase(
+        &stack,
+        agent,
+        draw,
+        None,
+        options.probe_ports,
+        git,
+        prober,
+        saver,
+    )? {
         WaitingPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
         WaitingPhase::Standing(standing) => {
             (standing.data.waits.clone(), free_runs(&standing.data))
@@ -5983,7 +7727,16 @@ fn claim_waiting_core(
         description,
     );
     let outcome = settle_score(transport, &request);
-    let standing = match waiting_phase(&stack, agent, draw, None, git, saver)? {
+    let standing = match waiting_phase(
+        &stack,
+        agent,
+        draw,
+        None,
+        options.probe_ports,
+        git,
+        prober,
+        saver,
+    )? {
         WaitingPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
         WaitingPhase::Standing(standing) => standing,
     };
@@ -6047,7 +7800,9 @@ fn waiting_phase(
     agent: &str,
     draw: i64,
     routed: Option<&RoutedContext<'_>>,
+    probe_ports: bool,
     git: &dyn GitRunner,
+    prober: &dyn PortProber,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<WaitingPhase> {
     let lock = locked(stack)?;
@@ -6085,7 +7840,6 @@ fn waiting_phase(
         }
         return Err(exc);
     }
-    let base_branch = effective_base_branch(config.as_ref()).to_string();
     let instant = now_stamp();
     let expired = sweep_expired(&mut data, &instant);
     if let Err(exc) = refuse_standing_position(&data, agent) {
@@ -6114,7 +7868,8 @@ fn waiting_phase(
         }
         return Err(exc);
     }
-    if free_run(&data, draw).is_some() {
+    let effective_probe = probe_ports || config.as_ref().is_some_and(|cfg| cfg.probe_ports);
+    if let Ok(span) = select_span(&data, draw, effective_probe, prober) {
         let line = routed.map(|routed| {
             let mut line = RoutingLine::new(agent, routed.description, routed.model.clone());
             line.verdict = routed.verdict.clone();
@@ -6127,7 +7882,10 @@ fn waiting_phase(
             stack,
             agent,
             draw,
-            base_branch: &base_branch,
+            config: config.as_ref(),
+            probe_ports,
+            preselected_span: Some(span),
+            prober,
             data,
             lock: &lock,
             git,
@@ -6227,6 +7985,32 @@ pub fn claim_routed_waiting(
     )
 }
 
+/// Allocate a routed waiting claim with per-call options such as
+/// `--probe-ports`, under obligations SY-19 and SY-30.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_routed_waiting_with_options(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    default_profile: Profile,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+    options: ClaimOptions,
+) -> Result<ClaimOutcome> {
+    claim_routed_waiting_with_full(
+        stack,
+        agent,
+        description,
+        default_profile,
+        wait_for,
+        transport,
+        options,
+        &ProcessGit,
+        &LoopbackProber,
+        &save_registry,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn claim_routed_waiting_with(
     stack: &Path,
@@ -6238,21 +8022,50 @@ fn claim_routed_waiting_with(
     git: &dyn GitRunner,
     saver: &dyn Fn(&Path, &Registry) -> Result<()>,
 ) -> Result<ClaimOutcome> {
+    claim_routed_waiting_with_full(
+        stack,
+        agent,
+        description,
+        default_profile,
+        wait_for,
+        transport,
+        ClaimOptions::default(),
+        git,
+        &LoopbackProber,
+        saver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_routed_waiting_with_full(
+    stack: &Path,
+    agent: &str,
+    description: &str,
+    default_profile: Profile,
+    wait_for: Option<i64>,
+    transport: Option<&dyn JudgeTransport>,
+    options: ClaimOptions,
+    git: &dyn GitRunner,
+    prober: &dyn PortProber,
+    saver: &dyn Fn(&Path, &Registry) -> Result<()>,
+) -> Result<ClaimOutcome> {
     let stack = resolve_path(stack);
     validate_agent_name(agent)?;
     validate_wait_bound(wait_for)?;
     let model = transport.map(|_| ROUTING_MODEL.to_string());
     let mut pre_settled: Option<Profile> = None;
     {
-        let (_lock, mut data, _config) = claim_prologue(&stack, git)?;
+        let (_lock, mut data, config) = claim_prologue(&stack, git)?;
         let instant = now_stamp();
         let _ = sweep_expired(&mut data, &instant);
         refuse_standing_position(&data, agent)?;
         validate_description(description)?;
         refuse_queue_full(&data)?;
+        let effective_probe =
+            options.probe_ports || config.as_ref().is_some_and(|cfg| cfg.probe_ports);
         if !PROFILES
             .iter()
-            .any(|profile| free_run(&data, profile.draw()).is_some())
+            .any(|profile| select_span(&data, profile.draw(), effective_probe, prober).is_ok())
         {
             pre_settled = Some(default_profile);
         }
@@ -6277,7 +8090,16 @@ fn claim_routed_waiting_with(
     // that does not wait, exactly as SY-17 and SY-20 stand. The
     // snapshot the scoring request is built from is taken here,
     // from the registry as it stands at this check.
-    let snapshot = match waiting_phase(&stack, agent, settled.draw(), Some(&routed), git, saver)? {
+    let snapshot = match waiting_phase(
+        &stack,
+        agent,
+        settled.draw(),
+        Some(&routed),
+        options.probe_ports,
+        git,
+        prober,
+        saver,
+    )? {
         WaitingPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
         WaitingPhase::Standing(standing) => {
             (standing.data.waits.clone(), free_runs(&standing.data))
@@ -6292,7 +8114,16 @@ fn claim_routed_waiting_with(
         Some(description),
     );
     let outcome = settle_score(transport, &request);
-    let standing = match waiting_phase(&stack, agent, settled.draw(), Some(&routed), git, saver)? {
+    let standing = match waiting_phase(
+        &stack,
+        agent,
+        settled.draw(),
+        Some(&routed),
+        options.probe_ports,
+        git,
+        prober,
+        saver,
+    )? {
         WaitingPhase::Allocated(record) => return Ok(ClaimOutcome::Claim(record)),
         WaitingPhase::Standing(standing) => standing,
     };
@@ -7443,5 +9274,82 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_span_skips_probing_isolated_short_free_slots() {
+        use std::cell::RefCell;
+
+        struct RecordingProber {
+            probed: RefCell<Vec<u16>>,
+        }
+
+        impl PortProber for RecordingProber {
+            fn is_port_free(&self, port: u16) -> bool {
+                self.probed.borrow_mut().push(port);
+                true
+            }
+        }
+
+        let (dir, stack) = unit_stack("select-span-short-gap");
+        init_stack(&stack.join("sub"), 20_000, 4, 4).unwrap();
+        let sub = stack.join("sub");
+        // Occupy slot 1 (20004..=20007), leaving isolated 1-slot gap [0] and 2-slot run [2, 3].
+        let mut reg = load_registry(&sub).unwrap();
+        reg.claims.insert(
+            "holder".to_string(),
+            Record {
+                agent: "holder".to_string(),
+                branch: "switchyard/holder".to_string(),
+                worktree: "worktrees/holder".to_string(),
+                port_start: 20_004,
+                port_end: 20_007,
+                database: "switchyard_holder".to_string(),
+                env_file: "worktrees/holder/.env.switchyard".to_string(),
+                claimed_at: "2026-11-27T00:00:00+00:00".to_string(),
+            },
+        );
+        let prober = RecordingProber {
+            probed: RefCell::new(Vec::new()),
+        };
+        let span = select_span(&reg, 2, true, &prober).unwrap();
+        assert_eq!(span, (20_008, 20_015));
+        assert_eq!(
+            *prober.probed.borrow(),
+            (20_008..=20_015).collect::<Vec<u16>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ipv6_bind_error_means_disabled_distinguishes_disabled_family_from_in_use_errors() {
+        assert!(ipv6_bind_error_means_disabled(&io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "ipv6 loopback disabled"
+        )));
+        assert!(ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)
+        ));
+        assert!(ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EAFNOSUPPORT)
+        ));
+        assert!(ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EPROTONOSUPPORT)
+        ));
+
+        assert!(!ipv6_bind_error_means_disabled(&io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "port bound"
+        )));
+        assert!(!ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EADDRINUSE)
+        ));
+        assert!(!ipv6_bind_error_means_disabled(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "permission denied"
+        )));
+        assert!(!ipv6_bind_error_means_disabled(
+            &io::Error::from_raw_os_error(libc::EACCES)
+        ));
     }
 }
